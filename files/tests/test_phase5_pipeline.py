@@ -296,9 +296,66 @@ def test_preset_cancel_writes_nothing(tmp_path) -> None:
 
 
 # ── Output-dir resolution ────────────────────────────────────────────────────
-def test_resolve_output_dir_auto_increments(tmp_path) -> None:
+def test_resolve_output_dir_default_is_slug_and_auto_increments(tmp_path) -> None:
+    # Default name is now the novel slug (was "webscraped_{slug}").
     d1 = pipeline.resolve_output_dir("shadow-slave", downloads_root=tmp_path)
-    assert d1 == tmp_path / "webscraped_shadow-slave-1"
+    assert d1 == tmp_path / "shadow-slave-1"
     d1.mkdir()
     d2 = pipeline.resolve_output_dir("shadow-slave", downloads_root=tmp_path)
-    assert d2 == tmp_path / "webscraped_shadow-slave-2"
+    assert d2 == tmp_path / "shadow-slave-2"
+
+
+def test_resolve_output_dir_custom_parent_and_name(tmp_path) -> None:
+    parent = tmp_path / "MyNovels"
+    parent.mkdir()
+    d1 = pipeline.resolve_output_dir(
+        "shadow-slave", parent_dir=parent, base_name="Shadow Slave Books"
+    )
+    # Uses the chosen parent + sanitised custom name, with the -N increment.
+    assert d1.parent == parent
+    assert d1.name == "Shadow Slave Books-1"
+    d1.mkdir()
+    d2 = pipeline.resolve_output_dir(
+        "shadow-slave", parent_dir=parent, base_name="Shadow Slave Books"
+    )
+    assert d2.name == "Shadow Slave Books-2"
+
+
+def test_resolve_output_dir_blank_name_falls_back_to_slug(tmp_path) -> None:
+    d = pipeline.resolve_output_dir(
+        "shadow-slave", parent_dir=tmp_path, base_name="   "
+    )
+    assert d == tmp_path / "shadow-slave-1"
+
+
+# ── Nesting regression (0.1.1 doubled-folder bug) ────────────────────────────
+def test_resolve_output_dir_default_is_single_level_not_nested(tmp_path) -> None:
+    """A default run lands directly under the Downloads-equivalent base — exactly
+    one directory deep, never inside a prior run's folder."""
+    d = pipeline.resolve_output_dir("shadow-slave", downloads_root=tmp_path)
+    assert d == tmp_path / "shadow-slave-1"
+    assert d.parent == tmp_path  # top level of the base, not nested
+
+
+def test_resolve_output_dir_increment_is_sibling_not_nested(tmp_path) -> None:
+    """The second default run is a SIBLING of the first under the same parent —
+    never created inside the first run's folder (the doubled-folder bug)."""
+    d1 = pipeline.resolve_output_dir("shadow-slave", downloads_root=tmp_path)
+    d1.mkdir()
+    d2 = pipeline.resolve_output_dir("shadow-slave", downloads_root=tmp_path)
+    assert d2 == tmp_path / "shadow-slave-2"
+    assert d2.parent == d1.parent == tmp_path
+    assert d1 not in d2.parents  # d2 is NOT nested inside d1
+
+
+def test_resolve_output_dir_ignores_old_webscraped_folders(tmp_path) -> None:
+    """The pre-0.1.1 ``webscraped_{slug}-N`` folders must not interfere with the
+    new ``{slug}-N`` scan: a fresh default run still yields ``{slug}-1`` and never
+    nests inside (or matches) a leftover ``webscraped_`` folder."""
+    (tmp_path / "webscraped_shadow-slave-1").mkdir()
+    (tmp_path / "webscraped_shadow-slave-2").mkdir()
+    d = pipeline.resolve_output_dir("shadow-slave", downloads_root=tmp_path)
+    assert d == tmp_path / "shadow-slave-1"
+    assert d.parent == tmp_path
+    # Critically NOT nested inside the leftover folder.
+    assert d != tmp_path / "webscraped_shadow-slave-1" / "shadow-slave-1"

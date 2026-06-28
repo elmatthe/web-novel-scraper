@@ -13,6 +13,17 @@ from enum import Enum
 from pathlib import Path
 
 
+class EmptyExtractionError(Exception):
+    """An adapter fully fetched a page but found no body paragraphs in it.
+
+    This is its OWN failure class, distinct from a Cloudflare block / network
+    error: the page came back (a real, non-challenge response) but the body
+    container had nothing extractable — usually a markup change on the site. The
+    pipeline records it as a plain chapter failure and must NOT treat it as a
+    block/challenge (so it never triggers auto-slowdown or the second-pass sweep).
+    """
+
+
 class OutputMode(str, Enum):
     """How chapters are grouped into PDF files."""
 

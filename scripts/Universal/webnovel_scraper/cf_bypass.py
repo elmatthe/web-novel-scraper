@@ -24,6 +24,20 @@ All strategies include additional manual stealth patches and human-like
 behavior (random delays, mouse jitter, realistic viewport) to reduce
 detection surface beyond what any single library covers.
 
+Live escalation order used by ``request_manager`` (NOT the "Strategy 1/2/3"
+numbering above, which is historical): camoufox leads the browser rungs because
+it clears the common managed challenge cheaply, and the Chromium
+playwright-stealth rungs are the LAST-RESORT rescue after camoufox is exhausted:
+
+    http -> cloudscraper -> camoufox -> camoufox_fresh
+         -> playwright_stealth -> playwright_stealth_fresh
+
+A live FreeWebNovel challenge was observed to defeat camoufox on every attempt,
+which is why the Chromium-stealth rescue rungs are wired back in after it. Only
+ONE browser engine may be live per thread (camoufox + Chromium each run their own
+sync-Playwright), so ``request_manager`` tears the other engine down before
+starting one.
+
 Usage:
     from cf_bypass import create_stealth_browser, wait_for_cloudflare
 

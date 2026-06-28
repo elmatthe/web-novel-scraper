@@ -31,12 +31,14 @@ logger = logging.getLogger(__name__)
 
 # ── Retry / fetch constants ──────────────────────────────────────────────────
 # MAX_RETRIES is retries after the first attempt. With the default of 6, a fetch
-# can make up to 7 attempts total. The escalation ladder is exhausted after a few
-# rungs, so the later attempts keep hammering the strongest rung (camoufox_fresh)
-# with backoff — the "relentless per-chapter retry" Phase 9 wants for long
+# can make up to 7 attempts total — enough to walk every rung of the 6-rung
+# escalation ladder at least once (http, cloudscraper, camoufox, camoufox_fresh,
+# playwright_stealth, playwright_stealth_fresh), with one extra on the final
+# stealth rung. This is the "relentless per-chapter retry" Phase 9 wants for long
 # unattended runs: a chapter is only recorded failed after this whole ladder AND
-# the pipeline's second-pass sweep both give up. Permanent 403/404 still
-# short-circuit immediately so a genuinely dead chapter never hangs the run.
+# the pipeline's second-pass sweep (which re-walks the same full ladder) both give
+# up. Permanent 403/404 still short-circuit immediately so a genuinely dead
+# chapter never hangs the run.
 MAX_RETRIES = 6
 RETRY_SLEEP = 5.0          # backoff base, seconds
 RETRY_BACKOFF_MULTIPLIER = 3.0
@@ -50,30 +52,46 @@ CF_CLEAR_TIMEOUT = 45.0    # seconds to wait for a Cloudflare challenge to clear
 
 FETCH_STRATEGY_HTTP = "http"
 FETCH_STRATEGY_CLOUDSCRAPER = "cloudscraper"
-FETCH_STRATEGY_BROWSER = "browser"
-FETCH_STRATEGY_BROWSER_FRESH = "browser_fresh"
 FETCH_STRATEGY_CAMOUFOX = "camoufox"
 FETCH_STRATEGY_CAMOUFOX_FRESH = "camoufox_fresh"
-# Camoufox (anti-detect Firefox) is the strongest Cloudflare strategy and is the
-# only one observed to clear FreeWebNovel's challenge, so it leads both browser
-# ladders; the Chromium stealth path is kept as a fallback. A missing camoufox
-# install simply raises and the ladder escalates to the next strategy.
-# The active ladders are camoufox-only for the browser rungs: camoufox runs its
-# own internal sync-Playwright, and starting our Chromium sync-Playwright on the
-# same thread raises "Sync API inside the asyncio loop". The two engines cannot
-# coexist in one run, so the Chromium ``browser``/``browser_fresh`` strategies are
-# kept available but left out of the default ladders (Chromium-stealth does not
-# clear FreeWebNovel's Cloudflare anyway). A missing camoufox install simply
-# raises and, for the default ladder, http/cloudscraper still run first.
+FETCH_STRATEGY_PLAYWRIGHT_STEALTH = "playwright_stealth"
+FETCH_STRATEGY_PLAYWRIGHT_STEALTH_FRESH = "playwright_stealth_fresh"
+# Backwards-compatible aliases (the Chromium stealth rungs were historically named
+# ``browser`` / ``browser_fresh``). Kept so any external caller/log parser keeps
+# resolving; new code uses the playwright_stealth names.
+FETCH_STRATEGY_BROWSER = FETCH_STRATEGY_PLAYWRIGHT_STEALTH
+FETCH_STRATEGY_BROWSER_FRESH = FETCH_STRATEGY_PLAYWRIGHT_STEALTH_FRESH
+
+# Escalation ladder (live-tuned after the first genuine FreeWebNovel Cloudflare
+# challenge, which camoufox alone FAILED to clear on every attempt):
+#   http -> cloudscraper -> camoufox -> camoufox_fresh
+#        -> playwright_stealth -> playwright_stealth_fresh
+# Camoufox (anti-detect Firefox) leads the browser rungs — it clears the common
+# managed challenge cheaply — but is no longer assumed sufficient: the Chromium
+# playwright-stealth rungs are the LAST-RESORT rescue after camoufox is exhausted,
+# since a real FWN challenge has been observed to defeat camoufox where Chromium
+# stealth may still clear.
+#
+# Only ONE browser engine can be live per thread: camoufox runs its own internal
+# sync-Playwright and our Chromium stealth path starts another sync-Playwright;
+# two of them on the same thread raise "Sync API inside the asyncio loop". The
+# fetch methods therefore tear the *other* engine down before starting one
+# (see ``_fetch_camoufox_once`` / ``_fetch_browser_once``), so the ladder can walk
+# from camoufox into the stealth rungs within a single chapter's attempts. A
+# missing camoufox/stealth install simply raises and the ladder escalates on.
 DEFAULT_ESCALATION_LADDER = (
     FETCH_STRATEGY_HTTP,
     FETCH_STRATEGY_CLOUDSCRAPER,
     FETCH_STRATEGY_CAMOUFOX,
     FETCH_STRATEGY_CAMOUFOX_FRESH,
+    FETCH_STRATEGY_PLAYWRIGHT_STEALTH,
+    FETCH_STRATEGY_PLAYWRIGHT_STEALTH_FRESH,
 )
 BROWSER_ESCALATION_LADDER = (
     FETCH_STRATEGY_CAMOUFOX,
     FETCH_STRATEGY_CAMOUFOX_FRESH,
+    FETCH_STRATEGY_PLAYWRIGHT_STEALTH,
+    FETCH_STRATEGY_PLAYWRIGHT_STEALTH_FRESH,
 )
 
 # Repo-root-relative cache root: files/cache/ (request_manager is at
@@ -95,7 +113,13 @@ BROWSER_HEADERS = {
         "image/avif,image/webp,image/apng,*/*;q=0.8"
     ),
     "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
+    # Do NOT advertise Brotli ("br"). ``requests``/``urllib3`` only decode it when
+    # the optional ``brotli`` package is installed; without it a brotli-encoded
+    # response comes back as raw compressed bytes that ``r.text`` mis-decodes into
+    # U+FFFD-replacement-char garbage (the Shadow Slave "chapter 3+ extract zero
+    # paragraphs" bug). gzip and deflate are always decodable, so request only
+    # those — the page content is identical, just gzip-compressed instead.
+    "Accept-Encoding": "gzip, deflate",
     "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
     "Sec-Ch-Ua-Mobile": "?0",
     "Sec-Ch-Ua-Platform": '"Windows"',
@@ -136,6 +160,32 @@ class ScrapeCancelled(Exception):
 # cannot drift. ``is_cloudflare_challenge`` is re-exported here unchanged so
 # existing callers/tests that use ``request_manager.is_cloudflare_challenge`` keep
 # working.
+
+
+# A body dominated by U+FFFD replacement characters was served in a
+# content-encoding the HTTP client could not decode (e.g. brotli without the
+# brotli package). It is not real HTML — never cache it or hand it to a parser.
+_REPLACEMENT_CHAR = "�"
+_GARBLED_ABS_FLOOR = 32        # ignore the odd stray replacement char on tiny pages
+_GARBLED_RATIO = 0.02         # >2% replacement chars => mis-decoded binary, not HTML
+
+
+def _looks_garbled(html: str) -> bool:
+    """True when ``html`` is mis-decoded binary (an undecodable content-encoding).
+
+    Real HTML effectively never contains U+FFFD replacement characters; a
+    brotli/compressed body that ``requests`` could not decode is ~40% of them.
+    Used as a guard so an undecodable response is treated as a retryable fetch
+    failure (escalate the ladder) instead of being cached and silently failing
+    body extraction downstream.
+    """
+    if not html:
+        return False
+    n = len(html)
+    if n < 200:
+        return False
+    bad = html.count(_REPLACEMENT_CHAR)
+    return bad >= _GARBLED_ABS_FLOOR and (bad / n) > _GARBLED_RATIO
 
 
 def cache_key_for(url: str) -> str:
@@ -289,10 +339,19 @@ class RequestManager:
         if not (self.use_cache and cache_path.is_file()):
             return None
         try:
-            return cache_path.read_text(encoding="utf-8")
+            html = cache_path.read_text(encoding="utf-8")
         except Exception as exc:  # corrupt/locked cache -> re-fetch
             self._log(f"Cache read failed for {cache_path.name}: {exc}; re-fetching.")
             return None
+        # Self-heal a poisoned cache: an entry written before the brotli fix may be
+        # mis-decoded garbage. Ignore it (and re-fetch cleanly) rather than serving
+        # garbage that fails body extraction downstream.
+        if _looks_garbled(html):
+            self._log(
+                f"Cache entry {cache_path.name} is garbled (undecodable); re-fetching."
+            )
+            return None
+        return html
 
     def _write_cache(self, cache_path: Path, html: str) -> None:
         if not self.use_cache:
@@ -336,9 +395,9 @@ class RequestManager:
             html = self._get_text(self.session, url)
         elif strategy == FETCH_STRATEGY_CLOUDSCRAPER:
             html = self._get_text(self._cloudscraper(), url)
-        elif strategy == FETCH_STRATEGY_BROWSER:
+        elif strategy == FETCH_STRATEGY_PLAYWRIGHT_STEALTH:
             html = self._fetch_browser_once(url, fresh_context=False)
-        elif strategy == FETCH_STRATEGY_BROWSER_FRESH:
+        elif strategy == FETCH_STRATEGY_PLAYWRIGHT_STEALTH_FRESH:
             html = self._fetch_browser_once(url, fresh_context=True)
         elif strategy == FETCH_STRATEGY_CAMOUFOX:
             html = self._fetch_camoufox_once(url, fresh_context=False)
@@ -347,6 +406,11 @@ class RequestManager:
         else:
             raise ValueError(f"Unknown fetch strategy: {strategy}")
 
+        if _looks_garbled(html):
+            raise _RetryableFetch(
+                f"undecodable response from {strategy} (an unsupported "
+                "content-encoding); escalating instead of caching garbage"
+            )
         if is_cloudflare_challenge(html):
             raise _RetryableFetch(f"Cloudflare challenge returned by {strategy}")
         return html
@@ -462,7 +526,25 @@ class RequestManager:
                     self._log(f"  (browser reset: {attr} -> {exc})")
                 setattr(self, attr, None)
 
+    def _teardown_chromium(self) -> None:
+        """Fully stop the Chromium stealth engine, INCLUDING its sync-Playwright
+        driver. Needed before starting Camoufox: Camoufox runs its own internal
+        sync-Playwright and two sync-Playwright loops on one thread raise "Sync API
+        inside the asyncio loop". (``_reset_browser`` keeps the driver alive for a
+        fresh-context reset; this also stops the driver.)"""
+        self._reset_browser()
+        if self._pw is not None:
+            try:
+                self._pw.stop()
+            except Exception as exc:
+                self._log(f"  (chromium teardown: _pw -> {exc})")
+            self._pw = None
+
     def _fetch_browser_once(self, url: str, *, fresh_context: bool) -> str:
+        # One browser engine per thread: tear down any live Camoufox engine before
+        # starting Chromium stealth (their sync-Playwright loops cannot coexist).
+        if self._cf_cm is not None or self._cf_page is not None:
+            self._reset_camoufox()
         if fresh_context:
             self._reset_browser()
 
@@ -503,6 +585,11 @@ class RequestManager:
                 self._log(f"  (camoufox reset: {exc})")
 
     def _fetch_camoufox_once(self, url: str, *, fresh_context: bool) -> str:
+        # One browser engine per thread: fully stop any live Chromium stealth engine
+        # (including its sync-Playwright driver) before starting Camoufox, which
+        # spins up its own sync-Playwright internally.
+        if self._pw is not None or self._page is not None:
+            self._teardown_chromium()
         if fresh_context:
             self._reset_camoufox()
 

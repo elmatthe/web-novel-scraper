@@ -85,16 +85,21 @@ unless you want to watch the browser work.
 
 ## Where the files go
 
-Finished PDFs are saved to your Downloads folder, in a new folder named for the
-novel, for example:
+By default, finished PDFs are saved to your Downloads folder in a new folder named
+for the novel, for example:
 
 ```
-C:\Users\<you>\Downloads\webscraped_shadow-slave-1\
+C:\Users\<you>\Downloads\shadow-slave-1\
 ```
 
-Each run creates a fresh numbered folder, so a new run never overwrites an old one.
-The app also remembers what it already downloaded, so if you stop and re-run, it
-skips chapters you already have.
+You can change this before you start: click **Browse…** next to **Output folder**
+to pick any folder with the normal Windows picker, and optionally type a **Folder
+name** of your own (leave it blank to use the novel's name).
+
+Either way, a number (`-1`, `-2`, …) is added to the end, so each run creates a
+fresh folder and a new run never overwrites an old one. The app also remembers what
+it already downloaded, so if you stop and re-run **into the same folder**, it skips
+chapters you already have.
 
 ## Platform
 

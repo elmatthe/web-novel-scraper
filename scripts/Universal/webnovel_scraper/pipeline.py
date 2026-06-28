@@ -40,7 +40,14 @@ from typing import Callable, Iterable, Optional
 from . import catalog
 from . import pdf_builder
 from .adapters.base import BaseAdapter
-from .models import ChapterContent, ChapterMeta, OutputMode, ScrapeJob, SiteSpec
+from .models import (
+    ChapterContent,
+    ChapterMeta,
+    EmptyExtractionError,
+    OutputMode,
+    ScrapeJob,
+    SiteSpec,
+)
 from .registry import REGISTRY, AdapterDisabledError
 from .request_manager import RequestManager, ScrapeCancelled
 
@@ -130,6 +137,7 @@ class RunReport:
     skipped_existing: list[int] = field(default_factory=list)  # resume-skipped ch.
     failed: list[int] = field(default_factory=list)          # ch. still failed after sweep
     permanent_failed: list[int] = field(default_factory=list)  # 403/404 — not swept
+    extraction_failed: list[int] = field(default_factory=list)  # fetched OK but no body — not swept, not a block
     rescued: list[int] = field(default_factory=list)         # ch. saved by the 2nd-pass sweep
     warnings: list[str] = field(default_factory=list)        # adapter + pipeline warnings
     cancelled: bool = False
@@ -151,6 +159,11 @@ class RunReport:
             lines.append(
                 f"  Rescued by 2nd-pass sweep: {len(self.rescued)}"
             )
+        if self.extraction_failed:
+            lines.append(
+                "  Extraction failures (page fetched but no body found): "
+                f"{len(self.extraction_failed)}"
+            )
         if self.auto_slowdowns:
             lines.append(
                 f"  Auto-slowdown raised the inter-fetch delay to "
@@ -171,20 +184,50 @@ class RunReport:
 
 # ── Output-dir resolution ────────────────────────────────────────────────────
 def resolve_output_dir(
-    novel_slug: str, *, downloads_root: Optional[Path] = None
+    novel_slug: str,
+    *,
+    downloads_root: Optional[Path] = None,
+    parent_dir: Optional[Path] = None,
+    base_name: Optional[str] = None,
 ) -> Path:
-    """Return the next free ``webscraped_{slug}-N`` dir under Downloads.
+    """Return the next free ``{base_name or slug}-N`` dir under the parent folder.
 
-    Auto-increments ``N`` so a fresh run never clobbers a previous one. The path
-    is **not** created here — the pipeline creates ``job.output_dir`` when it
+    Defaults (the user touches nothing): ``~/Downloads/{slug}-N`` — e.g.
+    ``~/Downloads/shadow-slave-1`` — where ``N`` auto-increments to the first
+    folder that does not already exist, so a fresh run never clobbers a previous
+    one.
+
+    The GUI can override either side without moving any logic out of the pipeline:
+      * ``parent_dir`` — a custom parent folder the user browsed to (else
+        ``downloads_root`` for tests, else ``~/Downloads``).
+      * ``base_name`` — a custom folder name the user typed (sanitised for the
+        filesystem; falls back to the slug when blank/empty after sanitising).
+
+    The ``-N`` auto-increment is applied against the chosen ``parent + name`` too,
+    so a custom run also never overwrites an existing folder of the same name. The
+    path is **not** created here — the pipeline creates ``job.output_dir`` when it
     runs. Resolved via ``Path.home()`` so it is platform-neutral (never a
-    hardcoded ``C:\\Users\\...``); ``downloads_root`` overrides for tests.
+    hardcoded ``C:\\Users\\...``).
     """
-    root = downloads_root if downloads_root is not None else (Path.home() / "Downloads")
+    if parent_dir is not None:
+        root = Path(parent_dir)
+    elif downloads_root is not None:
+        root = Path(downloads_root)
+    else:
+        root = Path.home() / "Downloads"
+
+    name = (base_name or "").strip()
+    if name:
+        # Sanitise a user-typed name (strips path separators / illegal chars); a
+        # name that sanitises away entirely falls back to the slug.
+        name = BaseAdapter.safe_filename(name) or novel_slug
+    else:
+        name = novel_slug
+
     n = 1
-    while (root / f"webscraped_{novel_slug}-{n}").exists():
+    while (root / f"{name}-{n}").exists():
         n += 1
-    return root / f"webscraped_{novel_slug}-{n}"
+    return root / f"{name}-{n}"
 
 
 # ── Chapter-index persistence (pipeline-level, output-dir scoped) ─────────────
@@ -471,6 +514,20 @@ def _fetch_one(
         content = adapter.fetch_chapter(meta, spec)  # type: ignore[attr-defined]
     except ScrapeCancelled:
         raise
+    except EmptyExtractionError as exc:
+        # The page WAS fetched (a real, non-challenge response) but had no
+        # extractable body. This is an extraction failure, NOT a block: record it
+        # as a plain failure, but do NOT register an auto-slowdown step and do NOT
+        # mark it sweepable (re-fetching the same page yields the same empty body).
+        log(f"  chapter {meta.index} FAILED (extraction, not a block): {exc}")
+        if meta.index not in report.failed:
+            report.failed.append(meta.index)
+        if meta.index not in report.extraction_failed:
+            report.extraction_failed.append(meta.index)
+        # Still observe normal inter-fetch politeness (pacer was not raised).
+        if sleep_after and not _cancelled(cancel_event):
+            pacer.sleep()
+        return None
     except Exception as exc:  # one bad chapter must never kill the run
         log(f"  chapter {meta.index} FAILED: {exc}")
         if meta.index not in report.failed:
@@ -492,8 +549,14 @@ def _fetch_one(
 
 
 def _sweepable(report: RunReport) -> list[int]:
-    """Indices eligible for the second-pass sweep: failed but not permanent."""
-    return [i for i in report.failed if i not in report.permanent_failed]
+    """Indices eligible for the second-pass sweep: failed, but neither a permanent
+    403/404 nor an extraction failure (a fetched-but-empty page does not change on
+    an immediate re-fetch, so sweeping it only wastes a request)."""
+    return [
+        i
+        for i in report.failed
+        if i not in report.permanent_failed and i not in report.extraction_failed
+    ]
 
 
 def _run_separate(job, spec, adapter, output_dir, in_range, report, log,
@@ -564,7 +627,10 @@ def _fetch_block_with_sweep(
         )
         if content is not None:
             contents[meta.index] = content
-        elif meta.index not in report.permanent_failed:
+        elif (
+            meta.index not in report.permanent_failed
+            and meta.index not in report.extraction_failed
+        ):
             failed_metas.append(meta)
         state.tick()
 
@@ -628,7 +694,10 @@ def _run_chunked(job, spec, adapter, output_dir, in_range, stem, report, log,
             )
             if content is not None:
                 contents[meta.index] = content
-            elif meta.index not in report.permanent_failed:
+            elif (
+                meta.index not in report.permanent_failed
+                and meta.index not in report.extraction_failed
+            ):
                 failed_metas.append(meta)
                 entry_for_index[meta.index] = entry
             state.tick()

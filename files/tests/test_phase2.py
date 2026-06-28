@@ -159,12 +159,15 @@ def test_fetch_retry_succeeds_on_attempt_2_3_or_4(
 
 
 def test_fetch_escalation_ladder_advances_per_attempt(tmp_path, monkeypatch) -> None:
+    # max_retries=5 -> 6 attempts, exactly enough to walk every rung of the 6-rung
+    # ladder (http, cloudscraper, camoufox, camoufox_fresh, playwright_stealth,
+    # playwright_stealth_fresh) once.
     sleeps: list[float] = []
     mgr = RequestManager(
         "s",
         use_cache=False,
         cache_root=tmp_path,
-        max_retries=3,
+        max_retries=5,
         retry_jitter_ratio=0.0,
         sleep_fn=sleeps.append,
     )
@@ -179,8 +182,14 @@ def test_fetch_escalation_ladder_advances_per_attempt(tmp_path, monkeypatch) -> 
     with pytest.raises(rm.FetchError):
         mgr.fetch("https://example.com/cf")
 
+    # Every rung walked, in order — including the two stealth rescue rungs.
     assert strategies == list(rm.DEFAULT_ESCALATION_LADDER)
-    assert sleeps == [5.0, 15.0, 45.0]
+    assert strategies[-2:] == [
+        rm.FETCH_STRATEGY_PLAYWRIGHT_STEALTH,
+        rm.FETCH_STRATEGY_PLAYWRIGHT_STEALTH_FRESH,
+    ]
+    # Backoff is computed/capped per retry: 5, 15, 45, 120 (capped), 120 (capped).
+    assert sleeps == [5.0, 15.0, 45.0, 120.0, 120.0]
 
 
 def test_fetch_use_browser_starts_on_browser_ladder(tmp_path, monkeypatch) -> None:
@@ -204,10 +213,15 @@ def test_fetch_use_browser_starts_on_browser_ladder(tmp_path, monkeypatch) -> No
     monkeypatch.setattr(mgr, "_fetch_uncached_strategy", fake_strategy)
 
     assert mgr.fetch("https://example.com/cf", use_browser=True) == "<html>browser ok</html>"
-    # Browser mode is camoufox-only: camoufox, then camoufox_fresh (no Chromium —
-    # the two sync-Playwright engines can't share a thread).
-    assert strategies == list(rm.BROWSER_ESCALATION_LADDER)
+    # Browser mode starts on the browser ladder: camoufox first, then camoufox_fresh
+    # (with max_retries=1 only the first two rungs are reached here). The full
+    # browser ladder also ends with the playwright_stealth rescue rungs.
+    assert strategies == list(rm.BROWSER_ESCALATION_LADDER[:2])
     assert strategies[0] == rm.FETCH_STRATEGY_CAMOUFOX
+    assert rm.BROWSER_ESCALATION_LADDER[-2:] == (
+        rm.FETCH_STRATEGY_PLAYWRIGHT_STEALTH,
+        rm.FETCH_STRATEGY_PLAYWRIGHT_STEALTH_FRESH,
+    )
     assert sleeps == [5.0]
 
 

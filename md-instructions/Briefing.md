@@ -30,9 +30,14 @@ and never ships. The pytest suite is at `files/tests/`, its fixtures at
   maps `site_key -> adapter`. 0.1.0 ships two enabled adapters (`freewebnovel`,
   `webnovel_dynamic`) and three disabled stubs (`empire_novel`, `novel_bin`, `telegraph`).
 - `request_manager.py` â€” HTTP/browser fetching with configurable per-fetch
-  retries, exponential backoff + jitter, an ordered Cloudflare escalation ladder
-  (plain HTTP -> cloudscraper -> Playwright stealth -> fresh Playwright context /
-  new UA), on-disk HTML cache, and a Cloudflare-aware browser path (`cf_bypass.py`).
+  retries, exponential backoff + jitter, and the ordered Cloudflare escalation
+  ladder `http -> cloudscraper -> camoufox -> camoufox_fresh -> playwright_stealth
+  -> playwright_stealth_fresh` (camoufox leads the browser rungs; the Chromium
+  playwright-stealth rungs are the last-resort rescue after a live FWN challenge was
+  found to defeat camoufox). Only one browser engine is live per thread — the fetch
+  methods tear the other engine down before starting one, so the ladder can walk
+  from camoufox into the stealth rungs within a single chapter's attempts. Plus an
+  on-disk HTML cache and the Cloudflare-aware browser path (`cf_bypass.py`).
 - `cloudflare_detection.py` â€” the one shared `is_cloudflare_challenge` detector
   imported by both `request_manager` and `cf_bypass` (so they cannot drift). Strong
   interstitial markers flag immediately; ambient beacon markers clear only on
@@ -51,9 +56,14 @@ suite in `files/tests/` (a `conftest.py` there puts `scripts/Universal/` on
 `sys.path` so `import webnovel_scraper` resolves).
 
 ## Current Version
-0.1.0 (release-ready â€” pending the user's manual live-scrape pass + tag/force-push).
-Phase 9 (live-scrape hardening) and its review fixes are implemented; suite is
-**106 offline tests**, `verify` green.
+0.1.1 (release-ready â€” pending the user's manual live-scrape pass + tag/force-push).
+Phase 9 (live-scrape hardening) and its review fixes are implemented; the 0.1.1
+post-live-pass session added the brotli body-extraction fix, the
+extraction-failure misclassification fix, the user-choosable output folder, a
+follow-up fix to that feature's doubled-folder nesting bug, and the playwright-
+stealth Cloudflare rescue rungs + strengthened end-of-run sweep (after camoufox was
+live-proven insufficient against a real FWN challenge).
+Suite is **128 offline tests**, `verify` green.
 
 ## What Has Been Built
 - **Phase 0 (scaffold) â€” complete:** git repo initialized on `feature/v0.1.0-build`;
@@ -104,7 +114,8 @@ Phase 9 (live-scrape hardening) and its review fixes are implemented; suite is
   chapters. Output modes: **SEPARATE** (one PDF per chapter, `safe_filename(heading)`),
   **CHUNKED** (`{Stem}_Chapters_{a}-{b}.pdf`), **SINGLE** (`{Stem}_All_Chapters.pdf`),
   each through `pdf_builder.create_pdf` (which strips heading-only pages).
-  `resolve_output_dir()` returns the next free `~/Downloads/webscraped_{slug}-N`.
+  `resolve_output_dir()` returns the next free `~/Downloads/{slug}-N` (optionally
+  a user-chosen parent folder and/or custom folder name via the GUI Browse… picker).
   Returns a `RunReport` (written / skipped / failed counts + a resume hint).
   New `test_phase5_pipeline.py` (11 offline cases: the three modes, resume skips,
   range clamp, disabled-adapter refusal incl. all three stubs, cancellation,
@@ -247,6 +258,77 @@ Phase 9 (live-scrape hardening) and its review fixes are implemented; suite is
     transient (only 403/404 are permanent); and the `_Pacer` ceiling is now an
     absolute cap on the base delay too. +5 regression tests → **106 offline tests**.
 
+- **0.1.1 post-live-pass fixes (2026-06-28) â€” complete:** two live-discovered
+  defects plus a requested feature.
+  - **Brotli body-extraction fix (Critical).** Live Shadow Slave chapters 3+ all
+    failed "Could not extract body paragraphs" while chapters 1â€“2 worked. Root
+    cause: `request_manager` advertised `Accept-Encoding: gzip, deflate, br`, but
+    `requests` cannot decode Brotli without the optional `brotli` package, so a
+    brotli-encoded chapter came back as U+FFFD-replacement-char garbage (~15 KB,
+    no `<html>`) that yielded zero paragraphs. (Chapters 1â€“2 had been cached clean
+    from an earlier run; 3+ hit the brotli path fresh.) The adapter selectors were
+    never wrong â€” the real current FWN markup extracts 50 paragraphs once correctly
+    decoded. Fix: drop `br` from the header (gzip/deflate are always decodable); add
+    a `_looks_garbled` guard that treats an undecodable response (>2% replacement
+    chars) as a retryable fetch failure so the ladder escalates instead of caching
+    garbage; and self-heal a previously-poisoned cache entry on read (a garbled
+    cache file is ignored and re-fetched).
+  - **Extraction-failure misclassification fix.** An empty-extraction outcome (a
+    fully-fetched, non-challenge page with no body) was routed into the
+    block/challenge path: `pipeline._fetch_one` called `pacer.register_block()`,
+    driving the auto-slowdown up (5.2â†’7.9â†’â€¦â†’30s) on what was not a Cloudflare
+    block. Now its own `models.EmptyExtractionError` class (raised by both the FWN
+    and WND adapters): recorded in `RunReport.failed` and the new
+    `RunReport.extraction_failed`, but **never** registers a block (no
+    auto-slowdown) and is **excluded from the second-pass sweep** (re-fetching the
+    same page yields the same empty body).
+  - **User-choosable output folder (feature).** The default output folder name is
+    now `{slug}-N` (e.g. `shadow-slave-1`), renamed from `webscraped_{slug}-N`.
+    `resolve_output_dir` gained optional `parent_dir` + `base_name` params
+    (defaulting to the prior behaviour, with the `-N` no-overwrite increment
+    applied to any custom parent+name). `app.py` added an **Output folder** row: a
+    read-only parent display + a native **Browse…** picker (`filedialog.
+    askdirectory`) and an optional **Folder name** entry (blank = the novel slug).
+    All path logic stays in `resolve_output_dir`; the GUI is a thin shell.
+  - **Output-folder nesting follow-up fix.** The feature above shipped with a
+    doubled-folder bug: a live run wrote `…/Downloads/webscraped_shadow-slave-1/
+    shadow-slave-1`. `resolve_output_dir` was correct, but the GUI's read-only
+    field both displayed and held the *parent* and `Browse…` wrote the picked
+    folder back into it, so a prior/browsed output folder became the next run's
+    `parent_dir` (nesting one level per run). Fixed: `app.py` keeps the chosen
+    parent in a dedicated `self._output_parent` Path (default `~/Downloads`,
+    changed only by Browse), and the read-only field now shows a live preview of
+    the resolved **target** (`<parent>/{name}-N`) which is never fed back as a
+    parent; `resolve_output_dir` is called via one `_resolve_output_dir` helper for
+    both preview and run, always from the stored parent. `chapter_index.json` stays
+    in the output dir (resume source of truth; relocating would break same-folder
+    resume) — flagged cosmetic, left in place.
+  - New `files/test-files/fwn_chapter_current_ok.html` (real current FWN chapter,
+    sanitised) + `fwn_chapter_brotli_garbage.html` (the actual poisoned cache
+    artifact). New `test_brotli_extraction_fix.py` (7 cases); `test_phase5_pipeline.py`
+    (+3 nesting/sibling/old-prefix cases) and `test_phase8_gui.py` (+1 single-level
+    target-preview case) extended for the output-folder default/feature/nesting fix.
+    Suite: **120 offline tests**, `verify` green.
+  - **Cloudflare ladder: playwright-stealth rescue rungs + stronger sweep.** A full
+    Shadow Slave stress-scrape (1–3065) hit the first genuine FWN Cloudflare
+    challenge and camoufox **failed every attempt** (chapters 102, 174, …). The
+    dormant Chromium playwright-stealth strategy is now wired back as the last-resort
+    rungs: `http → cloudscraper → camoufox → camoufox_fresh → playwright_stealth →
+    playwright_stealth_fresh` (constants renamed `FETCH_STRATEGY_PLAYWRIGHT_STEALTH
+    [_FRESH]`, old `…_BROWSER…` names kept as aliases; `BROWSER_ESCALATION_LADDER`
+    gained the same rungs; `MAX_RETRIES` stays 6 = 7 attempts, enough for all six
+    rungs). Camoufox and Chromium-stealth can't share a thread (each runs its own
+    sync-Playwright → "Sync API inside the asyncio loop"), so the fetch methods tear
+    the other engine fully down before starting one (`_teardown_chromium` /
+    `_reset_camoufox`). The Phase-9C end-of-run sweep now re-walks this **full**
+    ladder for every CF-skipped (non-permanent, non-extraction) chapter, giving the
+    Chromium-stealth rescue the main pass camoufox couldn't provide; rescued chapters
+    are written in all three modes, still-failing stay in `RunReport.failed` + the
+    summary. New `test_stealth_rescue.py` (8 cases) + two `test_phase2.py` ladder
+    tests updated. Suite: **128 offline tests**, `verify` green. **Honest status:**
+    offline tests prove only the wiring/flow; whether Chromium stealth actually
+    clears a live FWN challenge is unproven until the next live run.
+
 ## Known Issues
 - **WebNovel camoufox rescue (was the open Critical):** the most likely root cause
   â€” over-eager challenge detection mis-flagging cleared post-redirect pages â€” is
@@ -255,12 +337,16 @@ Phase 9 (live-scrape hardening) and its review fixes are implemented; suite is
   dependent and can only be confirmed by the user's manual pass; the code can no
   longer fail a chapter that camoufox *did* clear, and intermittent failures now
   get the relentless ladder + second-pass sweep instead of an immediate skip.
-- No blocking Critical defects. The FreeWebNovel Cloudflare live-pass Critical is
-  **mitigated/closed for scraper resilience**: a blocked chapter now retries
-  through the escalation ladder, final failure is recorded and skipped, and the
-  rest of the run continues. Honest remaining risk: Cloudflare may still defeat
-  every bypass strategy on a given day, so the user's manual live FWN pass should
-  confirm current success before tagging 0.1.0.
+- **FreeWebNovel Cloudflare bypass — OPEN (camoufox proven insufficient live).**
+  The 1–3065 stress-scrape hit a real FWN managed challenge and **camoufox cleared
+  none of it** (chapters 102, 174, … all failed every camoufox attempt). Scraper
+  *resilience* is solid (blocked chapters retry the full ladder, are recorded/
+  skipped, and the run continues; the end-of-run sweep re-tries them), but the
+  *bypass* is not yet proven: the Chromium playwright-stealth rescue rungs are now
+  wired in after camoufox as the intended fix. **Whether stealth actually clears a
+  live FWN challenge is unconfirmed** — needs a fresh live pass over the known-bad
+  chapters. If stealth also fails, the next levers are headful mode, a residential
+  proxy, or `nodriver` (strategy 3 in `cf_bypass.py`, not yet wired).
 - Both enabled adapters (`freewebnovel`, `webnovel_dynamic`) are implemented;
   `empire_novel`, `novel_bin`, `telegraph` remain intentional disabled stubs for
   a later version.
@@ -275,7 +361,7 @@ Phase 9 (live-scrape hardening) and its review fixes are implemented; suite is
   across all three output modes (with browser mode for Cloudflare and at least
   one uncached chapter to validate the retry ladder), 3
   WebNovel-dynamic chapters, confirm resume skips existing PDFs, Stop cancels
-  cleanly, and output lands in `~/Downloads/webscraped_*`.
+  cleanly, and output lands in `~/Downloads/{slug}-N` (or a custom browsed folder).
 - After the live pass: decide on the six flagged Minor/Suggestion items, tag
   0.1.0, force-push the repo as one release, and delete the implementation-plan
   instruction drop.
@@ -284,23 +370,23 @@ Phase 9 (live-scrape hardening) and its review fixes are implemented; suite is
 Deferred tidy-ups to do AFTER the 0.1.0 live pass and force-push (not before --
 see the note at the end of this list):
 
-1. **Drop `playwright-stealth==2.0.3` and the unreachable Chromium-stealth code.**
-   Remove `create_stealth_browser` / `fetch_with_stealth` (strategy 1) from
-   `cf_bypass.py` and the `FETCH_STRATEGY_BROWSER` / `FETCH_STRATEGY_BROWSER_FRESH`
-   rungs from `request_manager.py` -- none are in the active camoufox-only ladders
-   (`http -> cloudscraper -> camoufox -> camoufox_fresh`). **Keep `playwright`
-   itself** (camoufox depends on it). Pair the dependency removal with deleting the
-   unreachable strategy code and updating any tests that reference it (e.g.
-   `files/tests/test_phase2.py`).
-2. **Rename the GUI "Use Playwright browser mode" checkbox** (`app.py:199`) and its
-   mirror in `README.md` (~line 80) to a neutral "Use browser mode" label, since
-   the engine is now camoufox rather than Playwright/Chromium.
-3. **Update the stale ladder-description comments** in `cf_bypass.py` (~lines
-   34/189) that still read "Playwright stealth -> fresh Playwright context" so they
-   reflect the camoufox-only ladder.
+1. **~~Drop `playwright-stealth` and the unreachable Chromium-stealth code.~~
+   CANCELLED / SUPERSEDED (2026-06-28).** The 1–3065 live stress-scrape proved
+   camoufox **insufficient** against a real FreeWebNovel Cloudflare challenge, so
+   strategy-1 Chromium playwright-stealth was wired back into the live ladder as the
+   last-resort rescue rungs (`… → camoufox_fresh → playwright_stealth →
+   playwright_stealth_fresh`). `playwright-stealth` is now **required**, not
+   droppable. Do not remove it.
+2. **Rename the GUI "Use Playwright browser mode" checkbox** (`app.py`) and its
+   mirror in `README.md` to a neutral "Use browser mode" label — the browser path
+   now spans camoufox *and* Chromium playwright-stealth, so "Playwright browser
+   mode" is imprecise. (Cosmetic; still open.)
+3. **~~Update the stale `cf_bypass.py` ladder-description comments.~~ DONE
+   (2026-06-28).** The cf_bypass docstring now documents the live ladder order, and
+   the request_manager ladder comment is current. The old "Playwright stealth ->
+   fresh Playwright context" comments no longer exist.
 
-**Important -- do NOT do these before the live pass:** keep `playwright-stealth`
-and the strategy-1 Chromium-stealth path in place THROUGH the live pass. If
-camoufox fails to clear a live WebNovel Cloudflare challenge, the dormant
-strategy 1 is the fallback that can be wired in as a rescue rung. Only clean it
-out once the live pass confirms camoufox alone is sufficient.
+**Note:** the earlier "keep strategy-1 through the live pass in case camoufox
+fails" caveat has now played out exactly — camoufox failed live, strategy-1 is the
+wired rescue. Whether strategy-1 itself clears a live FWN challenge is still
+unproven (see Known Issues).

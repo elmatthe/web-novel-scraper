@@ -22,7 +22,7 @@ from urllib.parse import urldefrag, urljoin, urlparse
 
 from bs4 import BeautifulSoup
 
-from ..models import ChapterContent, ChapterMeta, SiteSpec
+from ..models import ChapterContent, ChapterMeta, EmptyExtractionError, SiteSpec
 from .base import BaseAdapter
 
 logger = logging.getLogger(__name__)
@@ -452,7 +452,10 @@ class FreeWebNovelAdapter(BaseAdapter):
         )
         paragraphs = _extract_paragraphs(soup, heading_for_filter)
         if not paragraphs:
-            raise RuntimeError(
+            # A fully-fetched, non-challenge page with no extractable body is an
+            # extraction failure (its own class) — NOT a Cloudflare block. The
+            # pipeline records it as a plain failure without auto-slowdown.
+            raise EmptyExtractionError(
                 f"Could not extract body paragraphs for chapter {meta.index}."
             )
 

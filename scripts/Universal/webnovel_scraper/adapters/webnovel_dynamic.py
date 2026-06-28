@@ -30,7 +30,7 @@ from typing import Optional
 
 from bs4 import BeautifulSoup
 
-from ..models import ChapterContent, ChapterMeta, SiteSpec
+from ..models import ChapterContent, ChapterMeta, EmptyExtractionError, SiteSpec
 from .base import BaseAdapter
 
 logger = logging.getLogger(__name__)
@@ -378,7 +378,9 @@ class WebNovelDynamicAdapter(BaseAdapter):
         raw_title, paragraphs = extract_chapter(html, meta.index)
 
         if not paragraphs:
-            raise RuntimeError(
+            # Fully-fetched page, no extractable body: an extraction failure (its
+            # own class), NOT a Cloudflare block — see EmptyExtractionError.
+            raise EmptyExtractionError(
                 f"Could not extract body paragraphs for chapter {meta.index} "
                 f"({meta.url})."
             )

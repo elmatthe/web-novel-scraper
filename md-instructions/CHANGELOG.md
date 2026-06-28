@@ -3,6 +3,145 @@
 All notable changes to this project are recorded here. Versions follow semantic
 versioning.
 
+## [0.1.1] — 2026-06-28
+
+Post-live-pass fixes: two live-discovered defects from a Shadow Slave
+FreeWebNovel scrape, plus a requested output-folder feature — and follow-up fixes
+to a nesting bug that feature shipped with and to the Cloudflare escalation ladder.
+
+### Changed — Cloudflare ladder: playwright-stealth rescue rungs + stronger end-of-run sweep
+- **Live finding.** A full Shadow Slave stress-scrape (chapters 1–3065) produced
+  the project's first genuine FreeWebNovel Cloudflare challenge. The result was
+  negative: on chapters 102, 174 (and likely others) the whole
+  `http → cloudscraper → camoufox → camoufox_fresh (×4)` ladder ran and **every
+  camoufox attempt** returned "Cloudflare challenge still present after camoufox
+  fetch." Camoufox alone does **not** clear a real FWN challenge; those chapters
+  were correctly recorded failed and skipped, leaving gaps. This reverses the
+  standing assumption that camoufox is sufficient.
+- **Rescue rungs wired in.** The dormant Chromium playwright-stealth strategy
+  (strategy-1 in `cf_bypass.py`) is now wired back into the live ladder as the
+  **last-resort** rungs after camoufox:
+  `http → cloudscraper → camoufox → camoufox_fresh → playwright_stealth →
+  playwright_stealth_fresh`. The strategy constants were renamed
+  `FETCH_STRATEGY_BROWSER[_FRESH]` → `FETCH_STRATEGY_PLAYWRIGHT_STEALTH[_FRESH]`
+  (old names kept as aliases) so the live log reads clearly. `BROWSER_ESCALATION_
+  LADDER` (browser-mode) gained the same two rungs. `MAX_RETRIES` stays 6 (7
+  attempts) — exactly enough to walk all six rungs once with one extra on the final
+  stealth rung; the permanent 403/404 short-circuit is intact.
+- **One engine per thread.** Camoufox and our Chromium-stealth path each run their
+  own sync-Playwright, which cannot coexist on one thread ("Sync API inside the
+  asyncio loop"). The fetch methods now tear the *other* engine fully down before
+  starting one (`_teardown_chromium` stops the Chromium driver before camoufox;
+  `_reset_camoufox` runs before Chromium stealth), so the ladder can walk from
+  camoufox into the stealth rungs within a single chapter's attempt sequence.
+- **Stronger end-of-run sweep.** The Phase-9C second-pass sweep over non-permanent,
+  non-extraction failures now has teeth: because the ladder it re-walks includes the
+  stealth rescue rungs (and a failed chapter is never cached), every CF-skipped
+  chapter gets a genuine end-of-session retry through the **full** ladder — the
+  Chromium-stealth rescue it never had before — at the auto-slowed delay. Rescued
+  chapters move to `RunReport.rescued` and are written (SEPARATE: own PDF post-loop;
+  CHUNKED/SINGLE: before the group/file PDF). Anything still failing stays in
+  `RunReport.failed` and is listed in the summary with the resume hint.
+- `is_cloudflare_challenge` already clears a stealth-cleared page content-aware
+  (strong markers flag; ambient beacon clears on structural payload such as the FWN
+  `class="txt"` body container), so a genuinely-cleared stealth fetch is recognised
+  as success — no detection change needed.
+- **Honest status:** offline tests prove the wiring/flow (the ladder reaches the
+  stealth rungs, the sweep re-walks the full ladder, a stealth-rung clear is
+  rescued and written). Whether Chromium playwright-stealth actually defeats a live
+  FWN Cloudflare challenge is **unproven** until the user's next live run — camoufox
+  was proven insufficient; strategy-1 is the wired rescue still awaiting live
+  confirmation.
+- Tests: new `files/tests/test_stealth_rescue.py` (ladder order incl. the two
+  stealth rungs; a chapter advancing camoufox_fresh → stealth; one-engine-per-thread
+  teardown both directions; end-to-end sweep-reaches-stealth-and-rescues in all
+  three output modes; fails-every-rung stays failed + in summary). Updated two
+  `test_phase2.py` ladder tests for the longer ladders. Suite: **128 offline
+  tests**, `verify` green.
+
+### Fixed — output folder nested a folder per run (doubled-folder bug)
+- **Symptom.** A live run logged `Output: …\Downloads\webscraped_shadow-slave-1\
+  shadow-slave-1` — the new `{slug}-N` folder was created *inside* the previous
+  run's leftover folder instead of at the top of Downloads.
+- **Root cause.** `resolve_output_dir` was correct, but the GUI's read-only
+  "Output folder" field both displayed *and* held the **parent** directory, and
+  `Browse…` wrote the picked folder into that same field, which was then passed
+  back as `parent_dir`. The original Task 2 spec called for the read-only field to
+  show the **target** path while Browse picks the parent; conflating the two meant
+  a previously-created (or browsed) output folder could become the next run's
+  parent, nesting one level per run.
+- **Fix.** `app.py` now keeps the chosen parent in a dedicated `self._output_parent`
+  `Path` (default `~/Downloads`, changed **only** by `Browse…`), and the read-only
+  field shows a live preview of the resolved **target** (`<parent>/{name}-N`),
+  which is never fed back as a parent. `resolve_output_dir` is called from one
+  helper (`_resolve_output_dir`) for both the preview and the actual run, always
+  from the stored parent Path — so a resolved output dir can never be reused as a
+  parent. Confirmed: the pre-rename `webscraped_{slug}-N` folders do not interfere
+  with the new `{slug}-N` collision scan; a fresh default run yields exactly
+  `~/Downloads/{slug}-1` at the top level.
+- `chapter_index.json` stays in the output dir (it is the documented, output-dir-
+  scoped resume source of truth; relocating it would break "re-run into the same
+  folder to resume"). Flagged as a cosmetic item, left in place per policy.
+- Tests: +3 `resolve_output_dir` cases in `test_phase5_pipeline.py` (default is
+  single-level; the `-N` increment is a sibling, never nested; old `webscraped_`
+  folders are ignored) and +1 GUI case in `test_phase8_gui.py` (the target preview
+  is one level under Downloads and the parent passed is the Downloads base, not the
+  target). Suite: **120 offline tests**, `verify` green.
+
+### Fixed — FreeWebNovel body extraction (brotli decode)
+- **Root cause.** On the live scrape, chapters 1–2 wrote PDFs but chapters 3+ all
+  failed with "Could not extract body paragraphs". The HTTP layer advertised
+  `Accept-Encoding: gzip, deflate, br`, but `requests` cannot decode Brotli
+  without the optional `brotli` package — so a brotli-encoded chapter page came
+  back as U+FFFD-replacement-char garbage (~15 KB, no real HTML), which yielded
+  zero paragraphs. Chapters 1–2 happened to be cached clean from an earlier run;
+  3+ hit the brotli path fresh this session. The adapter's body selectors were
+  **not** the problem — the correctly-decoded current FWN markup extracts a full
+  body (50 paragraphs) with the unchanged selectors.
+- **Fix.** `request_manager.BROWSER_HEADERS` no longer advertises `br` (gzip and
+  deflate are always decodable; the page content is identical). Added a
+  `_looks_garbled` guard: a response with >2% U+FFFD replacement characters is an
+  undecodable content-encoding and is treated as a **retryable** fetch failure, so
+  the escalation ladder advances instead of caching garbage. Cache reads now
+  self-heal — a previously-poisoned (garbled) cache entry is ignored and
+  re-fetched rather than served.
+
+### Fixed — extraction-failure misclassified as a Cloudflare block
+- An empty-extraction outcome (a fully-fetched, non-challenge page with no
+  extractable body) was being routed into the block/challenge path:
+  `pipeline._fetch_one` called `pacer.register_block()`, ratcheting the adaptive
+  auto-slowdown up (5.2 → 7.9 → … → 30 s) on what was never a Cloudflare block.
+- Empty extraction is now its own `models.EmptyExtractionError` class, raised by
+  both the FreeWebNovel and WebNovel-dynamic adapters. The pipeline records it in
+  `RunReport.failed` and the new `RunReport.extraction_failed`, **does not**
+  register an auto-slowdown block, and **excludes it from the second-pass sweep**
+  (re-fetching the same page yields the same empty body). Genuine Cloudflare
+  blocks still take the slowdown/sweep path unchanged.
+
+### Added — user-choosable output folder + name
+- The default output folder name is now `{slug}-N` (e.g. `shadow-slave-1`),
+  renamed from `webscraped_{slug}-N`.
+- `pipeline.resolve_output_dir` gained optional `parent_dir` and `base_name`
+  parameters (both default to the prior behaviour). A custom name is sanitised for
+  the filesystem and the `-N` no-overwrite auto-increment is applied to any
+  custom parent + name, so a custom run never overwrites an existing folder.
+- `app.py` added an **Output folder** row: a read-only display of the chosen
+  parent folder with a native **Browse…** picker (`tkinter.filedialog.
+  askdirectory`) and an optional **Folder name** entry (blank = the novel slug).
+  All path resolution stays in `resolve_output_dir`; the GUI remains a thin shell
+  and the daemon-thread + Stop/cancel flow is unchanged.
+
+### Tests / docs
+- New fixtures `files/test-files/fwn_chapter_current_ok.html` (the real current
+  FWN chapter, sanitised) and `fwn_chapter_brotli_garbage.html` (the actual
+  poisoned cache artifact from the live run).
+- New `files/tests/test_brotli_extraction_fix.py` (7 cases: current markup
+  extracts; garble detection; no-brotli header; garbled HTTP escalates and is not
+  cached; garbled cache self-heals; empty-extraction classified-not-block and
+  not-swept in separate + single modes). `test_phase5_pipeline.py` updated for the
+  new default name + custom parent/name; `test_phase8_gui.py` extended for the
+  output-folder defaults. Suite: **116 offline tests**, `verify` green.
+
 ## [0.1.0] — 2026-06-24
 
 ### Phase 9 — Live-scrape hardening (2026-06-27)

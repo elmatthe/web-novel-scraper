@@ -1,6 +1,66 @@
 # webnovel-scraper - Handoff
 
-## Current Focus
+## Current Focus (newest)
+**0.1.1 Cloudflare ladder: playwright-stealth rescue rungs + stronger end-of-run
+sweep (2026-06-28) — complete; `verify` green at 128 tests.** A full Shadow Slave
+stress-scrape (1–3065) produced the first genuine FWN Cloudflare challenge and
+camoufox **failed every attempt** (chapters 102, 174, …) — reversing the standing
+"camoufox is sufficient" assumption. Wired the dormant Chromium playwright-stealth
+strategy back into the live ladder as the last-resort rungs:
+`http → cloudscraper → camoufox → camoufox_fresh → playwright_stealth →
+playwright_stealth_fresh` (constants renamed `FETCH_STRATEGY_PLAYWRIGHT_STEALTH
+[_FRESH]`, old `…_BROWSER…` kept as aliases; `BROWSER_ESCALATION_LADDER` gained the
+same two rungs; `MAX_RETRIES` left at 6 = 7 attempts, enough for all six rungs).
+Added one-engine-per-thread teardown (`_teardown_chromium` stops the Chromium driver
+before camoufox; `_reset_camoufox` runs before Chromium stealth) so the two
+sync-Playwright engines never collide. The Phase-9C end-of-run sweep now re-walks
+this full ladder for every CF-skipped (non-permanent, non-extraction) chapter — the
+stealth rescue camoufox couldn't give on the main pass — writing rescued chapters in
+all three modes and leaving the rest in `RunReport.failed` + the summary. New
+`test_stealth_rescue.py` (8) + 2 `test_phase2.py` ladder tests updated. **Honest
+status:** offline tests prove only the wiring/flow; whether Chromium stealth clears a
+live FWN challenge is UNPROVEN until the user's next live run. The brotli + nesting
+fixes are confirmed working live and untouched. NOT committed; plan not deleted.
+
+## Current Focus (prior)
+**0.1.1 output-folder nesting fix (2026-06-28) — complete; `verify` green at 120
+tests.** A live run of the new output-folder feature wrote a *doubled* path
+(`…\Downloads\webscraped_shadow-slave-1\shadow-slave-1`). `resolve_output_dir`
+itself was correct; the GUI's read-only field both displayed and held the parent
+and `Browse…` wrote the picked folder back into it, so a prior/browsed output dir
+became the next run's `parent_dir`, nesting `{slug}-N` one level deeper each run.
+Fixed in `app.py`: the chosen parent now lives in a dedicated `self._output_parent`
+Path (default `~/Downloads`, set **only** by Browse); the read-only field shows a
+live preview of the resolved **target** (`<parent>/{name}-N`) that is never fed
+back as a parent; one `_resolve_output_dir` helper feeds both the preview and the
+run. `chapter_index.json` stays in the output dir (resume source of truth; moving
+it would break same-folder resume — flagged cosmetic, left in place). +3
+`resolve_output_dir` tests + 1 GUI preview test. The brotli body-extraction fix is
+**confirmed working live** and untouched. NOT committed; plan not deleted.
+
+## Current Focus (prior)
+**0.1.1 post-live-pass fixes (2026-06-28) — complete; `verify` green at 116
+tests.** A live Shadow Slave FreeWebNovel scrape surfaced two distinct defects,
+both fixed offline this session, plus a requested feature:
+1. **Brotli body-extraction failure (Critical).** Chapters 3+ failed "Could not
+   extract body paragraphs" because the HTTP layer advertised `Accept-Encoding:
+   …, br` and `requests` can't decode Brotli without the `brotli` package → the
+   page came back as U+FFFD garbage → zero paragraphs. Fix: dropped `br` from the
+   header; added a `_looks_garbled` fetch guard (undecodable → retryable, never
+   cached); cache reads self-heal a poisoned entry. The adapter selectors were
+   never wrong (the decoded current markup extracts 50 paragraphs).
+2. **Extraction-failure misclassification.** An empty-extraction outcome was
+   calling `pacer.register_block()` (auto-slowdown). Now its own
+   `models.EmptyExtractionError`: recorded in `RunReport.failed` +
+   `extraction_failed`, never a block, never swept.
+3. **User-choosable output folder (feature).** Default folder renamed
+   `webscraped_{slug}-N` → `{slug}-N`; `resolve_output_dir` gained `parent_dir` +
+   `base_name`; GUI got an **Output folder** Browse… picker + **Folder name**
+   field. Logic stays in `resolve_output_dir`.
+
+NOT committed (user force-pushes manually). Implementation-plan drop not deleted.
+
+## Current Focus (Phase 9)
 **Phase 9 (live-scrape hardening) implemented — 0.1.0 remains pending the user's
 manual live test + tag/force-push.** This session implemented the five-part Phase
 9 from the plan §8: **9A** GUI inter-fetch delay control ("Delay between fetches
@@ -33,12 +93,22 @@ for the user's manual pass. NOT committed; implementation-plan drop intentionall
 | 5 | Suggestion | scripts/Universal/webnovel_scraper/pdf_builder.py | `PdfReader` in `remove_single_heading_pages` not closed (handle leak). | Flagged â€” awaiting user | Claude Code |
 | 6 | Suggestion | scripts/Universal/webnovel_scraper/pipeline.py | A PDF that fails mid-write would be treated as complete by resume (silent skip on re-run). | Flagged â€” awaiting user | Claude Code |
 | 7 | Critical | scripts/Universal/webnovel_scraper/request_manager.py; scripts/Universal/webnovel_scraper/pipeline.py | FreeWebNovel first-time uncached chapter fetches can hit Cloudflare mid-scrape; prior path risked chapter failures without enough retry/escalation. | **Mitigated/closed for fatal behavior** 2026-06-27 — retry ladder + backoff + strategy escalation added; exhausted chapters are recorded/skipped and the run continues. Live bypass success still needs manual FWN validation. | Codex |
+| 8 | Critical | scripts/Universal/webnovel_scraper/request_manager.py | Live FWN chapters 3+ failed body extraction — `Accept-Encoding: …, br` returned brotli that `requests` could not decode → U+FFFD garbage → zero paragraphs. | **Fixed** 2026-06-28 — dropped `br`; `_looks_garbled` guard (undecodable → retryable, not cached); cache reads self-heal poisoned entries. | Claude Code |
+| 9 | Critical | scripts/Universal/webnovel_scraper/pipeline.py | Empty-extraction outcome misclassified as a Cloudflare block, driving `_Pacer` auto-slowdown to 30 s (every ch. 3+ in the live incident, throttling the run to a near halt + needless camoufox escalation). | **Fixed** 2026-06-28 — own `EmptyExtractionError` class; recorded in `failed`/`extraction_failed`, no block, excluded from sweep. | Claude Code |
+| 10 | Critical | scripts/Universal/app.py | 0.1.1 output-folder feature nested a `{slug}-N` folder inside the prior run's folder (`…/webscraped_shadow-slave-1/shadow-slave-1`): the GUI's read-only field both showed and held the parent, and Browse wrote the picked folder back into it, so a prior output dir became the next run's `parent_dir`. | **Fixed** 2026-06-28 — parent kept in a dedicated `_output_parent` Path (set only by Browse); read-only field shows the resolved target preview, never fed back as a parent; one `_resolve_output_dir` helper. | Claude Code |
+| 11 | Critical | scripts/Universal/webnovel_scraper/request_manager.py; scripts/Universal/webnovel_scraper/cf_bypass.py | Live (1–3065) FWN Cloudflare challenge: camoufox cleared NONE of it — the whole `http→cloudscraper→camoufox→camoufox_fresh` ladder failed on chapters 102, 174, … So the camoufox-only ladder is live-proven insufficient; those chapters were skipped (correct resilience) but left gaps. | **Wiring fixed, bypass UNPROVEN** 2026-06-28 — Chromium playwright-stealth re-wired as last-resort rungs after camoufox; one-engine-per-thread teardown added; end-of-run sweep re-walks the full ladder (incl. stealth) for every CF-skipped chapter. Whether stealth actually clears live FWN CF needs a fresh live pass. | Claude Code |
 
-No blocking Critical issues. Item **#7 is mitigated/closed for scraper resilience**
-(fatal halt/mass-failure behavior fixed; live Cloudflare success still requires
-manual validation). Items **#1 and #2 are fixed** (user-approved follow-up,
-2026-06-27); **#3â€“#6 remain deferred** (Suggestion-level, awaiting user
-direction). Full detail for the older Phase 8 findings is in
+**Open Critical that still needs live validation: #11** — camoufox is live-proven
+insufficient against a real FWN challenge; the Chromium playwright-stealth rescue
+rungs are now wired in (and the end-of-run sweep re-walks the full ladder), but
+whether stealth *actually* clears a live FWN challenge is unconfirmed and needs the
+user's next live pass over the known-bad chapters (102, 174, …). If stealth also
+fails, escalate to headful mode / a residential proxy / `nodriver`. Item **#7 is
+mitigated/closed for scraper resilience** (fatal halt/mass-failure behavior fixed;
+**but** #11 now supersedes its "live bypass success still needs validation" caveat
+with the concrete finding that camoufox alone is not enough). Items **#8, #9, #10
+are fixed** (this 0.1.1 cycle); **#1, #2 fixed** earlier; **#3–#6 remain deferred**
+(Suggestion-level). Full detail for the older Phase 8 findings is in
 `files/test-logs/v0.1.0_pre-release.md`.
 
 Notes:
@@ -64,6 +134,97 @@ Notes:
 
 ## Work Log (newest first)
 
+- 2026-06-28 - Claude Code: **0.1.1 release — committed, tagged, pushed.** Release
+  housekeeping session (no feature/code changes). Ran `verify` (green: **128
+  passed**), audited the working tree against the three 0.1.1 Session Sync Log
+  entries (all files present, no discrepancy; pre-0.1.1 fixtures already tracked in
+  the v0.1.0 orphan commit `0bb4fe5`), confirmed the docs already reflect all 0.1.1
+  work (brotli fix, output-folder nesting fix, playwright-stealth rescue rungs,
+  strengthened end-of-run sweep) and that README still matches current behavior.
+  Staged everything with `git add -A` and committed a **new** commit on top of
+  `0bb4fe5` on `main` (did NOT amend/rebase the orphan commit), tagged `v0.1.1`
+  (annotated), pushed `main` + the tag to `origin`, and created the GitHub release
+  `v0.1.1`. Open Critical **#11** (live FWN Cloudflare bypass — whether Chromium
+  playwright-stealth actually clears a real FWN challenge) remains UNPROVEN and is
+  carried into 0.1.1 as a known issue; backlog item 2 (rename the "Use Playwright
+  browser mode" GUI label) still open.
+- 2026-06-28 - Claude Code: **0.1.1 Cloudflare ladder — playwright-stealth rescue
+  rungs + stronger end-of-run sweep.** Live finding from the 1–3065 Shadow Slave
+  stress-scrape: the first genuine FWN Cloudflare challenge, and camoufox FAILED it
+  on every attempt (chapters 102, 174, …) — `http→cloudscraper→camoufox→
+  camoufox_fresh (×4)` all returned "challenge still present." GOAL 1: wired the
+  dormant Chromium playwright-stealth strategy back into the live ladder as the
+  last-resort rungs → `http → cloudscraper → camoufox → camoufox_fresh →
+  playwright_stealth → playwright_stealth_fresh`. Renamed `FETCH_STRATEGY_BROWSER
+  [_FRESH]` → `FETCH_STRATEGY_PLAYWRIGHT_STEALTH[_FRESH]` (old names aliased),
+  extended `DEFAULT_ESCALATION_LADDER` + `BROWSER_ESCALATION_LADDER`, updated the
+  dispatch + ladder comments + cf_bypass docstring. `MAX_RETRIES` left at 6 (=7
+  attempts) — already enough to walk all six rungs once (no change needed). Added
+  one-engine-per-thread teardown: `_teardown_chromium()` (stops the Chromium
+  sync-Playwright driver) runs before camoufox starts, and `_reset_camoufox()` runs
+  before Chromium stealth starts — they can't share a thread ("Sync API inside the
+  asyncio loop"). Confirmed `is_cloudflare_challenge` already clears a stealth-cleared
+  page content-aware (FWN `class="txt"` body is a structural marker) — no detection
+  change. GOAL 2: the existing Phase-9C sweep already covers all non-permanent,
+  non-extraction failures in all three modes and re-calls `rm.fetch` (which re-walks
+  the FULL ladder, since failed chapters are never cached) — so extending the ladder
+  in GOAL 1 automatically gives the sweep the stealth rescue the main pass lacked; no
+  pipeline change needed, verified by tests. New `files/tests/test_stealth_rescue.py`
+  (8: ladder order, camoufox_fresh→stealth advance, both teardown directions,
+  end-to-end sweep-reaches-stealth-and-rescues across SEPARATE/CHUNKED/SINGLE,
+  fails-every-rung-stays-failed+in-summary); updated 2 `test_phase2.py` ladder tests.
+  Marked the Briefing "drop playwright-stealth" backlog item CANCELLED. `verify`
+  green: **128 passed**. **Honest:** offline tests prove wiring/flow only; live FWN
+  stealth clearance unproven until the next live run. NOT committed; plan not deleted.
+- 2026-06-28 - Claude Code: **0.1.1 output-folder nesting fix.** A live run wrote
+  `…\Downloads\webscraped_shadow-slave-1\shadow-slave-1` (doubled folder).
+  Diagnosed: `pipeline.resolve_output_dir` was correct (default →
+  `~/Downloads/{slug}-N`, `-N` scan keys on `{slug}-N` and ignores the old
+  `webscraped_` prefix); the bug was in `app.py` — the read-only "Output folder"
+  field both displayed and held the *parent*, and `_on_browse` wrote the picked
+  folder into that same var, which `_on_start` then passed as `parent_dir`, so a
+  prior/browsed output dir nested a fresh `{slug}-N` inside it. Fix: added
+  `self._output_parent` (Path, default `~/Downloads`, set only by Browse); the
+  read-only field now shows a live **target** preview via `_refresh_output_preview`
+  (never fed back as a parent); both the preview and the run resolve through one
+  `_resolve_output_dir` helper using the stored parent Path. **Secondary item
+  decision:** left `chapter_index.json` in the output dir — it is the documented
+  output-dir-scoped resume source of truth and the "re-run into the same folder to
+  resume" contract + tests depend on it; relocating to `files/cache/{slug}/` would
+  risk breaking resume, so it stays (flagged cosmetic). Tests: +3
+  `resolve_output_dir` cases (`test_phase5_pipeline.py`: default single-level,
+  increment-as-sibling, old-`webscraped_`-ignored) + 1 GUI case
+  (`test_phase8_gui.py`: target preview one level under Downloads, parent passed is
+  the Downloads base not the target). Also fixed two handoff doc-sync nits flagged
+  by Codex (issue #9 severity Major→Critical; added the missing Deleted line for
+  `scrape_noble_queen_issue_summary.md` to the prior 2026-06-28 sync entry).
+  `verify` green: **120 passed**. The brotli body-extraction fix is confirmed
+  working live and was not touched. NOT committed; plan not deleted.
+- 2026-06-28 - Claude Code: **0.1.1 post-live-pass fixes** (two defects + a
+  feature). Investigated the live FWN "chapters 3+ FAILED: Could not extract body
+  paragraphs" report using the on-disk cache at `files/cache/shadow-slave/`:
+  computed the SHA-256 cache keys, found chapters 1–2 were clean HTML (~76 KB) and
+  3+ were undecoded binary garbage (~15 KB, 43% U+FFFD). Re-fetched chapter 3
+  live: `Accept-Encoding: gzip, deflate, br` → `Content-Encoding: br`, 6516
+  replacement chars, no `<html>`; `gzip, deflate` → clean 75 KB HTML.
+  **Root causes:** (1a) brotli mis-decode (no `brotli` pkg in `requests`); (1b)
+  `pipeline._fetch_one` calling `pacer.register_block()` on the resulting
+  empty-extraction. **Fixes:** dropped `br` from `BROWSER_HEADERS`; added
+  `request_manager._looks_garbled` (>2% U+FFFD → `_RetryableFetch`, used on fetch
+  AND cache-read so a poisoned cache self-heals); new `models.EmptyExtractionError`
+  raised by both adapters and classified in `pipeline._fetch_one` as an
+  extraction failure (recorded in `failed` + new `RunReport.extraction_failed`,
+  no block, excluded from `_sweepable` and the chunked/single sweep collectors).
+  **Feature (Task 2):** renamed default output dir `webscraped_{slug}-N` →
+  `{slug}-N`; `resolve_output_dir` gained `parent_dir`/`base_name`; `app.py` got
+  an Output-folder Browse… picker + Folder-name field (logic stays in
+  `resolve_output_dir`). Added fixtures `fwn_chapter_current_ok.html` +
+  `fwn_chapter_brotli_garbage.html`; new `test_brotli_extraction_fix.py` (7);
+  updated `test_phase5_pipeline.py` + `test_phase8_gui.py`. `verify` green: **116
+  passed**. NOT committed; plan not deleted. **Honest risk:** the brotli fix is
+  generic to the FWN HTTP path so it applies to all FWN novels (not just Shadow
+  Slave); the only residual unknown is whether FWN ever serves an encoding other
+  than gzip/deflate/br (the garble guard would catch that case and escalate).
 - 2026-06-27 - Claude Code: implemented **Phase 9 (live-scrape hardening)**, all
   five parts. **9A:** relabelled the GUI delay field to "Delay between fetches
   (seconds)", default 1.2→2.0, anti-detection hint; binds to `ScrapeJob.delay`
@@ -202,6 +363,104 @@ Notes:
 ---
 
 ## Session Sync Log (newest first)
+
+### 2026-06-28 - HOME-PC - COMMITTED + PUSHED as v0.1.1
+0.1.1 release: committed all uncommitted 0.1.1 work as one new commit on `main` on
+top of the v0.1.0 orphan commit `0bb4fe5`, tagged `v0.1.1` (annotated), pushed
+`main` + tag to `origin`, and published the GitHub release. The complete file set
+committed in this release (everything below, accumulated across the three prior
+0.1.1 sync entries):
+
+- Changed: `scripts/Universal/app.py`,
+  `scripts/Universal/webnovel_scraper/request_manager.py`,
+  `scripts/Universal/webnovel_scraper/cf_bypass.py`,
+  `scripts/Universal/webnovel_scraper/models.py`,
+  `scripts/Universal/webnovel_scraper/pipeline.py`,
+  `scripts/Universal/webnovel_scraper/adapters/freewebnovel.py`,
+  `scripts/Universal/webnovel_scraper/adapters/webnovel_dynamic.py`.
+- Changed: `files/tests/test_phase2.py`, `files/tests/test_phase5_pipeline.py`,
+  `files/tests/test_phase8_gui.py`.
+- Added:   `files/tests/test_brotli_extraction_fix.py`,
+  `files/tests/test_stealth_rescue.py`.
+- Added:   `files/test-files/fwn_chapter_current_ok.html`,
+  `files/test-files/fwn_chapter_brotli_garbage.html`.
+- Changed: `README.md`, `md-instructions/Briefing.md`,
+  `md-instructions/CHANGELOG.md`, `md-instructions/handoff.md` (this entry +
+  release work-log entry).
+- Deleted: `md-instructions/scrape_noble_queen_issue_summary.md`.
+- Note: `verify` green (128 passed). Commit `0bb4fe5` (v0.1.0) left untouched.
+
+### 2026-06-28 - HOME-PC - not committed (left in working tree, per user)
+0.1.1 Cloudflare ladder: playwright-stealth rescue rungs + stronger end-of-run sweep
+(camoufox live-proven insufficient against a real FWN challenge).
+
+- Changed: `scripts/Universal/webnovel_scraper/request_manager.py` (renamed strategy
+  constants to `FETCH_STRATEGY_PLAYWRIGHT_STEALTH[_FRESH]` with `…_BROWSER…` aliases;
+  extended `DEFAULT_ESCALATION_LADDER` + `BROWSER_ESCALATION_LADDER` with the two
+  stealth rungs after camoufox_fresh; updated dispatch + ladder/MAX_RETRIES comments;
+  added `_teardown_chromium` and the one-engine-per-thread teardown calls in
+  `_fetch_camoufox_once` / `_fetch_browser_once`).
+- Changed: `scripts/Universal/webnovel_scraper/cf_bypass.py` (docstring now documents
+  the live ladder order + the one-engine-per-thread constraint).
+- Unchanged (verified): `scripts/Universal/webnovel_scraper/pipeline.py` — the
+  Phase-9C sweep already covers all non-permanent/non-extraction failures in all
+  three modes and re-walks the full ladder via `rm.fetch`; extending the ladder
+  strengthens the sweep automatically. `cloudflare_detection.py` already content-aware.
+- Added: `files/tests/test_stealth_rescue.py` (8 cases).
+- Changed: `files/tests/test_phase2.py` (2 ladder tests updated for the longer
+  ladders + the new stealth rungs).
+- Changed: `md-instructions/CHANGELOG.md`, `md-instructions/Briefing.md` (new ladder,
+  backlog item #1 CANCELLED, Known Issues camoufox-insufficient, count 120→128),
+  `md-instructions/handoff.md` (this entry, work log, Open Issues #11).
+- Note: `verify` green: 128 passed. Live FWN stealth clearance UNPROVEN until the
+  next live pass. Not committed; plan not deleted.
+
+### 2026-06-28 - HOME-PC - not committed (left in working tree, per user)
+0.1.1 output-folder nesting fix (doubled-folder bug) + handoff doc-sync nits.
+
+- Changed: `scripts/Universal/app.py` (parent kept in `self._output_parent` Path,
+  set only by Browse; read-only field shows the resolved target preview via
+  `_refresh_output_preview`; one `_resolve_output_dir` helper for preview + run;
+  preview refreshed on novel change, browse, folder-name keystroke, run-finished).
+- Unchanged: `scripts/Universal/webnovel_scraper/pipeline.py` (`resolve_output_dir`
+  was already correct; left as-is). `chapter_index.json` stays in the output dir
+  (resume source of truth) — decision flagged, no move.
+- Changed: `files/tests/test_phase5_pipeline.py` (+3 nesting/sibling/old-prefix
+  cases), `files/tests/test_phase8_gui.py` (+1 single-level target-preview case;
+  updated the defaults test to the new `_output_parent` Path).
+- Changed: `md-instructions/CHANGELOG.md` (0.1.1 nesting-fix entry),
+  `md-instructions/Briefing.md` (nesting follow-up + count 116→120),
+  `md-instructions/handoff.md` (this entry, work log, issue #9 severity
+  Major→Critical, issue #10, Deleted line on the prior sync entry).
+- Note: `verify` green: 120 passed. Brotli fix confirmed live, untouched. Not
+  committed; plan not deleted.
+
+### 2026-06-28 - HOME-PC - not committed (left in working tree, per user)
+0.1.1 post-live-pass fixes (brotli extraction, misclassification, output folder).
+
+- Changed: `scripts/Universal/webnovel_scraper/request_manager.py` (drop `br` from
+  `Accept-Encoding`; add `_looks_garbled`; guard fresh fetches and self-heal
+  garbled cache reads).
+- Changed: `scripts/Universal/webnovel_scraper/models.py` (new
+  `EmptyExtractionError`).
+- Changed: `scripts/Universal/webnovel_scraper/adapters/freewebnovel.py`,
+  `.../adapters/webnovel_dynamic.py` (raise `EmptyExtractionError` on empty body).
+- Changed: `scripts/Universal/webnovel_scraper/pipeline.py` (classify
+  `EmptyExtractionError` as extraction failure — `RunReport.extraction_failed`, no
+  block, excluded from sweep; `resolve_output_dir` gained `parent_dir`/`base_name`
+  + default name `{slug}-N`).
+- Changed: `scripts/Universal/app.py` (Output-folder Browse… picker + Folder-name
+  field; wired to `resolve_output_dir`).
+- Added:   `files/test-files/fwn_chapter_current_ok.html`,
+  `files/test-files/fwn_chapter_brotli_garbage.html`.
+- Added:   `files/tests/test_brotli_extraction_fix.py` (7 cases).
+- Changed: `files/tests/test_phase5_pipeline.py` (default name + custom
+  parent/name), `files/tests/test_phase8_gui.py` (output-folder defaults).
+- Changed: `README.md`, `md-instructions/Briefing.md`,
+  `md-instructions/CHANGELOG.md` (0.1.1 section), `md-instructions/handoff.md`.
+- Deleted: `md-instructions/scrape_noble_queen_issue_summary.md` (stale issue
+  summary, superseded; was already staged for deletion in the working tree).
+- Note: `verify` green: 116 passed. Not committed; plan not deleted.
 
 ### 2026-06-27 - HOME-PC - not committed (left in working tree, per user)
 Phase 9 live-scrape hardening.
