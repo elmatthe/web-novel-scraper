@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<!--
+  Synthesized fixture (Phase 9D): a *post-redirect* WebNovel chapter page as it
+  looks today after dynamic.webnovel.com/story/... 301-redirects to
+  www.webnovel.com/book/...  KEY PROPERTIES this fixture must preserve:
+    * NO  Next.js data blob on the redirected page (it is dead there).
+    * YES the chapter payload lives in the inline globals assignment below.
+    * YES the page still carries Cloudflare's ambient beacon script
+          (/cdn-cgi/challenge-platform/...) even though the challenge is CLEARED.
+  The beacon is exactly what used to make the request manager mis-flag this
+  cleared page as "Cloudflare challenge still present after camoufox fetch".
+  (Marker strings are kept out of this comment so the lenient JS-assignment
+  scanner does not latch onto the comment text instead of the real payload.)
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Glory to the Victor - The Noble Queen - WebNovel</title>
+  <script src="/cdn-cgi/challenge-platform/scripts/jsd/main.js"></script>
+</head>
+<body>
+  <div id="app">
+    <div class="cha-content">
+      <div class="cha-words">
+        <p>Loading…</p>
+      </div>
+    </div>
+  </div>
+  <script nonce="">
+    g_data.book = {"bookInfo":{"bookId":"28684090500376805","bookName":"The Noble Queen","chapterNum":864}};
+    g_data.chapInfo = {
+      "chapterId":"76998299197949227",
+      "chapterName":"Glory\ to\ the\ Victor",
+      "chapterIndex":1,
+      "contents":[
+        {"content":"<p>One\ strike\ after\ another,\ Queen\ Bee\ pressed\ her\ advantage.</p>"},
+        {"content":"<p>The\ arena\ fell\ silent\ as\ the\ final\ blow\ landed.</p>"},
+        {"content":"<p>Victory,\ at\ last,\ belonged\ to\ her.</p>"}
+      ]
+    };
+  </script>
+</body>
+</html>

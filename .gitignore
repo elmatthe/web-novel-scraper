@@ -1,0 +1,46 @@
+# ── Python runtime / build artifacts ─────────────────────────────────────────
+.venv/
+.python_runtime/
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+*.spec
+.pytest_cache/
+
+# ── Agent / IDE tooling scratch (not part of the user's locked root layout) ───
+.agents/
+.claude/
+.codex/
+
+# ── Environment ──────────────────────────────────────────────────────────────
+.env
+
+# ── Logs ─────────────────────────────────────────────────────────────────────
+*.log
+
+# ── OS cruft ─────────────────────────────────────────────────────────────────
+.DS_Store
+**/.DS_Store
+Thumbs.db
+
+# Effective generated/dev-only folder ignores. Keep comments on separate lines:
+# Git treats inline comments after patterns as literal path text.
+files/bin/
+files/legacy-reference/
+files/test-logs/
+files/cache/
+files/output/
+files/test-output/
+files/**/cache/
+
+# Output PDFs are generated artifacts — do NOT ignore committed test fixtures.
+*.pdf
+
+# ── Keep: committed test inputs live under files/test-files/ and ship to the
+#    dev test suite — they must NOT be ignored (re-include any *.pdf fixtures).
+!files/test-files/
+!files/test-files/**

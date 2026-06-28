@@ -1,0 +1,10 @@
+requests==2.34.2            # HTTP fetch (default request path)
+beautifulsoup4==4.14.3      # HTML parsing for TOC + chapter extraction
+cloudscraper==1.2.71        # HTTP-only Cloudflare fallback (no browser)
+playwright==1.59.0          # Browser path for Cloudflare-protected sites (FreeWebNovel)
+playwright-stealth==2.0.3   # CF bypass strategy 1, used by cf_bypass.py (JS stealth patches)
+camoufox[geoip]==0.4.11     # CF bypass strategy 2 (anti-detect Firefox); the only path that clears FreeWebNovel. Needs `python -m camoufox fetch` to download the browser binary
+reportlab==4.5.1            # The single PDF layout (create_pdf_from_text)
+pypdf==6.11.0               # PDF page post-processing (replaces deprecated PyPDF2)
+pdfplumber==0.11.9          # Detects heading-only pages for remove_single_heading_pages
+pytest==9.1.1               # Test runner (the verify gate runs this)

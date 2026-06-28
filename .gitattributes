@@ -1,0 +1,8 @@
+# Keep Windows batch launchers as CRLF everywhere (including the GitHub
+# "Download ZIP" path). cmd.exe mis-parses LF-only .bat files, which can make a
+# double-clicked launcher flash open and close with no readable error.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# macOS launcher must stay LF so it runs from Finder/Terminal.
+*.command text eol=lf
