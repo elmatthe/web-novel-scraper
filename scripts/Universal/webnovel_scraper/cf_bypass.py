@@ -63,6 +63,13 @@ logger = logging.getLogger(__name__)
 # challenge`` is re-exported below for callers that import it from cf_bypass.
 from .cloudflare_detection import is_cloudflare_challenge  # noqa: E402
 
+# Point Chromium / playwright-stealth at the contained in-repo browser cache the
+# launcher installs into (files/bin/ms-playwright), even when started outside the
+# launcher. ``setdefault`` semantics — see ``browser_env``.
+from .browser_env import ensure_browsers_path  # noqa: E402
+
+ensure_browsers_path()
+
 EXTRA_STEALTH_JS = """
 // Patch navigator.webdriver to undefined (not false)
 Object.defineProperty(navigator, 'webdriver', {get: () => undefined});

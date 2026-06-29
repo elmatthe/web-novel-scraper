@@ -56,7 +56,19 @@ suite in `files/tests/` (a `conftest.py` there puts `scripts/Universal/` on
 `sys.path` so `import webnovel_scraper` resolves).
 
 ## Current Version
-0.1.1 (release-ready â€” pending the user's manual live-scrape pass + tag/force-push).
+0.1.2 (on branch `feature/v0.1.2-cf-avoidance` â€” pending the user's manual live
+full-run from HOME-PC). Adds HTTP-layer Cloudflare *avoidance* (homepage warm-up
+GET + host-derived Referer/Sec-Fetch-Site on top of the existing persistent
+session/cookie reuse), fixes the Chromium install gap so the playwright-stealth
+rungs can actually launch on a fresh setup (contained in `files/bin/ms-playwright`
+via `PLAYWRIGHT_BROWSERS_PATH`), and makes a browser-launch failure a non-blocking
+immediate skip (no more 100-second freeze). Suite: **138 offline tests**, `verify`
+green. The legacy FreeWebNovel scraper could not be diffed this session â€” it is
+gitignored (`files/legacy-reference/`) and was absent â€” so the avoidance is a
+best-practice implementation, not a confirmed port; live confirmation is the
+user's next full run.
+
+### Prior: 0.1.1 (release-ready â€” pending the user's manual live-scrape pass + tag/force-push).
 Phase 9 (live-scrape hardening) and its review fixes are implemented; the 0.1.1
 post-live-pass session added the brotli body-extraction fix, the
 extraction-failure misclassification fix, the user-choosable output folder, a
@@ -329,6 +341,38 @@ Suite is **128 offline tests**, `verify` green.
     offline tests prove only the wiring/flow; whether Chromium stealth actually
     clears a live FWN challenge is unproven until the next live run.
 
+- **0.1.2 Cloudflare avoidance + fresh-install fixes (2026-06-29) â€” complete on
+  `feature/v0.1.2-cf-avoidance`:** driven by a live work-PC run (Shadow Slave
+  100â€“110, fresh zip) with three problems.
+  - **Task 1 â€” HTTP-layer CF avoidance.** `request_manager._http_get` adds a
+    once-per-host **warm-up GET** to the site origin (acquires `cf_clearance` into
+    the persistent session before chapter fetches â€” the key gap on resume runs
+    where the TOC is cached), a **host-derived `Referer`** (replacing the hardcoded
+    cross-site `webnovel.com` referer), and **`Sec-Fetch-Site` chaining**
+    (`none` warm-up â†’ `same-origin` chapters). The persistent `requests.Session` +
+    cookie reuse already existed and is unchanged; brotli fix + garbled self-heal
+    preserved. **The legacy scraper was gitignored/absent so this is best-practice,
+    not a confirmed port.**
+  - **Task 2 â€” Chromium install gap.** Both launchers now install **both** engines:
+    the `.bat` gained `python -m playwright install chromium` (contained in
+    `files\bin\ms-playwright` via `PLAYWRIGHT_BROWSERS_PATH`, sentinel-gated); the
+    `.command` gained the camoufox fetch it was missing. New
+    `webnovel_scraper/browser_env.py` defaults `PLAYWRIGHT_BROWSERS_PATH` to the
+    contained path at import (setdefault), imported by `request_manager` + `cf_bypass`,
+    so the engine is found at runtime even outside the launcher.
+  - **Task 3 â€” non-blocking launch failure.** `_looks_like_browser_launch_failure`
+    classifies an engine-missing / launch error as an **immediate** strategy failure
+    that advances the ladder with **no** backoff sleep (kills the 100-second
+    "retrying in 102.7sâ€¦" freeze). A clear one-line log points to re-running setup;
+    an exhausted chapter is recorded failed and the run continues.
+  - **Task 4 â€” ladder.** Shape unchanged
+    (`http â†’ cloudscraper â†’ camoufox â†’ camoufox_fresh â†’ playwright_stealth â†’
+    playwright_stealth_fresh`); no strategy removed. Rationale: Task 1 avoids the
+    challenge (the real fix); the browser rungs are the now-launchable, non-blocking
+    safety net.
+  - New `files/tests/test_cf_avoidance.py` (10 cases). Suite: **138 offline tests**,
+    `verify` green.
+
 ## Known Issues
 - **WebNovel camoufox rescue (was the open Critical):** the most likely root cause
   â€” over-eager challenge detection mis-flagging cleared post-redirect pages â€” is
@@ -337,16 +381,20 @@ Suite is **128 offline tests**, `verify` green.
   dependent and can only be confirmed by the user's manual pass; the code can no
   longer fail a chapter that camoufox *did* clear, and intermittent failures now
   get the relentless ladder + second-pass sweep instead of an immediate skip.
-- **FreeWebNovel Cloudflare bypass — OPEN (camoufox proven insufficient live).**
-  The 1–3065 stress-scrape hit a real FWN managed challenge and **camoufox cleared
-  none of it** (chapters 102, 174, … all failed every camoufox attempt). Scraper
-  *resilience* is solid (blocked chapters retry the full ladder, are recorded/
-  skipped, and the run continues; the end-of-run sweep re-tries them), but the
-  *bypass* is not yet proven: the Chromium playwright-stealth rescue rungs are now
-  wired in after camoufox as the intended fix. **Whether stealth actually clears a
-  live FWN challenge is unconfirmed** — needs a fresh live pass over the known-bad
-  chapters. If stealth also fails, the next levers are headful mode, a residential
-  proxy, or `nodriver` (strategy 3 in `cf_bypass.py`, not yet wired).
+- **FreeWebNovel Cloudflare — 0.1.2 shifts strategy from FIGHT to AVOID; UNPROVEN
+  live.** Both camoufox (0.1.1) and Chromium stealth were live-proven *insufficient*
+  at *clearing* a real FWN managed challenge. 0.1.2's primary fix is therefore to
+  **avoid triggering the challenge in the first place** at the HTTP layer: a
+  once-per-host homepage warm-up GET (acquires `cf_clearance` into the persistent
+  session before chapters, even on resume runs), a correct host-derived `Referer`
+  (was a hardcoded cross-site `webnovel.com` referer — a bot-tell), and
+  `Sec-Fetch-Site` chaining (`none` → `same-origin`). The browser rungs remain the
+  safety net (now actually launchable per the Chromium install fix, and non-blocking
+  if an engine is missing). **Whether avoidance actually stops the live challenges is
+  unconfirmed** — it could not be validated against the legacy scraper (gitignored/
+  absent) and needs the user's next live full run from HOME-PC. If FWN still
+  challenges, the remaining levers are **headful** browser mode, a **residential
+  proxy**, or `nodriver` (strategy 3 in `cf_bypass.py`, not yet wired).
 - Both enabled adapters (`freewebnovel`, `webnovel_dynamic`) are implemented;
   `empire_novel`, `novel_bin`, `telegraph` remain intentional disabled stubs for
   a later version.

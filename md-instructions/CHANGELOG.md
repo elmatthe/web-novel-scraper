@@ -3,6 +3,105 @@
 All notable changes to this project are recorded here. Versions follow semantic
 versioning.
 
+## [0.1.2] — 2026-06-29
+
+Cloudflare-avoidance pass driven by a live work-PC run (Shadow Slave, chapters
+100–110, fresh GitHub zip) that surfaced three problems: slow + repeated CF
+challenges, the playwright-stealth rungs crashing on a fresh install because
+setup never downloaded Chromium, and the run **freezing** on a 100-second backoff
+before retrying a browser launch that structurally could not succeed.
+
+> **Honest note on the headline (Task 1):** the legacy FreeWebNovel scraper
+> (`files/legacy-reference/freewebnovel-webscraper.py`) is **gitignored**
+> (`.gitignore`: `files/legacy-reference/`) and therefore was **not present** in
+> the working tree this session, so it could **not** be diffed against the current
+> request layer. Rather than invent a "legacy trick," this pass implemented the
+> CF-avoidance behaviour the brief itself names as the most probable win —
+> persistent session + cookie reuse (already present) **plus** a homepage warm-up
+> GET and correct browser-like Referer / Sec-Fetch-Site. Whether this matches what
+> the legacy scraper did is unverified; whether it actually stops the live
+> challenges can only be confirmed by the next live full run from HOME-PC.
+
+### Added — HTTP-layer Cloudflare avoidance (primary/attempt-1 path)
+- **Once-per-host warm-up GET.** Before the first chapter on a host is requested,
+  the persistent session now GETs the site **origin** (homepage) so Cloudflare
+  issues a `cf_clearance` cookie into the session — mirroring a human opening the
+  site before reading. This matters most on a **resume** run, where the cached TOC
+  means the first network hit would otherwise be a chapter URL with no cookies.
+  The warm-up is best-effort: a warm-up error is swallowed and the real fetch still
+  runs. (`request_manager._http_get` / `_warmed_hosts_for`.)
+- **Host-derived Referer + correct Sec-Fetch-Site.** The old code sent a hardcoded
+  `Referer: https://www.webnovel.com/` on **every** request — including
+  FreeWebNovel ones — a cross-site referer that doesn't match the host being
+  fetched (a bot-tell). Now the warm-up looks like an address-bar navigation
+  (`Sec-Fetch-Site: none`, no Referer) and every subsequent same-host request looks
+  like an in-site click (`Sec-Fetch-Site: same-origin`, `Referer` = the site
+  origin). The static `Referer` was removed from `BROWSER_HEADERS`.
+- **Persistent session + cookie reuse were already present** (one
+  `requests.Session` per `RequestManager`, reused for the whole run) and are
+  unchanged; the warm-up + header chaining build on top of them. The 0.1.1 brotli
+  fix (no `br` in `Accept-Encoding`) and the garbled-content self-heal are
+  preserved.
+
+### Fixed — Chromium install gap (fresh-install stealth rungs could never launch)
+- The Windows launcher ran `python -m camoufox fetch` but **never** downloaded
+  Chromium, so the `playwright_stealth` / `playwright_stealth_fresh` rungs added in
+  0.1.1 could not launch on any machine that only ran setup ("Executable doesn't
+  exist … playwright install"). The macOS launcher had the mirror-image gap —
+  it installed Chromium but never fetched camoufox.
+- **Both launchers now install BOTH engines.** `Setup_and_Run-Web-Novel-Scraper.bat`
+  gained a Chromium step (`python -m playwright install chromium` — Chromium only,
+  never full Chrome) contained in the repo at `files\bin\ms-playwright` via
+  `PLAYWRIGHT_BROWSERS_PATH` (portable, no admin), gated by a `.venv\playwright.fetched`
+  sentinel. `Setup_and_Run-Web-Novel-Scraper.command` gained the camoufox fetch it
+  was missing (gated by `.venv/camoufox.fetched`).
+- **Runtime respects the same path.** New `webnovel_scraper/browser_env.py` defaults
+  `PLAYWRIGHT_BROWSERS_PATH` to the contained `files/bin/ms-playwright` at import
+  time (via `os.environ.setdefault`, so the launcher's explicit value always wins),
+  imported by both `request_manager` and `cf_bypass`. So Chromium is found where
+  setup put it even when the program is started outside the launcher (a dev running
+  `app.py`, the test suite).
+
+### Fixed — browser-launch failure no longer freezes the run (non-blocking)
+- A browser executable-missing / launch error is now classified as an **immediate,
+  non-retryable strategy failure** that advances to the next ladder rung **without**
+  the long exponential backoff sleep. Previously such an error fell into the generic
+  retry branch and slept 5 → 15 → 45 → 120 s before re-attempting a launch that
+  could never succeed — the live "retrying in 102.7s with playwright_stealth_fresh"
+  freeze. New `request_manager._looks_like_browser_launch_failure` matches Playwright
+  "Executable doesn't exist" / "playwright install" messages, missing-engine markers,
+  and any `ImportError` / `FileNotFoundError`. A clear one-line log points the user to
+  re-run setup. A chapter that exhausts the whole ladder is recorded in
+  `RunReport.failed` and the run continues (confirmed by test).
+
+### Ladder (Task 4) — unchanged shape, now reliable + non-blocking
+- The escalation ladder stays
+  `http → cloudscraper → camoufox → camoufox_fresh → playwright_stealth →
+  playwright_stealth_fresh`. **Reasoning:** with Task 1 reducing how often CF
+  triggers at all, `http`/`cloudscraper` should clear most chapters cheaply;
+  camoufox remains the primary browser rung; the Chromium playwright-stealth rungs
+  are kept as the **last-resort** rescue (Task 2 makes them actually launchable;
+  Task 3 makes them fully non-blocking if an engine is still missing). No strategy
+  was removed — the user wants a working fallback chain, not fewer options. Both
+  camoufox and Chromium-stealth were live-proven *insufficient* against a real FWN
+  challenge in 0.1.1, so the genuine fix is Task 1 (avoid the challenge), with the
+  browser rungs as the safety net.
+
+### Tests / docs
+- New `files/tests/test_cf_avoidance.py` (10 cases): warm-up-once + Referer/
+  Sec-Fetch-Site chaining + cookie carry-over across chapters on a persistent
+  session; warm-up-failure-is-swallowed; `BROWSER_HEADERS` browser-like without
+  brotli or the static cross-site Referer; persistent-session reuse; `browser_env`
+  defaults the contained path and never overrides an explicit one; the launch-failure
+  classifier; launch failure skips backoff and advances every rung (no long sleep);
+  a real transient block still backs off; and a pipeline run continues past a chapter
+  that exhausts on a launch failure. All 0.1.1 tests stay green. Suite: **138 offline
+  tests**, `verify` green.
+- **Honest risk:** the legacy scraper could not be diffed (gitignored/absent), so the
+  HTTP-avoidance is a best-practice hypothesis, not a confirmed port. It can only be
+  validated by the user's next live full run from HOME-PC. If FWN still challenges,
+  the remaining levers are headful browser mode and a residential proxy.
+
 ## [0.1.1] — 2026-06-28
 
 Post-live-pass fixes: two live-discovered defects from a Shadow Slave
