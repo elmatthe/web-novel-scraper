@@ -1,6 +1,45 @@
 # webnovel-scraper - Handoff
 
 ## Current Focus (newest)
+**0.1.2 Cloudflare avoidance + fresh-install fixes (2026-06-29) â€” complete on
+branch `feature/v0.1.2-cf-avoidance`; `verify` green at 138 tests; NOT pushed yet
+(see push status below).** Work-PC run (Shadow Slave 100â€“110, fresh GitHub zip)
+found three problems, all addressed:
+1. **Slow + repeated CF challenges (Task 1).** Shifted from *fighting* the
+   challenge to *avoiding* it at the HTTP layer. `request_manager._http_get` now
+   does a **once-per-host warm-up GET** to the site origin (acquires `cf_clearance`
+   into the persistent session before chapter fetches â€” the gap on resume runs
+   where the TOC is cached), sets a **host-derived `Referer`** (was a hardcoded
+   cross-site `webnovel.com` referer = bot-tell), and chains **`Sec-Fetch-Site`**
+   (`none` warm-up â†’ `same-origin` chapters). Persistent session + cookie reuse
+   already existed; brotli + garbled self-heal preserved.
+   **â€¼ï¸ The legacy `freewebnovel-webscraper.py` is gitignored (`files/legacy-reference/`)
+   and was ABSENT from the zip, so it could NOT be diffed â€” this is best-practice,
+   not a confirmed port. The user pre-approved proceeding this way.**
+2. **Stealth rungs crash on fresh install (Task 2).** The `.bat` fetched camoufox
+   but never Chromium; the `.command` installed Chromium but never camoufox â€” each
+   missing one engine. Both now install **both**: `.bat` adds
+   `python -m playwright install chromium` contained in `files\bin\ms-playwright`
+   via `PLAYWRIGHT_BROWSERS_PATH` (sentinel `.venv\playwright.fetched`); `.command`
+   adds camoufox fetch (sentinel `.venv/camoufox.fetched`). New
+   `webnovel_scraper/browser_env.py` defaults `PLAYWRIGHT_BROWSERS_PATH` to the
+   contained path at import (setdefault) so runtime finds Chromium even outside the
+   launcher; imported by `request_manager` + `cf_bypass`.
+3. **Freeze on launch failure (Task 3).** `_looks_like_browser_launch_failure`
+   classifies an engine-missing / "Executable doesn't exist / playwright install"
+   error as an **immediate** strategy failure that advances the ladder with **no**
+   backoff sleep (kills the live 100-second "retrying in 102.7sâ€¦" hang). Clear
+   one-line log points to re-running setup; exhausted chapter recorded failed, run
+   continues (test-proven).
+- **Task 4 (ladder):** shape unchanged
+  (`http â†’ cloudscraper â†’ camoufox â†’ camoufox_fresh â†’ playwright_stealth â†’
+  playwright_stealth_fresh`); no strategy removed. Task 1 avoids the challenge;
+  browser rungs are the now-launchable, non-blocking safety net.
+- New `files/tests/test_cf_avoidance.py` (10). **Honest:** live confirmation that
+  avoidance stops the challenges is the user's next full run from HOME-PC; if it
+  still challenges, next levers are headful mode / residential proxy.
+
+## Current Focus (prior)
 **0.1.1 Cloudflare ladder: playwright-stealth rescue rungs + stronger end-of-run
 sweep (2026-06-28) — complete; `verify` green at 128 tests.** A full Shadow Slave
 stress-scrape (1–3065) produced the first genuine FWN Cloudflare challenge and
@@ -134,6 +173,27 @@ Notes:
 
 ## Work Log (newest first)
 
+- 2026-06-29 - Claude Code (CSPW-PC, work PC): **0.1.2 Cloudflare avoidance +
+  fresh-install fixes** on new branch `feature/v0.1.2-cf-avoidance`. **Task 1:**
+  could NOT diff the legacy scraper (`files/legacy-reference/` is gitignored and
+  was absent from the fresh zip; searched the whole Desktop tree â€” only the current
+  adapter exists). User pre-approved proceeding with the brief's named "most
+  probable win." Implemented in `request_manager.py`: `_http_get` (warm-up GET to
+  host origin once per session, host-derived `Referer`, `Sec-Fetch-Site`
+  none→same-origin chaining), `_warmed_hosts_for`, `_apply_request_headers`;
+  removed the hardcoded `Referer: webnovel.com` from `BROWSER_HEADERS`. Persistent
+  session + cookie reuse were already present (one `requests.Session` per manager,
+  reused all run). Kept `_get_text(session, url)` 2-arg signature so the
+  `test_phase9` monkeypatches still bind. **Task 2:** new `browser_env.py`
+  (setdefault `PLAYWRIGHT_BROWSERS_PATH` → `files/bin/ms-playwright`), imported by
+  `request_manager` + `cf_bypass`; `.bat` adds gated `python -m playwright install
+  chromium`; `.command` adds the gated camoufox fetch it was missing. **Task 3:**
+  `_looks_like_browser_launch_failure` + a launch-failure branch in
+  `_fetch_with_retry_ladder` that `continue`s to the next rung with no backoff
+  sleep. **Task 4:** ladder shape unchanged, documented. New
+  `files/tests/test_cf_avoidance.py` (10). `verify` green: **138 passed**. Branch
+  created + committed; push status recorded in the Session Sync Log. Implementation
+  plan (this drop) is the in-prompt task, not a file to delete.
 - 2026-06-28 - Claude Code: **0.1.1 release — committed, tagged, pushed.** Release
   housekeeping session (no feature/code changes). Ran `verify` (green: **128
   passed**), audited the working tree against the three 0.1.1 Session Sync Log
@@ -363,6 +423,38 @@ Notes:
 ---
 
 ## Session Sync Log (newest first)
+
+### 2026-06-29 - CSPW-PC (work PC) - NOT committed / NOT pushed (no git on this PC)
+0.1.2 Cloudflare avoidance + fresh-install fixes. **git is not installed on
+CSPW-PC and there is no admin to install it**, so the branch/commit/push could not
+be done here. The complete change set is in the working tree, `verify` green (138
+passed). Finish the branch on HOME-PC (has git + admin): get this tree's changed
+files into the HOME-PC clone, then run the command block the agent provided
+(create `feature/v0.1.2-cf-avoidance` off `main`, commit as
+Elijah Matthew <129206189+elmatthe@users.noreply.github.com>, push). Do NOT touch
+`main`; do NOT tag/release (re-test live first).
+
+- Added:   `scripts/Universal/webnovel_scraper/browser_env.py` (setdefault
+  `PLAYWRIGHT_BROWSERS_PATH` → contained `files/bin/ms-playwright`).
+- Changed: `scripts/Universal/webnovel_scraper/request_manager.py` (warm-up GET +
+  host-derived Referer + Sec-Fetch-Site chaining via `_http_get`/`_warmed_hosts_for`/
+  `_apply_request_headers`; removed static `webnovel.com` Referer from
+  `BROWSER_HEADERS`; `_looks_like_browser_launch_failure` + no-backoff advance in
+  the retry ladder; import `browser_env.ensure_browsers_path`).
+- Changed: `scripts/Universal/webnovel_scraper/cf_bypass.py` (import
+  `browser_env.ensure_browsers_path` so the stealth path also points at the
+  contained Chromium).
+- Changed: `Setup_and_Run-Web-Novel-Scraper.bat` (gated `python -m playwright
+  install chromium` contained via `PLAYWRIGHT_BROWSERS_PATH`; header comment).
+- Changed: `Setup_and_Run-Web-Novel-Scraper.command` (added the missing gated
+  camoufox fetch; relabelled Chromium step).
+- Added:   `files/tests/test_cf_avoidance.py` (10 offline cases).
+- Changed: `md-instructions/Briefing.md`, `md-instructions/CHANGELOG.md`
+  (new `[0.1.2]` section), `md-instructions/handoff.md` (this entry + focus + work
+  log).
+- Note: `verify` green (138 passed). `files/bin/ms-playwright` and `files/cache/`
+  are gitignored — do not commit. The browser engines are downloaded by re-running
+  the launcher on each machine.
 
 ### 2026-06-28 - HOME-PC - COMMITTED + PUSHED as v0.1.1
 0.1.1 release: committed all uncommitted 0.1.1 work as one new commit on `main` on

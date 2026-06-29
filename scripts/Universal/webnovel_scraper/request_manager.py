@@ -22,12 +22,20 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
+from urllib.parse import urlsplit, urlunsplit
 
 import requests
 
+from .browser_env import ensure_browsers_path
 from .cloudflare_detection import is_cloudflare_challenge
 
 logger = logging.getLogger(__name__)
+
+# Make sure the Chromium / playwright-stealth rungs look in the contained in-repo
+# browser cache (files/bin/ms-playwright) the launcher installs into, even when the
+# program is started outside the launcher. ``setdefault`` semantics — see
+# ``browser_env``.
+ensure_browsers_path()
 
 # ── Retry / fetch constants ──────────────────────────────────────────────────
 # MAX_RETRIES is retries after the first attempt. With the default of 6, a fetch
@@ -105,7 +113,10 @@ USER_AGENT = (
     "Chrome/124.0.0.0 Safari/537.36"
 )
 
-# Realistic Chrome headers (ported verbatim from scrape_noble_queen-v3.py).
+# Realistic Chrome headers. These are the *static* defaults; the request-specific
+# ``Referer`` and ``Sec-Fetch-Site`` are set per request by ``_http_get`` (see the
+# warm-up / same-origin chaining there) because the right value depends on whether
+# the request is the first landing on a host or a follow-on navigation within it.
 BROWSER_HEADERS = {
     "User-Agent": USER_AGENT,
     "Accept": (
@@ -125,10 +136,16 @@ BROWSER_HEADERS = {
     "Sec-Ch-Ua-Platform": '"Windows"',
     "Sec-Fetch-Dest": "document",
     "Sec-Fetch-Mode": "navigate",
+    # Default for the very first (warm-up / address-bar) navigation; switched to
+    # "same-origin" per request once the host has been warmed.
     "Sec-Fetch-Site": "none",
     "Sec-Fetch-User": "?1",
     "Upgrade-Insecure-Requests": "1",
-    "Referer": "https://www.webnovel.com/",
+    # NOTE: no static "Referer". The old verbatim port hardcoded
+    # ``Referer: https://www.webnovel.com/`` on EVERY request, including
+    # FreeWebNovel ones — a cross-site referer that does not match the host being
+    # fetched is a bot-tell. The correct, host-derived Referer is set per request
+    # in ``_http_get``.
 }
 
 
@@ -230,6 +247,54 @@ def _looks_like_permanent_status(exc: Exception) -> bool:
         if re.search(rf"\bHTTP\s+{status}\b", msg, re.IGNORECASE):
             return True
     return False
+
+
+# Markers in an exception message that mean a browser ENGINE is not installed /
+# cannot launch — a structural failure that retrying (with or without a long
+# backoff) can never fix. Caught so the ladder advances to the next rung
+# IMMEDIATELY rather than sleeping 100+ seconds before re-attempting a launch that
+# is doomed (the live "retrying in 102.7s with playwright_stealth_fresh" freeze).
+_BROWSER_LAUNCH_FAILURE_MARKERS = (
+    "executable doesn't exist",
+    "executable doesnt exist",
+    "playwright install",
+    "please run the following command",
+    "looks like playwright",
+    "browsertype.launch",
+    "host system is missing dependencies",
+    "no module named 'camoufox'",
+    'no module named "camoufox"',
+    "no module named 'playwright'",
+    'no module named "playwright"',
+    "no module named 'playwright_stealth'",
+    'no module named "playwright_stealth"',
+)
+
+
+def _looks_like_browser_launch_failure(exc: Exception) -> bool:
+    """True when ``exc`` means a browser engine is missing or cannot launch.
+
+    A missing engine (no Chromium download, camoufox not fetched, the stealth/
+    playwright package absent) is NOT a transient network blip: retrying the same
+    rung can never succeed. Classifying it lets the ladder skip the rung
+    immediately, with no backoff sleep, so a fresh install that only ran setup
+    never hangs the run.
+    """
+    # A missing Python package (cloudscraper, camoufox, playwright, the stealth
+    # helper) can never be fixed by retrying — treat any import error as a
+    # launch/engine failure so the ladder advances without backoff.
+    if isinstance(exc, (ImportError, FileNotFoundError)):
+        return True
+    msg = str(exc).lower()
+    return any(marker in msg for marker in _BROWSER_LAUNCH_FAILURE_MARKERS)
+
+
+def _origin_of(url: str) -> Optional[str]:
+    """Return ``scheme://netloc/`` for ``url``, or None if it has no host."""
+    parts = urlsplit(url)
+    if not parts.scheme or not parts.netloc:
+        return None
+    return urlunsplit((parts.scheme, parts.netloc, "/", "", ""))
 
 
 class RequestManager:
@@ -389,12 +454,92 @@ class RequestManager:
         r.raise_for_status()
         return r.text
 
+    @staticmethod
+    def _warmed_hosts_for(session: Any) -> set:
+        """The set of hosts already warmed on ``session`` (one per session)."""
+        warmed = getattr(session, "_wns_warmed_hosts", None)
+        if warmed is None:
+            warmed = set()
+            try:
+                session._wns_warmed_hosts = warmed
+            except Exception:
+                # A session that refuses attributes (unlikely) simply re-warms;
+                # harmless, just an extra homepage GET.
+                pass
+        return warmed
+
+    @staticmethod
+    def _apply_request_headers(
+        session: Any, *, referer: Optional[str], sec_fetch_site: str
+    ) -> None:
+        """Set the per-request Referer / Sec-Fetch-Site on ``session.headers``.
+
+        Works on a real ``requests``/``cloudscraper`` session (CaseInsensitiveDict)
+        and on the plain-dict fakes the tests use.
+        """
+        headers = session.headers
+        headers["Sec-Fetch-Site"] = sec_fetch_site
+        if referer:
+            headers["Referer"] = referer
+        else:
+            try:
+                headers.pop("Referer", None)
+            except Exception:
+                pass
+
+    def _http_get(self, session: Any, url: str) -> str:
+        """HTTP GET that mimics a real browser's navigation sequence.
+
+        The legacy FreeWebNovel scraper downloaded a whole novel without tripping
+        Cloudflare; the rewrite lost two browser-like behaviours that this restores
+        on the primary (attempt-1) HTTP path:
+
+        1. **A once-per-host warm-up GET to the site origin.** Before the first
+           chapter on a host is requested, we GET the homepage so Cloudflare issues
+           a ``cf_clearance`` cookie into the persistent session — exactly what a
+           human does by opening the site before reading. (A full run already
+           fetches the index page first, but a *resume* run loads the cached TOC and
+           would otherwise hit a chapter URL cold, with no cookies.) Cookies persist
+           on ``self.session`` across every chapter, so the clearance is reused.
+        2. **A host-derived Referer + correct Sec-Fetch-Site.** The warm-up looks
+           like an address-bar navigation (``Sec-Fetch-Site: none``, no Referer);
+           every subsequent same-host request looks like an in-site click
+           (``Sec-Fetch-Site: same-origin``, ``Referer`` = the site origin).
+
+        Goes through ``_get_text`` so status handling — and the tests that patch
+        ``_get_text`` — stay unchanged.
+        """
+        origin = _origin_of(url)
+        host = urlsplit(url).netloc
+        warmed = self._warmed_hosts_for(session)
+
+        if origin and host and host not in warmed:
+            # Best-effort warm-up: a failure here must never fail the real fetch
+            # (the real GET below still runs and reports the true outcome).
+            self._apply_request_headers(session, referer=None, sec_fetch_site="none")
+            try:
+                self._get_text(session, origin)
+                self._log(
+                    f"  warmed session on {host} (homepage GET to acquire cf cookies)"
+                )
+            except Exception as exc:
+                self._log(f"  (warm-up GET for {host} skipped: {exc})")
+            warmed.add(host)
+
+        if origin and host in warmed:
+            self._apply_request_headers(
+                session, referer=origin, sec_fetch_site="same-origin"
+            )
+        else:
+            self._apply_request_headers(session, referer=None, sec_fetch_site="none")
+        return self._get_text(session, url)
+
     def _fetch_uncached_strategy(self, url: str, strategy: str) -> str:
         """Run exactly one fetch attempt using one concrete strategy."""
         if strategy == FETCH_STRATEGY_HTTP:
-            html = self._get_text(self.session, url)
+            html = self._http_get(self.session, url)
         elif strategy == FETCH_STRATEGY_CLOUDSCRAPER:
-            html = self._get_text(self._cloudscraper(), url)
+            html = self._http_get(self._cloudscraper(), url)
         elif strategy == FETCH_STRATEGY_PLAYWRIGHT_STEALTH:
             html = self._fetch_browser_once(url, fresh_context=False)
         elif strategy == FETCH_STRATEGY_PLAYWRIGHT_STEALTH_FRESH:
@@ -459,6 +604,19 @@ class RequestManager:
                 )
                 if attempt >= max_attempts:
                     break
+                # A browser engine that isn't installed / can't launch is a
+                # STRUCTURAL failure: retrying it (let alone after a 100-second
+                # backoff) can never succeed. Advance to the next rung IMMEDIATELY,
+                # with no sleep, so a fresh install that only ran setup never hangs.
+                if _looks_like_browser_launch_failure(exc):
+                    next_strategy = _strategy_for_attempt(ladder, attempt + 1)
+                    self._log(
+                        f"  {strategy} browser engine is not installed/launchable — "
+                        f"skipping to {next_strategy} immediately (no backoff). "
+                        "Re-run Setup_and_Run-Web-Novel-Scraper to install the "
+                        "browser engines."
+                    )
+                    continue
                 delay = compute_backoff_delay(
                     attempt,
                     base_delay=retry_base_delay,

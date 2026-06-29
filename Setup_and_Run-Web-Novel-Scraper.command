@@ -201,16 +201,37 @@ else
 fi
 
 # ============================================================================
-#  STEP 3b - Playwright Chromium (for the Cloudflare / browser fetch path)
+#  STEP 3b - camoufox browser engine (the primary Cloudflare bypass rung)
 # ============================================================================
-# FreeWebNovel sits behind Cloudflare; the browser path needs Chromium. This
-# downloads INTO the project (PLAYWRIGHT_BROWSERS_PATH above), ~once.
+# FreeWebNovel sits behind Cloudflare. The primary browser rung is camoufox (an
+# anti-detect Firefox); its binary is downloaded with "python -m camoufox fetch"
+# into the per-user camoufox cache (~once, no admin). A sentinel lets later runs
+# skip it.
+if [ ! -f ".venv/camoufox.fetched" ]; then
+    echo "Downloading the camoufox browser engine (~once)..."
+    if python -m camoufox fetch; then
+        echo "done" > ".venv/camoufox.fetched"
+    else
+        echo "  WARNING: The camoufox download did not complete. The plain HTTP"
+        echo "           path still works, but the Cloudflare/browser bypass"
+        echo "           (needed for FreeWebNovel) will not until this succeeds."
+        echo "           Re-run this file to retry."
+        echo
+    fi
+fi
+
+# ============================================================================
+#  STEP 3c - Playwright Chromium (the playwright-stealth last-resort rungs)
+# ============================================================================
+# The last-resort rungs (playwright_stealth / playwright_stealth_fresh) drive a
+# Chromium through Playwright. Installed CHROMIUM ONLY (never full Chrome) and
+# contained INSIDE the project (PLAYWRIGHT_BROWSERS_PATH above), ~once.
 if [ ! -d "$PLAYWRIGHT_BROWSERS_PATH" ]; then
     echo "Downloading the Playwright Chromium browser into the project (~once)..."
     if ! python -m playwright install chromium; then
-        echo "  WARNING: Chromium download did not complete. The plain HTTP path"
-        echo "           still works; the Cloudflare/browser path may not until"
-        echo "           this succeeds. Re-run this file to retry."
+        echo "  WARNING: Chromium download did not complete. camoufox (the primary"
+        echo "           bypass) still works; only the last-resort playwright-stealth"
+        echo "           rungs are unavailable until this succeeds. Re-run to retry."
         echo
     fi
 fi

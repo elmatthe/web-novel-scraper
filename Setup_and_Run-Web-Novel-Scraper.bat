@@ -13,8 +13,10 @@ cd /d "%~dp0"
 ::       only (user scope, no admin).
 ::    3. Creates a fresh .venv IN THE REPO ROOT and installs all dependencies
 ::       (scripts\requirements.txt) into it (never system-wide).
-::    4. Downloads the camoufox browser engine (the Cloudflare bypass this
-::       project's retry ladder uses) for the Cloudflare/browser fetch path.
+::    4. Downloads the browser engines the Cloudflare retry ladder uses:
+::       camoufox (anti-detect Firefox, the primary browser rung) AND Chromium
+::       (for the playwright-stealth last-resort rungs). Both are contained in the
+::       repo / per-user cache - no admin, nothing system-wide.
 ::    5. Launches the GUI (scripts\Universal\app.py). On every later run it acts
 ::       as the launcher.
 ::
@@ -220,7 +222,36 @@ if not exist ".venv\camoufox.fetched" (
 )
 
 :: ============================================================================
-::  STEP 4 - Optional self-contained ffmpeg (unused by this project)
+::  STEP 4b - Chromium browser engine for the playwright-stealth rescue rungs
+:: ============================================================================
+:: The LAST-RESORT Cloudflare rungs (playwright_stealth / playwright_stealth_fresh)
+:: drive a Chromium browser through Playwright. camoufox above does NOT provide
+:: Chromium, so without this download those rungs can never launch (the live
+:: "Executable doesn't exist ... playwright install" failure). We install
+:: Chromium ONLY (never full Chrome) and CONTAIN it inside the repo at
+:: files\bin\ms-playwright via PLAYWRIGHT_BROWSERS_PATH - portable, no admin,
+:: consistent with how this project keeps binaries in-folder. The same variable
+:: is exported below so the GUI finds the engine where setup put it. A sentinel
+:: file lets later launches skip the download.
+set "PLAYWRIGHT_BROWSERS_PATH=%~dp0files\bin\ms-playwright"
+if not exist ".venv\playwright.fetched" (
+    echo [Step 4b of 5] Downloading the Chromium browser engine ^(~once, into this folder^)...
+    python -m playwright install chromium
+    if !errorlevel! neq 0 (
+        echo   WARNING: The Chromium browser download did not complete. camoufox
+        echo            ^(the primary bypass^) still works; only the last-resort
+        echo            playwright-stealth rungs are unavailable until this
+        echo            succeeds. Re-run this file to retry.
+        echo.
+    ) else (
+        echo done> ".venv\playwright.fetched"
+    )
+) else (
+    echo [Step 4b of 5] Chromium browser engine already downloaded - skipping.
+)
+
+:: ============================================================================
+::  STEP 4c - Optional self-contained ffmpeg (unused by this project)
 :: ============================================================================
 if "%USE_FFMPEG%"=="1" call :ensure_ffmpeg
 if exist "%BIN_DIR%" set "PATH=%BIN_DIR%;%PATH%"
