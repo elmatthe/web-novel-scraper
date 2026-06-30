@@ -3,6 +3,138 @@
 All notable changes to this project are recorded here. Versions follow semantic
 versioning.
 
+## [0.2.0] — Unreleased
+
+Fast-primary scraping with a **single background hard-chapter rescue lane**. The
+0.1.3 architecture ran one persistent VISIBLE browser for *every* FreeWebNovel
+chapter, which is slow when most chapters need no bypass at all. 0.2.0 splits the
+work: a fast primary pass races through the easy chapters, and only the genuinely
+hard ones (a real Cloudflare challenge) are handed to **one** dedicated background
+rescue worker that escalates a fixed strategy ladder. There is exactly **one**
+rescue lane in 0.2.0 — `RESCUE_MAX_WORKERS = 1`, enforced as a hard cap (the pool
+constructor rejects any other count); the user-selectable 1–5 worker toggle is
+**deferred to 0.2.1**. No release tag/date until the manual live pass signs off.
+
+### Added — single-lane hard-chapter rescue (`rescue_pool.py`, new)
+- A `RescuePool` owning **one** dedicated worker thread (no thread pool) with a
+  bounded job queue (`RESCUE_MAX_PENDING = 16`) and an unbounded results queue. The
+  worker builds and owns its **own** `RequestManager` and `FreeWebNovelAdapter` on
+  its own thread (sharing only the run's `HostRateLimiter` and `cancel_event`), and
+  tears the browser down in a `finally`.
+- **Ladder-as-data, monotonically escalating.** The rescue ladder is a fixed list
+  of `RescueStep`s — `headless_camoufox` → fresh `headless_camoufox` →
+  `headful_camoufox` → `headful_chromium` — that the worker walks per chapter and
+  only ever escalates: once it latches a stronger mode it never drops back for a
+  later chapter. The **initial rung follows the primary** (a headless-primary run
+  starts at the headless rung; a visible-primary run skips the headless rungs), so
+  rescue never starts *weaker* than the primary.
+- **Per-chapter processing deadline** of `RESCUE_MAX_ELAPSED_PER_CHAPTER = 180s`
+  (measured from dequeue; queue wait is not charged). Before each attempt the worker
+  computes the remaining budget, refuses to start a rung it cannot finish, and caps
+  the attempt timeout to what is left.
+- **One terminal result per accepted job** — including a job that was queued and
+  then cancelled (it terminalizes as `cancelled`, never silently dropped). Immutable
+  `RescueResult` (`rescued` / `rescue_exhausted` / `cancelled` / `not_found` /
+  `extraction_failed` / `pool_failed`); a worker crash terminalizes the active job
+  and drains the backlog as `pool_failed` rather than hanging.
+
+### Added — global fair host limiter (`host_rate_limiter.py`, new)
+- A `HostRateLimiter` shared by the primary and the rescue lane so both obey **one**
+  per-host pace. Per-host FIFO ticket ordering (no starvation), a positive-only
+  jitter after the interval, a global floor `HOST_MIN_INTERVAL = 3.0s`, a
+  `raise_interval` ratchet that never lowers, and a 429 host-cooldown
+  (`note_rate_limited` / `blocked_until`). The pipeline `_Pacer` feeds it: the shared
+  effective interval is `max(HOST_MIN_INTERVAL, job.delay, pacer.current)`, so the
+  adaptive auto-slowdown now paces the rescue worker too.
+
+### Added — typed failures + body-first classification (`request_manager.py`)
+- Typed `FetchError` subclasses: `NotFoundFetchError` (404/410, terminal),
+  `ChallengeFetchError`, `TransientFetchError`, and `RateLimitedFetchError`
+  (carrying `retry_after`). Classification is now **body-first**: a real chapter
+  payload is a success even under a 403/503; a Cloudflare body (including a CF-style
+  503) is a `Challenge`; 404/410 is `NotFound`; 429 is `RateLimited` (and notifies
+  the shared limiter's cooldown rather than escalating to the browser); 5xx is
+  `Transient`. **403 is no longer treated as permanent** (`PERMANENT_STATUSES` is now
+  `(404, 410)`). A `last_fetch_info` record (cache vs. network, and the outcome
+  class) is exposed for the circuit breaker.
+- **Fast/HTTP-probe split.** A `fetch(..., fast_path=True)` mode walks a short, bounded
+  fast ladder (camoufox ×2, no stealth rung) used by the primary and TOC; optional
+  HTTP probes are *extra* and never consume the browser budget.
+- **Explicit per-manager timeouts.** The constructor now takes explicit
+  `http_timeout` / `browser_nav_timeout` / `cloudflare_timeout`, **retiring the old
+  mutated module-global `FETCH_TIMEOUT`** entirely.
+
+### Added — pipeline conductor, TOC bootstrap, headless-only breaker (`pipeline.py`)
+- A fast-primary loop that races the easy chapters and hands each genuinely hard
+  chapter to the single rescue lane (built lazily on the first hard chapter, so an
+  easy run never spins up a worker). Rescue is the **sole** retrier on the
+  FreeWebNovel-browser path; the old end-of-run sweep is replaced there. WebNovel
+  (Dynamic) keeps its unchanged HTTP-only sweep.
+- **Scope gate.** Rescue is enabled only for `adapter_key == "freewebnovel"` **and**
+  `job.use_browser` — a WebNovel-dynamic or HTTP-only run never builds a pool.
+- **Pipeline-owned, headless-only circuit breaker.** The breaker is *armed only when
+  the run started headless* (so rescue never starts weaker than the primary), counts
+  only uncached primary **network** fetches, and trips on **≥5 consecutive** network
+  challenges **OR ≥9 challenges within a rolling window of 20**
+  (`BREAKER_CONSECUTIVE_CHALLENGES = 5`, `BREAKER_WINDOW = 20`,
+  `BREAKER_WINDOW_CHALLENGES = 9`). On a trip the pipeline **recreates the primary
+  manager/adapter as visible and latches** there for the rest of the run (closing the
+  old pair exactly once), and synchronously retries the triggering hard chapter on the
+  now-visible primary before falling back to rescue.
+- **TOC/index bootstrap fallback.** If building the chapter index is blocked under a
+  headless primary, the pipeline retries it once with a visible primary, and aborts
+  cleanly if it is still blocked.
+- **429 host cooldown.** A rate-limited primary fetch is retried on the shared limiter
+  cooldown up to `RATE_LIMIT_RETRY_BUDGET = 2` times (never escalated to rescue); a
+  persistent 429 is surfaced as transient so resume can pick it up.
+- `RunReport` gained rescue/breaker metrics (`rescue_exhausted` ⊆ `failed`,
+  `rescue_queue_peak`, `rescue_jobs_submitted` / `_completed`, `rescue_worker_failures`,
+  `circuit_breaker_tripped`, `primary_switched_visible`, `rescue_strategy`) and two
+  summary lines.
+
+### Added — `ScrapeJob` run-config (`models.py`)
+- `ScrapeJob` now carries the run configuration that used to be set by mutating
+  globals/catalog rows: `use_browser`, `headless`, `request_timeout`, and
+  `rescue_workers` (validated `== 1` in `__post_init__` — the single-lane invariant).
+  A new `runtime_site_spec(spec, job)` returns a per-run `SiteSpec` copy with
+  `use_browser` taken from the job, so fetching is driven by the job **without
+  mutating the shared catalog row**.
+
+### Changed — GUI wiring (`app.py`)
+- The **delay default is now 3.0s** (was 2.0), matching the shared host-limiter floor.
+- **The pipeline owns the request manager.** The GUI no longer pre-builds a
+  `RequestManager` or mutates `SiteSpec.use_browser`; it builds an immutable
+  `ScrapeJob` (use_browser / headless / request_timeout / `rescue_workers == 1`) and
+  hands it to the pipeline, which constructs, replaces (on a breaker trip), and closes
+  the active manager itself.
+- **Accurate Headless hint.** The Headless checkbox now reads: *"Headless primary
+  browser (advanced). If Cloudflare broadly blocks headless mode, the app may
+  automatically open and keep a visible browser for the rest of the run; hard chapters
+  may also open a visible rescue browser."*
+- **Rescue/breaker activity surfaces in the existing log pane** (no new widgets) — e.g.
+  "chapter N → rescue", "chapter N rescued", "chapter N failed after all methods", and
+  "primary mode broadly blocked — switching to a visible browser…". Progress ticks only
+  on terminal chapter states (including rescued chapters); all GUI updates are marshalled
+  via `self.after(...)` and rescue threads never touch tkinter.
+- **Non-daemon worker + poll-until-exit close.** The scrape worker is now non-daemon so
+  the pipeline's teardown `finally` always runs; closing the window while a scrape is
+  running signals `cancel_event`, marks the app closing, and polls on the Tk event loop
+  until the worker exits before destroying — rather than destroying immediately.
+
+### Tests
+- New `files/tests/test_phase1_rescue_core.py`, `test_phase2_rescue_pool.py`,
+  `test_phase3_rescue_conductor.py`, and `test_phase4_gui.py` (typed-failure /
+  classification / limiter / pool / conductor / GUI-wiring coverage), plus a light
+  offline release-metadata check. Existing assertions were adjusted (not deleted) to
+  track the deliberate behaviour changes (typed `ChallengeFetchError`,
+  `PERMANENT_STATUSES = (404, 410)`). No live network and no real browser launch in the
+  suite. Suite: **229 offline tests** (`verify` green: 228 passed, 1 expected
+  no-Tk-display skip).
+- **Honest status:** offline tests prove wiring/flow/lifecycle. Whether a **headless**
+  primary can clear FreeWebNovel's current Cloudflare (and how often the breaker has to
+  fall back to a visible browser, or hard chapters to the visible rescue lane) is the
+  open question the manual live pass answers.
+
 ## [0.1.3] — 2026-06-29
 
 Headful-browser-primary pass for FreeWebNovel, matched to the legacy scraper. Root

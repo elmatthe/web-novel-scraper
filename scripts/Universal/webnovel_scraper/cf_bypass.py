@@ -480,15 +480,21 @@ def fetch_with_stealth(
 
     response = page.goto(url, wait_until=wait_until, timeout=nav_timeout)
     status = getattr(response, "status", None)
-    if status in (403, 404):
+    # 404/410 → genuinely missing; surface so the caller records terminal not-found.
+    # 403 is deliberately NOT short-circuited (§3.3): on FreeWebNovel a 403 is almost
+    # always a Cloudflare block, so we proceed to the CF wait and let the caller
+    # classify the resulting body (real payload → success; still challenged →
+    # ChallengeFetchError) rather than treating 403 as permanent before the wait.
+    if status in (404, 410):
         raise RuntimeError(f"HTTP {status} for {url}")
     page.wait_for_timeout(random.randint(800, 2000))
 
     if not wait_for_cloudflare(page, timeout=cf_timeout, log_fn=log_fn):
-        raise RuntimeError(
-            f"Cloudflare challenge did not clear for {url}. "
-            "Try running with headless=False, using a different strategy, "
-            "or adding a proxy."
+        # Do NOT raise: return the current (still-challenge) page so the caller
+        # classifies it body-first. A genuinely cleared page returns real content.
+        _log(
+            f"Cloudflare challenge did not clear for {url} within {int(cf_timeout)}s; "
+            "returning current page for body-first classification."
         )
 
     simulate_human_behavior(page)
@@ -525,7 +531,10 @@ def fetch_camoufox(
     _log = log_fn or logger.info
     response = page.goto(url, wait_until=wait_until, timeout=nav_timeout)
     status = getattr(response, "status", None)
-    if status in (403, 404):
+    # 404/410 → genuinely missing (terminal not-found). 403 is NOT short-circuited:
+    # it is body-first classified after the poll below (§3.3) — a 403 carrying a real
+    # chapter body clears, a 403 still showing a challenge becomes a ChallengeFetchError.
+    if status in (404, 410):
         raise RuntimeError(f"HTTP {status} for {url}")
 
     deadline = time.time() + cf_timeout

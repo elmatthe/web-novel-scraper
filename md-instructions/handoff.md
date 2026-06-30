@@ -1,6 +1,594 @@
 # webnovel-scraper - Handoff
 
+## Current Focus — 0.2.0 live-test bug-fix drop (Phase C DONE; release-prep NEXT)
+**2026-06-30, HOME-PC. Working from `md-instructions/0.2.0_live-test-bug-report-and-fix-plan.md`
+(3 bugs surfaced by the user's first 0.2.0 live test, all on the legacy WND path; NOT 0.2.0
+regressions). ALL THREE BUGS NOW FIXED (BUG-2 in Phase B, BUG-1 + BUG-3 in Phase C). NOT
+committed; 0.2.0 stays Unreleased/undated. `verify` GREEN at 255 passed (245 after Phase B;
++10 new BUG-1 tests = 255). Ran ONCE foreground under a 300s watchdog — pytest 7.36s, no test
+needed the watchdog.**
+
+### PERSISTED Phase A root-cause findings (accepted; survive compaction)
+- **BUG-1 (HIGH, intermittent) — camoufox page closed before nav (WND ladder, shared code).**
+  `request_manager.py` caches one camoufox page and NEVER checks it is alive
+  (`grep is_closed/is_connected` = none). `_ensure_camoufox_page` returns a dead
+  `self._cf_page`; the non-fresh `camoufox` rung doesn't reset; `_warm_camoufox_session`
+  swallows the "page closed" warm-up failure and marks the host warmed, leaving a dead page;
+  the chapter `goto` then fails the WHOLE attempt. No within-attempt recreate — recovery only
+  comes from the NEXT rung (`camoufox_fresh` → `_reset_camoufox`). When the recreated page is
+  ALSO torn down (BUG-3) both rungs fail (live run #1). **Fix = Phase C**: guarded liveness
+  check + recreate-on-closed within the attempt (purely additive; never triggers on a healthy
+  FWN page → scope gate / single-lane / ch-102 detector untouched). Reproduced offline.
+- **BUG-2 (MEDIUM) — slow Stop + no atomic write. FIXED THIS PHASE (see below).** Exact cause
+  was the monolithic `self._sleep(delay)` inter-attempt backoff in
+  `_fetch_with_retry_ladder` (up to ~138s, un-sliced, cancel only checked at loop-top). The
+  legacy WND manager was also built WITHOUT a `sleep_fn`, so it used real `time.sleep`.
+- **BUG-3 (INVESTIGATE, partly environmental) — headful camoufox stalls/torn-down while
+  unfocused on Windows.** Firefox background/occlusion throttling of timer-driven CF-challenge
+  JS + `wait_for_timeout`; "click in → unstuck" matches. Likely shares BUG-1's root cause.
+  **Phase C**: prefer concrete load/selector/network signals over `wait_for_timeout` where it
+  helps; if still partly an OS reality, DOCUMENT it (one-line README/handoff note) — NO
+  fake-focus/automation-evasion hacks.
+- **Phase-4 lifecycle CONFIRMED present in live `app.py`** (non-daemon worker `daemon=False` +
+  `_begin_close`/`_poll_close` poll-until-exit before `destroy`); module docstring still says
+  "daemon thread" (stale wording, not stale code). **No `FETCH_TIMEOUT` global writes remain**
+  (only the module constant; `app.py` has zero refs; config travels on `ScrapeJob`).
+
+### Phase B — what changed (per file)
+- `request_manager.py` — (1) new module const `BACKOFF_WAIT_SLICE = 0.25`; (2) new
+  `RequestManager._cancellable_backoff(seconds)` slicing helper (≤0.25s slices, re-checks
+  `cancel_event` each slice, drives off the injected `self._sleep`, returns early on cancel —
+  mirrors `HostRateLimiter._wait`); (3) `_fetch_with_retry_ladder` now calls
+  `self._cancellable_backoff(delay)` instead of `self._sleep(delay)` (the loop-top check still
+  raises `ScrapeCancelled`); (4) `_warm_camoufox_session` now `except ScrapeCancelled: raise`
+  BEFORE its broad `except Exception`, so a Stop during warm-up nav propagates (matters on the
+  FWN path's shared limiter). Main-ladder `ScrapeCancelled` re-raise UNCHANGED.
+- `pipeline.py` — legacy-path `RequestManager(...)` build now threads `sleep_fn=sleep_fn` (the
+  run's injected timing source) so the legacy ladder's sliced backoff is fake-clock-drivable in
+  tests instead of falling through to real `time.sleep`. Rescue path / sweep / scope gate
+  untouched.
+- `pdf_builder.py` — (1) new `_atomic_write(path, write_fn)` (temp-in-same-dir →
+  `os.replace`, cleans temp on any failure); (2) `remove_single_heading_pages` now reads the
+  source from an in-memory `BytesIO` copy (no lingering handle) and rewrites atomically;
+  (3) `create_pdf` stages the whole build (ReportLab + heading-strip) in a `.part` temp and
+  publishes with a single atomic `os.replace` only on full success — a cancel/crash/kill at any
+  point leaves NO corrupt final PDF and NO `.part` artifact. Covers SEPARATE/CHUNKED/SINGLE and
+  the FWN path. Added `import os, tempfile, from io import BytesIO`.
+- Tests — **NEW `files/tests/test_bug2_cancel_atomic.py` (12 tests)**: sliced backoff aborts
+  within one slice on cancel (fake clock); real-clock regression guard that HANGS if the
+  backoff reverts to a monolithic sleep; full-wait-preserved-when-not-cancelled (slices sum to
+  the delay); `_warm_camoufox_session` re-raises `ScrapeCancelled` (and still swallows a
+  non-cancel warm-up failure); main-ladder `ScrapeCancelled` re-raise unchanged; atomic
+  `create_pdf` success/valid-PDF/no-`.part`; mid-write failure (os.replace raises) leaves no
+  corrupt final + no temp; failure doesn't clobber an existing good final; all 3 output modes
+  write finals with no `.part`; FWN healthy run writes all 5, `failed==[]`, no `.part`, scope
+  gate intact (pool never built).
+- Tests UPDATED (4 existing, faithful to original intent — the backoff is now sliced, so a
+  recording `sleep_fn` sees ≤0.25s slices; assertions switched from an exact per-attempt list
+  to TOTAL + slice-cap): `test_phase2.py` (×3 incl. the parametrized retry test),
+  `test_cf_avoidance.py` (launch-failure-still-backs-off), `test_headful_camoufox.py`
+  (stealth-launch-failure-non-blocking). No test deleted/ignored to hit a number.
+
+### Phase B divergences / notes
+- The sliced backoff lives in the SHARED `_fetch_with_retry_ladder`, so the FWN browser-primary
+  path's inter-attempt backoff is now cancel-aware too — a benign superset of the WND-only ask,
+  no behavior change beyond interruptibility. Total backoff duration is unchanged (verified by
+  the sum-preserved test).
+- The inter-fetch `_Pacer.sleep` (3.0s default) is still a single `self._sleep` — left as-is
+  (the plan scoped the fix to the long ladder backoff; 3s is tolerable for Stop latency). Noted
+  as a possible future polish, not done now.
+- CHANGELOG NOT touched: BUG-2/3 are pre-acceptance fixes to the still-Unreleased 0.2.0; fold
+  into the 0.2.0 entry at acceptance/tag time (keeps 0.2.0 Unreleased/undated; docs gate green).
+
+### Phase C — what changed (BUG-1 liveness/recreate + BUG-3 doc note)
+All in the SHARED camoufox code in `request_manager.py` (cf_bypass.py UNTOUCHED) — purely
+additive/guarded robustness that NEVER triggers on a healthy page.
+- `request_manager.py` —
+  - **NEW module helper `_page_is_alive(page)`** — returns whether a cached browser page can be
+    reused, WITHOUT throwing. Conservative in the SAFE direction: a page is ALIVE unless
+    *positively* proven closed (`page.is_closed()` truthy, or `is_closed()` *raises* → dead). A
+    page object that does NOT expose `is_closed` (a test fake, or anything we can't introspect)
+    is treated as **alive** — the only choice that lets the guard never spuriously recreate a
+    healthy page (real Playwright/camoufox pages always have `is_closed()` → `False` when
+    healthy; the existing offline suite caches a bare `object()` as the page). NOTE: the Phase C
+    plan sketched "returns False on a no-method object"; that would recreate every cached
+    healthy/fake page lacking the hook and break the object()-reuse tests, so the safe default
+    is used and documented (in code + in the new test's module docstring).
+  - **NEW module helper `_is_page_closed_error(exc)`** — True iff `str(exc)` looks like a
+    Playwright/Camoufox "target/page/context/browser has been closed" teardown (matched by
+    message substring via `_PAGE_CLOSED_MARKERS`, so it needs no playwright import and survives
+    class renames). Never raises. `ScrapeCancelled`/other failures → False (escalate normally).
+  - **`_ensure_camoufox_page`** now calls `_page_is_alive(self._cf_page)` before reusing the
+    cached page; a positively-dead page triggers `_reset_camoufox()` + a fresh build WITHIN the
+    attempt. Healthy page → reused unchanged (guard never fires).
+  - **`_fetch_camoufox_once`** wrapped in a `for attempt in range(2)` loop: if warm-up or the
+    chapter goto raises a closed-page error on the FIRST try, `_reset_camoufox()` + retry ONCE
+    on a fresh page within the SAME rung. A second closed error (or any non-closed failure)
+    re-raises so the ladder advances — exactly one recreate per rung, no loop. `ScrapeCancelled`
+    re-raises immediately (never treated as a closed-page retry).
+  - **`_warm_camoufox_session`** — its broad `except Exception` now special-cases a closed-page
+    error: do NOT mark the host warmed, do NOT leave the dead page cached — `_reset_camoufox()`
+    + re-raise so `_fetch_camoufox_once`'s recreate-and-retry rebuilds + re-warms a fresh page
+    (the old behaviour swallowed it, marked warmed, and handed the caller a corpse → the chapter
+    goto then failed the whole rung = the live BUG-1). A NON-closed warm-up failure is still
+    swallowed + marks warmed (Phase B behaviour unchanged). `ScrapeCancelled` re-raise (Phase B)
+    unchanged and FIRST in the except chain.
+- **BUG-3 — assessed, NOT code-fixed (environmental); documented.** The CF interstitial is
+  JS-rendered and clears on Cloudflare's own timers; there is NO reliable concrete
+  selector/load signal to wait on for "challenge cleared" (we already positively wait on
+  `has_real_payload` in `cf_bypass.fetch_camoufox`). The stall is Firefox throttling its
+  background/occluded-window timers on Windows — an OS reality, not something an external
+  `wait_for_*` can un-throttle. Per the plan's explicit allowance, the poll is left as-is and
+  the **liveness recreate (BUG-1 fix) is the primary code mitigation** for the closed-window
+  case. Documented honestly:
+  - `README.md` — one sentence under "Cloudflare handling": keep the browser window visible;
+    minimised/occluded Firefox may have challenge timers throttled; click into it if a chapter
+    stalls.
+  - (full note here in handoff, above.)
+- Tests — **NEW `files/tests/test_bug1_camoufox_liveness.py` (10 tests)**: liveness-helper edge
+  inputs (None→dead, open→alive, closed→dead, raising→dead, no-`is_closed`→alive); closed-error
+  detector positives/negatives (incl. `ScrapeCancelled`→False); dead cached page → reset +
+  recreate → success; page dies mid-attempt → reset + retry-within-rung succeeds; two
+  consecutive dead pages → raises, exactly one recreate (chapter goto attempted exactly twice,
+  no loop); warm-up closed → host NOT warmed + dead page NOT cached + reset ran; warm-up
+  NON-closed failure → swallowed + marked warmed (Phase B unchanged); healthy page reused across
+  3 chapters → never recreated, browser never reset; recreate attempt returns the correct body
+  via `_fetch_uncached_strategy`; `ScrapeCancelled` still re-raises through warm-up. No existing
+  test changed (the object()-page reuse tests stay green because missing-`is_closed` = alive).
+
+### Phase C divergences / notes
+- Liveness "missing `is_closed` = ALIVE" default deviates from the plan's literal "returns False
+  on a no-method object" — see the rationale above; the deviation is what KEEPS the never-fire
+  guarantee and the existing green suite. Documented in code + test docstring.
+- BUG-3 is intentionally a doc-note, not a code change to `cf_bypass.py` (no reliable concrete
+  signal for the JS interstitial; the BUG-1 recreate is the real mitigation). cf_bypass.py was
+  NOT touched.
+- FWN scope gate (`job.adapter_key == "freewebnovel" and job.use_browser`), single-lane
+  invariant (`RESCUE_MAX_WORKERS = 1`), and the ch-102 payload-gated detector are **UNTOUCHED**.
+  The guard is purely additive and never fires on a healthy FWN page.
+- CHANGELOG still NOT touched (BUG-1/2/3 are pre-acceptance fixes to still-Unreleased 0.2.0;
+  fold into the 0.2.0 entry at acceptance/tag time).
+
+**SAFE TO COMPACT before release-prep: YES.** All Phase C changes are on disk, `verify` green at
+255, nothing in-flight. All three live-test bugs (BUG-1/2/3) are now addressed. Next step is the
+user's acceptance of 0.2.0 (fold BUG-1/2/3 into the 0.2.0 CHANGELOG entry at tag time per §8) or
+a fresh live re-test — no further automated phase is pending.
+
 ## Current Focus (newest)
+**0.2.0 IMPLEMENTED — all five phases complete and verified; PENDING the user's manual
+live test (§7). NOT committed; 0.2.0 stays Unreleased/undated (2026-06-30, HOME-PC).**
+Phase 5 was docs + version only (no behaviour change): `CHANGELOG.md` gained
+`## [0.2.0] — Unreleased` (undated; describes a SINGLE background rescue lane, not "N
+workers"; cites the actual breaker thresholds ≥5 consecutive OR ≥9-of-20, the 180s
+deadline, `HOST_MIN_INTERVAL=3.0`, `RATE_LIMIT_RETRY_BUDGET=2`); `Briefing.md` got the
+0.2.0 architecture (`rescue_pool.py` single lane, `host_rate_limiter.py`, fast/HTTP-probe
+split, the pipeline conductor + scope gate + headless-only breaker + TOC bootstrap,
+`ScrapeJob` run-config), "Current Version → 0.2.0 (Unreleased)", a 0.2.0 "What Has Been
+Built" entry, an updated Known Issues (headless-clearance is the open live question) and
+Next Steps (§7 Pass A + Pass B, cache-OFF + fresh folder); `README.md` got one minimal
+note (Headless may be auto-overridden to visible for the rest of a broadly-blocked run;
+hard chapters may open a visible rescue browser); and a new light offline
+`files/tests/test_release_metadata.py` (4 tests) asserts the top CHANGELOG version is
+0.2.0, Briefing agrees, and 0.2.0 stays Unreleased/undated.
+
+`verify` GREEN at **233 passed** (Phase-4 run was 228 passed + 1 intermittent no-Tk skip
+= 229 collected; +4 release-metadata = 233 collected; this run all GUI tests passed so the
+no-Tk skip did not trigger — it remains an expected, by-design graceful skip on a machine
+with no Tk display). No tests deleted/ignored to hit a number. Ran ONCE foreground under a
+300s watchdog — completed in ~7.2s, no test needed the watchdog to terminate.
+
+**verify.py needed NO change.** Its docs gate requires `^##\s*\[?v?\d+\.\d+\.\d+\]?`,
+which `## [0.2.0] — Unreleased` already satisfies (the date is optional), so the undated
+Unreleased heading passes without weakening the pattern. Not a divergence.
+
+**SAFE TO COMPACT before the manual live test: YES.** Phase 5 is the last automated phase;
+everything is on disk, `verify` is green at 233, nothing is in-flight. A future
+context-cleared session can resume straight into helping interpret/triage the live pass
+results (or starting 0.2.1 only after the user accepts 0.2.0 per §8). See the consolidated
+cross-phase report in the Session Sync Log entry below.
+
+## Current Focus (Phase 4)
+**0.2.0 — Phase 4 complete (GUI wiring: 3.0s delay default, accurate Headless hint,
+rescue/breaker activity surfaced in the existing log pane, the GUI-pre-built
+RequestManager retired in favour of pipeline-owned managers, and the non-daemon
+window-close poll-until-exit lifecycle); NOT committed, 0.2.0 stays Unreleased
+(2026-06-30, HOME-PC).** `verify` GREEN at **228 passed, 1 skipped** (Phase-3 baseline
+222 + 7 new Phase-4 tests = 229 collected; the 1 skip is the graceful no-Tk-display
+fallback, see below). No tests deleted. Ran ONCE foreground under a 300s watchdog —
+completed in 8.54s, no test needed the watchdog to terminate. Docs/version are Phase 5.
+
+**What changed, per file:**
+- `app.py` (the thin GUI shell) —
+  - **§4.1 delay default → `DEFAULT_DELAY = "3.0"`** (anti-detection hint unchanged).
+  - **§4.2 Headless hint copy** rewritten to be accurate about the breaker override +
+    the visible rescue browser: *"Headless primary browser (advanced). If Cloudflare
+    broadly blocks headless mode, the app may automatically open and keep a visible
+    browser for the rest of the run; hard chapters may also open a visible rescue
+    browser."* (the only permitted copy change).
+  - **§3.15 — the GUI no longer pre-builds a `RequestManager`.** Removed the
+    `from webnovel_scraper.request_manager import RequestManager` import and the
+    `RequestManager(...)` construction in `_on_start`; the pipeline now OWNS/replaces
+    the active primary manager via its factory seam (rescue path) or builds its own
+    from the job (legacy path). `_run_worker(self, job)` lost the `rm` parameter and
+    its `rm.close()` teardown (the pipeline closes its managers). This closes the
+    Phase-3 transitional divergence (the GUI-passed `rm` was ignored on the rescue
+    path).
+  - **Stopped mutating `SiteSpec.use_browser`.** `_on_start` now computes a local
+    `use_browser` and passes it via `ScrapeJob.use_browser`; the catalog row is never
+    mutated. The Start log line reads the local `use_browser`.
+  - **§4.4 window-close lifecycle.** The scrape worker is now **non-daemon**
+    (`daemon=False`) so the pipeline's teardown `finally` (browser + rescue-pool close)
+    always runs. New `_closing` flag + `CLOSE_POLL_MS = 50`. `_on_close` is idempotent
+    and, while running, confirms then calls `_begin_close` (set `cancel_event`, mark
+    closing, lock buttons) → `_poll_close`, which re-schedules itself via `self.after`
+    on the Tk event loop until `self._worker` is no longer alive, then `destroy()` —
+    instead of destroying immediately. `_thread_log`/`_thread_progress` and the worker's
+    final `self.after(0, self._on_run_finished)` are now wrapped so a late callback on a
+    destroyed window is a silent no-op (a non-daemon worker can still emit one line after
+    close begins).
+- `pipeline.py` (`run_scrape`, legacy branch only) — because the GUI stopped
+  pre-building/handing down a manager, the adapter-less legacy path now (a) derives a
+  per-run spec via `runtime_site_spec(spec, job)` so **`job.use_browser` drives the
+  adapter** (the catalog FWN row is `use_browser=True`, so an unchecked-browser FWN run
+  would otherwise wrongly launch a browser), and (b) threads `headless=job.headless` +
+  `http_timeout=job.request_timeout` into the `RequestManager` it builds (preserving the
+  Timeout field the GUI used to supply). **The rescue path, the sweep logic, and the
+  injected-adapter branch are otherwise unchanged** (an injected adapter still receives
+  the catalog spec; default jobs build a manager with the same defaults as before, so
+  existing legacy/WND tests are unaffected).
+- Tests — **NEW** `files/tests/test_phase4_gui.py` (7): delay default == "3.0";
+  source-scan guard (no `RequestManager(`, no `import RequestManager`, no `FETCH_TIMEOUT`,
+  no `spec.use_browser =`, `daemon=False` present); Headless hint mentions the visible
+  override + rescue browser; **Start launches a non-daemon worker that passes the
+  ScrapeJob and NO `request_manager`** (job carries delay 3.0 / timeout / `use_browser` /
+  `rescue_workers==1`); **close polls until the worker exits then destroys** (fake worker
+  + injected `after` + idempotent second close — no real-clock wait); thread callbacks are
+  safe after destroy; **legacy path threads job config + derives `use_browser` from the
+  job** (recording adapter + recording manager prove `use_browser=False` reaches the
+  adapter despite the catalog `True`, and the self-built manager honours
+  `http_timeout`/`headless`/`use_cache`/`http_first`).
+
+**Code-vs-plan divergences (how I adapted):**
+- **Legacy-path pipeline edit was required to drop the `SiteSpec.use_browser` mutation
+  safely.** The plan's §4 frames Phase 4 as GUI-only, but removing the GUI mutation
+  exposed that the legacy path read `spec.use_browser` straight off the catalog row
+  (FWN = `True`). I threaded `runtime_site_spec` + the job's timeout/headless into the
+  legacy real-adapter branch so behaviour is preserved (and now job-driven). This is the
+  minimal change needed to honour the §3.14 "config travels on the job, not a mutated
+  catalog row" invariant; the sweep logic itself is untouched. Documented, not scope creep.
+- **One Tk-instantiating GUI test intermittently SKIPS under the full suite.** The
+  display-needing tests use the same `pytest.importorskip("tkinter")` + `TclError →
+  pytest.skip` guard as the pre-existing `test_phase8_gui.py`. On Windows, repeated
+  `tk.Tk()` creation across the full session occasionally trips Tcl's "can't find a usable
+  init.tcl" init; when that happens the test skips gracefully rather than failing (the
+  standalone file run shows all 7 passing). This matches the established GUI-test pattern
+  (no headful/display test is a hard requirement in `verify`, per §5/Phase 4). No live
+  browser is ever launched in the suite.
+- **Phase-3 transitional divergence #1 (GUI-passed `rm` ignored on the rescue path) is now
+  CLOSED** — the GUI passes no manager at all. Divergences #2 (final-drain thread-coordination
+  polling) and #3 (rescue-pool initial mode latched at run start) are pipeline-internal and
+  untouched by Phase 4.
+
+**SAFE TO COMPACT before Phase 5: YES.** No in-flight state — all changes are on disk,
+`verify` is green at 228 passed / 1 skipped, no test needed the watchdog to terminate
+(full gate 8.54s). Phase 5 is docs + version only (§5): `CHANGELOG.md` `## [0.2.0] —
+Unreleased` (singular rescue lane, not "N workers"), `Briefing.md` architecture +
+"Current Version → 0.2.0 (Unreleased)" + suite count, `handoff.md` Current Focus +
+not-committed Sync Log entry, a minimal `README.md` note (Headless may be overridden to
+visible; hard chapters may open a visible rescue browser), and the light release-metadata
+test. No commit, no push.
+
+## Current Focus (Phase 3)
+**0.2.0 — Phase 3 complete (pipeline conductor: TOC bootstrap fallback,
+fast-primary loop, single-lane rescue as the SOLE FWN-browser retrier, pipeline-owned
+headless-only circuit breaker + headless→visible recreate/latch, 429 host-cooldown
+policy, continuous + final rescue drain folded into all three output modes, RunReport
+invariants + metrics); NOT committed, 0.2.0 stays Unreleased (2026-06-30, HOME-PC).**
+`verify` GREEN at **222 passed** (Phase-2 baseline 203 + 19 new Phase-3 tests). No tests
+deleted. Still strictly single-lane (the conductor builds the one `RescuePool` lazily on
+the first hard chapter). Ran ONCE foreground under a 300s watchdog — completed in 7.15s,
+no test needed the watchdog to terminate. GUI is Phase 4; docs/version are Phase 5.
+
+**What changed, per file:**
+- `adapters/freewebnovel.py` — added an optional `fast_path: bool = False` kwarg to
+  `build_chapter_index` and `fetch_chapter`, threaded to `rm.fetch(..., fast_path=True)`
+  **only when set** (so the legacy call signature — and every existing `FakeRM` test fake
+  that mimics it — is unchanged for the default path). This lets the conductor run the
+  primary/TOC under the Phase-1 bounded fast policy that raises a typed
+  `ChallengeFetchError` quickly.
+- `pipeline.py` — the conductor. New imports (`collections`, `HostRateLimiter`,
+  `runtime_site_spec`, typed `FetchError` subclasses, `rescue_pool as rp`,
+  `HOST_MIN_INTERVAL`). Breaker thresholds (`BREAKER_CONSECUTIVE_CHALLENGES=5`,
+  `BREAKER_WINDOW=20`, `BREAKER_WINDOW_CHALLENGES=9`), `RATE_LIMIT_RETRY_BUDGET=2`, and
+  `class ChapterIndexUnavailable`. `RunReport` gained the §3.16 metrics
+  (`rescue_exhausted` ⊆ `failed`, `rescue_queue_peak`, `rescue_jobs_submitted`,
+  `rescue_jobs_completed`, `rescue_worker_failures`, `circuit_breaker_tripped`,
+  `primary_switched_visible`, `rescue_strategy`) + two summary lines. `_rescue_enabled`
+  = the FWN-browser scope gate (`adapter_key=="freewebnovel" and use_browser`).
+  `_CircuitBreaker` (headless-only, armed only when the run started headless; counts only
+  uncached primary NETWORK fetches; consecutive≥5 OR ≥9-of-20 challenges trips).
+  `_PrimaryEngine` (the pipeline-owned manager+adapter pair; headless fixed at
+  construction; `switch_to_visible` recreates both and closes the old EXACTLY ONCE;
+  `managers_closed` for the test). `_RescueConductor` (per-chapter routing: success /
+  hard→rescue / not-found / extraction / 429; breaker trip → switch+latch+synchronous
+  visible retry; continuous `drain()` + blocking `final_drain()`; immutable
+  `RescueResult` folded into the report + content store on the pipeline thread; lazy pool
+  so an easy run never builds a worker). `_run_with_rescue` (TOC bootstrap via
+  `_bootstrap_toc`, range clamp, `_plan_fetch_list` resume-skips per mode, the fast loop,
+  final drain, `_assemble_output` writing CHUNKED/SINGLE folded in index order while
+  SEPARATE is written promptly by `_make_on_content`; default real factories share one
+  `HostRateLimiter` + `cancel_event`; closes the final manager + pool in `finally`).
+  `run_scrape` rewired: new optional seams (`monotonic_fn`, `host_limiter`,
+  `request_manager_factory`, `primary_adapter_factory`, `rescue_pool_factory`) + the
+  scope-gate branch. **Legacy `_drive` / `_run_separate` / `_run_chunked` / `_run_single`
+  / `_Pacer` are UNCHANGED** — the WND/HTTP/injected-adapter sweep path is byte-for-byte
+  the same (an injected `adapter` always keeps the legacy flow).
+- Tests — **NEW** `files/tests/test_phase3_rescue_conductor.py` (19): scope gate (3 cases)
+  + WND-regression-never-builds-a-pool; easy-run-never-instantiates-rescue; TOC
+  headless-block→visible-retry→success (manager recreated, each closed once) + visible-
+  still-fails→clean abort + visible-primary-block-aborts-without-a-retry; SEPARATE/
+  CHUNKED/SINGLE fold rescued in index order; permanent NotFound recorded + run completes;
+  rescue_exhausted is failed-not-rescued; breaker unit thresholds (consecutive, reset on
+  non-challenge, ≥9-of-20 window without 5-in-a-row, not-armed); breaker trips→switch→
+  synchronous-visible-retry→latch (managers closed once each, ch5 retried visible, 6-8
+  latched visible, 1-4 rescued); breaker NOT armed on a visible-primary run (one manager,
+  all rescued); 429 cooldown observed on the shared limiter + no breaker + resolves on the
+  primary (never escalated to rescue) + persistent-429→transient-for-resume; `_Pacer`
+  block raises the SHARED limiter interval (rescue paces with it); RunReport invariants
+  under a mixed scenario (rescued∩failed=∅; permanent/extraction/exhausted ⊆ failed);
+  Stop cancels loop+pool incl. a job mid-fake-CF-wait, every accepted job terminalizes
+  (`jobs_completed==jobs_submitted`, `outstanding==0`), cancelled≠rescue_exhausted.
+
+**Code-vs-plan divergences (how I adapted):**
+- **`request_manager` passed by the current GUI is IGNORED on the rescue path
+  (transitional).** Until Phase 4 rewires the GUI to pass config via `ScrapeJob` + the
+  factory seam (§3.15), a FWN-browser run from the live GUI passes a pre-built `rm` that
+  the conductor does not use (it owns managers via the default factory built from job
+  config: slug/use_cache/headless/http_first/request_timeout + the shared limiter +
+  cancel_event). The GUI still closes its unused `rm` in its own `finally` — a harmless
+  no-op (the manager is lazily started, so an un-started `close()` does nothing). Phase 4
+  removes the GUI-owned manager. Documented, not weakened.
+- **Final drain uses thread-coordination polling, not a logical fake-clock wait.**
+  `final_drain` does `pool.join(0.1)` in a loop until the worker thread exits, draining
+  between — the SAME rationale as the pool's internal queue polling (the worker makes
+  real progress, so it can never hang a fake-clock test; the cancel test proves the
+  end-to-end join completes without the watchdog). The CRITICAL TIMING requirement is
+  upheld: the only LOGICAL waits anywhere are the limiter's and the rescue worker's
+  `_cancelable_sleep`, both off the single injected `sleep`/`monotonic` seam from
+  Phases 1–2. The conductor introduces NO new real-clock logical wait — the 429 retry
+  re-calls `primary.fetch`, whose `acquire` waits the host cooldown on the shared
+  injected-clock limiter.
+- **Rescue pool's initial mode is latched to `job.headless` at run start.** If the breaker
+  (or the TOC fallback) later switches the PRIMARY to visible, the rescue worker still
+  begins its already-queued jobs from the headless ladder rung — but it only ever
+  escalates (Phase 2), so it reaches headful/chromium regardless. The "rescue never starts
+  weaker than the primary" invariant holds at construction (the primary was headless
+  then); after a breaker trip the conductor retries hard chapters SYNCHRONOUSLY on the
+  visible primary and only submits to rescue on continued failure. Noted, not weakened.
+- **Previously-logged divergences that did NOT bite this phase.** Phase-0 #2 (403/5xx raise
+  points) is moot — Phase-1 body-first classification already routes a 403/CF-503 to
+  `ChallengeFetchError`, so the breaker counts challenges correctly with no further change.
+  Phase-0 #5 (daemon-thread GUI close) and #6 (GUI-owned manager / mutated SiteSpec) are
+  deliberately untouched here — they are the Phase-4 GUI lifecycle change; the conductor
+  already consumes a per-run `runtime_site_spec` copy and never mutates the catalog row.
+
+**SAFE TO COMPACT before Phase 4: YES.** No in-flight state — all changes are on disk,
+`verify` is green at 222, no test needed the watchdog to terminate (full gate 7.15s).
+Phase 4 wires the GUI (§4): delay default → 3.0, accurate Headless hint about the breaker
+override + visible rescue browser, surface rescue/breaker activity in the existing log
+pane only, and the window-close lifecycle (non-daemon worker; on close set cancel_event,
+poll until the worker exits, then destroy) — confirming against the current daemon-thread
+GUI and reporting if it conflicts. It should also rewire `_on_start` to pass config via
+`ScrapeJob` and let the conductor own the manager (retiring the transitional ignored-`rm`
+above) and stop mutating `spec.use_browser`.
+
+## Current Focus (Phase 2)
+**0.2.0 — Phase 2 complete (single-lane RescuePool: one dedicated worker thread,
+ladder-as-data + monotonic escalation + initial-mode-follows-primary, per-chapter
+180s deadline, bounded/dedupe/cancel-aware backpressure, immutable RescueResult,
+one-terminal-result + worker-crash handling); NOT committed, 0.2.0 stays Unreleased
+(2026-06-30, HOME-PC).** `verify` GREEN at **203 passed** (Phase-1 baseline 187 + 16
+new Phase-2 tests). No tests deleted. Still strictly single-lane (`RESCUE_MAX_WORKERS`
+HARD cap 1; the pool's constructor rejects `workers != 1`). The pool is built but NOT
+yet wired into `run_scrape` — the conductor/TOC bootstrap/breaker/sweep-replacement is
+Phase 3; GUI is Phase 4.
+
+**What changed, per file:**
+- `rescue_pool.py` — **NEW.** `RescuePool` owns ONE dedicated `threading.Thread`
+  worker (no `ThreadPoolExecutor`), a `queue.Queue(maxsize=RESCUE_MAX_PENDING)` job
+  backlog + an unbounded results queue. The worker creates its **own**
+  `RequestManager` AND its **own** `FreeWebNovelAdapter` (via injectable
+  `manager_factory`/`adapter_factory` seams; real defaults build the genuine ones,
+  sharing the run's `HostRateLimiter` + `cancel_event`) and uses/closes them all on
+  the one worker thread (browser teardown in `finally`). Ladder-as-data
+  (`RescueStep`/`RESCUE_LADDER`): `headless_camoufox` ×2 (reuse) + ×1 (fresh) →
+  `headful_camoufox` ×2 (first fresh) → `headful_chromium` ×2 (first fresh). Modes
+  only escalate (`_MODE_RANK`); a worker latched higher skips lower steps on later
+  chapters; `_steps_for_current_latch()` enforces the floor. Initial mode follows the
+  primary: headless-primary → start `HEADLESS_CAMOUFOX` (full ladder); visible-primary
+  → start `HEADFUL_CAMOUFOX` (skip both headless steps). The headless→headful boundary
+  recreates the manager (headless is fixed at construction); camoufox→chromium within
+  headful is the manager's own engine-switch. Per-chapter deadline (`started_at` = the
+  DEQUEUE time, queue wait not charged): before each attempt it computes `remaining`,
+  refuses if `< RESCUE_MIN_ATTEMPT_BUDGET`, and passes `min(attempt_timeout, remaining)`
+  as the budget; default fetch applies the budget to nav AND CF wait via
+  `manager._fetch_uncached_strategy` then `adapter._extract_chapter`. Immutable
+  `RescueResult(meta, content, status, strategy, attempts, error)`; statuses
+  `rescued`/`rescue_exhausted`/`cancelled`/`not_found`/`extraction_failed`/`pool_failed`.
+  `submit()` is cancel-aware backpressure (dedupe by index AND URL; blocks when full;
+  never drops/bypasses the cap). One-terminal-result invariant: every accepted job
+  emits exactly one result, including queued-then-cancelled (`cancelled`). Worker-crash
+  / factory-init failure → `_PoolFailure`: terminalize active + drain pending as
+  `pool_failed`, stop accepting, expose `worker_failed`/`pool_error`. EVERY logical
+  wait goes through `_cancelable_sleep` (one injected `sleep`/`monotonic`, sliced +
+  cancel-checked); thread coordination uses short real `queue` timeouts (worker makes
+  real progress, so no fake-clock hang). `finish()` = graceful drain; `cancel()`/
+  `close()` = prompt stop + join. Std-lib only.
+- Tests — **NEW** `files/tests/test_phase2_rescue_pool.py` (16): single-lane constants
+  + pool rejects `workers=2`; ladder shape + first-headful-fresh; backlog of several
+  chapters; clears-on-a-later-step → rescued (strategy `headful_chromium`); never-clears
+  → exhausted after the full 7-attempt ladder; monotonic escalation (latched headful
+  never returns to headless; first headful fresh); initial-mode-follows-visible-primary
+  (no headless step ever run); no double-submit (index AND URL); same-thread ownership
+  (manager-create/adapter-create/fetch/teardown all == worker ident, ≠ main; rescue
+  adapter distinct from the primary's); deadline bounds total processing == 180 + an
+  attempt refused with too little time; every accepted job exactly one result;
+  queued-then-cancelled each emit `cancelled`; worker-init failure → pool-level failure
+  (all jobs `pool_failed`, no silent loss, stops accepting); not-found/extraction
+  terminal-not-retried (one attempt each); cancel interrupts a fake CF wait mid-attempt
+  (~5s of a 100s wait); timing-regression guard (a 600 fake-second wait completes via
+  the injected clock in ~no real time — would hang on a real-clock regression).
+
+**Code-vs-plan divergences (how I adapted):**
+- **Per-attempt budget vs nav+CF.** The plan says pass `min(strategy_timeout, remaining)`
+  into nav AND the CF wait. The default fetch does exactly that, so a single REAL
+  attempt's wall-time can approach 2× the budget — the worker's deadline check stops the
+  *ladder* but the real per-chapter ceiling is ~180s + one attempt's nav/CF overshoot
+  (and an in-flight `page.goto` may run to its nav timeout; cancellation is prompt
+  *between* polls, §3.12). The deterministic suite proves the LOGICAL bound (each attempt
+  consumes ≤ its budget → total ≤ 180). Documented in `_default_fetch`, not weakened.
+- **Single-engine rescue fetch reaches manager internals.** The default fetch drives one
+  concrete engine via `manager._fetch_uncached_strategy(url, strategy)` + parses via
+  `adapter._extract_chapter(html, meta)` (not the adapter's `fetch_chapter`/`rm.fetch`
+  ladder) so the WORKER owns escalation precisely (the plan's "escalate by recreating,
+  never flipping a live field"). Same-package use of those helpers; rescued content is
+  intentionally not cached.
+- **No `queue.join()`/`task_done()` anywhere** (the plan warns about a `queue.join()`
+  left waiting on an unmatched `task_done()`): the worker uses `get(timeout=_GET_POLL)`
+  and breaks on stop/cancel/empty, and accounting is by counters — so there is no
+  join-deadlock surface at all.
+- **`finish()` (graceful) vs `cancel()` (prompt)** are distinct: graceful drains the
+  backlog to completion (the pipeline's final blocking drain); cancel sets `cancel_event`
+  and terminalizes the rest as `cancelled`. `cancel_event` is the shared run event so a
+  graceful `finish()` deliberately does NOT set it (it would stop the primary too).
+
+**SAFE TO COMPACT before Phase 3: YES.** No in-flight state — all changes are on disk,
+`verify` is green at 203, no test needed the watchdog to terminate (Phase-2 file ran in
+3.15s; full gate 5.74s). Phase 3 wires `rescue_pool.RescuePool` into `run_scrape`: TOC
+bootstrap fallback (§3.11) before the loop, fast-path loop enqueues hard chapters +
+continuous/final result drain, rescue as the sole retrier (old sweep off on the FWN
+browser path, kept for WND), the pipeline-owned headless-only breaker (§3.9/§3.10) + the
+`request_manager_factory` recreate seam (§3.15), `_Pacer`→limiter interval, `RunReport`
+metrics (§3.16).
+
+## Current Focus (Phase 1)
+**0.2.0 — Phase 1 complete (typed failures + body-first classification + fast/HTTP-probe
+split + host limiter + ScrapeJob run-config + per-manager timeouts + last_fetch_info);
+NOT committed, 0.2.0 stays Unreleased (2026-06-30, HOME-PC).** `verify` GREEN at **187
+passed** (Phase-0 baseline 166 + 21 new Phase-1 tests). No tests deleted. Still strictly
+single-lane; rescue pool / conductor / breaker / GUI are Phases 2–5.
+
+**What changed, per file:**
+- `models.py` — `ScrapeJob` gained `use_browser`, `headless`, `request_timeout=30.0`,
+  `rescue_workers=1`; `__post_init__` rejects `rescue_workers != 1` (invariant #1). Added
+  `runtime_site_spec(spec, job)` = `dataclasses.replace(spec, use_browser=job.use_browser)`
+  so a per-run SiteSpec copy drives fetching without mutating the shared catalog row
+  (§3.14). `EmptyExtractionError` left exactly where it was (NOT under FetchError).
+- `host_rate_limiter.py` — **NEW.** `HostRateLimiter(interval, *, jitter_ratio, monotonic,
+  sleep, random_fn, default_cooldown)`: per-host key (`normalize_host` = lowercase host +
+  explicit port), FIFO ticket deque (front waiter always wins → no starvation), lock NOT
+  held during the wait, positive-only jitter added after the interval, `raise_interval`
+  (never lowers — for `_Pacer` in Phase 3), `note_rate_limited`/`blocked_until` host
+  cooldown for 429, cancel-aware wait raising `ScrapeCancelled`. Std-lib only.
+- `request_manager.py` — typed `FetchError` subclasses `NotFoundFetchError` (404/410,
+  terminal), `ChallengeFetchError`, `TransientFetchError`, `RateLimitedFetchError(retry_after)`
+  (§3.3); `_get_text` is now an **instance method** doing body-first classification (real
+  payload → success even on 403/503; CF body → Challenge incl. a CF-style 503; 404/410 →
+  NotFound; 429 → RateLimited+Retry-After; 5xx → Transient; bare 403 → Challenge + an
+  "unmatched 403 body" log). `PERMANENT_STATUSES` redefined to `(404, 410)` (alias of new
+  `NOT_FOUND_STATUSES`) — **403 is no longer permanent.** Fast ladders `FAST_BROWSER_LADDER`
+  / `FAST_HTTP_FIRST_LADDER` + `fetch(..., fast_path=True)` (camoufox×2, no stealth rung;
+  HTTP probes are EXTRA, never consume the browser budget — §3.2a). Constructor gains
+  explicit `http_timeout` / `browser_nav_timeout` / `cloudflare_timeout` (retiring the
+  mutated module global) and `host_limiter`; `_acquire_nav` gates every top-level nav
+  (HTTP warm-up + chapter, camoufox warm-up + chapter, stealth chapter); the ladder raises
+  the **last typed error** on exhaustion and records `last_fetch_info` (cache/success/
+  challenge/transient/not_found/rate_limited) for the Phase-3 breaker. 429 notifies the
+  shared limiter cooldown and is terminal (not escalated to browser).
+- `cf_bypass.py` — `fetch_with_stealth` / `fetch_camoufox` no longer short-circuit on 403
+  (only 404/410 raise); a 403 proceeds to the CF wait/poll and the body is classified by
+  the caller (§3.3, browser-403-clears-first). `fetch_with_stealth` returns the current page
+  on a non-clear instead of raising, so the manager classifies body-first.
+- `app.py` — removed the `request_manager.FETCH_TIMEOUT` module-global mutation (and its now
+  unused `rm_module` import); the GUI passes `http_timeout=timeout` to the manager and sets
+  `use_browser`/`headless`/`request_timeout` on the `ScrapeJob`. (Full GUI wiring is Phase 4.)
+- Tests — **NEW** `files/tests/test_phase1_rescue_core.py` (21). Adjusted 4 existing
+  assertions to track the deliberate behavior change: the old internal `_RetryableFetch`
+  signal is now the typed `ChallengeFetchError` (`test_phase9.py` ×2,
+  `test_camoufox_cleared_detection.py` ×1) and `PERMANENT_STATUSES` is now `(404, 410)`
+  (`test_phase2.py`); one prose comment in `test_brotli_extraction_fix.py`. No test deleted.
+
+**Code-vs-plan divergences (how I adapted):**
+- **Host-limiter wait can't be `cancel_event.wait` under a fake clock** (it would block real
+  time while the injected monotonic never advances → hang). Adapted: the wait always times
+  via the injected `sleep` (one timing source, deterministic), sliced into ≤0.25s chunks
+  that re-check `cancel_event` — so it still aborts promptly on Stop (honors the §3.4
+  "not a bare sleep" intent) without coupling to real time. Noted, not weakened.
+- **Limiter ↔ ScrapeCancelled import cycle** avoided by importing `ScrapeCancelled` lazily
+  inside `acquire` only on the cancel path (request_manager imports HostRateLimiter at top).
+- **`_RetryableFetch` / `_PermanentStatus` kept defined but no longer raised** (back-compat
+  for any external import); the typed `FetchError` subclasses now carry the signal. The
+  ladder still retries Challenge/Transient (they're `FetchError`s caught by the generic
+  retry branch) and treats NotFound/RateLimited as terminal.
+- **Limiter is built but not yet injected into the live pipeline** — per the Phase-1 scope
+  ("build the limiter + acquire points; don't rewire run_scrape"). Wiring it (and the
+  fast_path conductor) is Phase 3. `RequestManager(host_limiter=None)` default keeps every
+  existing path byte-for-byte unchanged.
+
+**SAFE TO COMPACT before Phase 2: YES.** No in-flight state — all changes are committed to
+disk, `verify` is green, and everything Phase 2 needs (typed errors, fast ladders + the
+`fast_path` seam, `HostRateLimiter`, `ScrapeJob` config, `last_fetch_info`, `runtime_site_spec`)
+is in source + captured above. Phase 2 builds `rescue_pool.py` (one dedicated thread, queue,
+ladder-as-data + monotonic escalation, per-chapter deadline, RescueResult) on these.
+
+## Current Focus (Phase 0)
+**0.2.0 concurrent-hard-chapter-rescue — Phase 0 (baseline) complete; NOT committed,
+0.2.0 stays Unreleased (2026-06-30, HOME-PC).** Implementing the
+`md-instructions/0.2.0_concurrent-hard-chapter-rescue.md` drop in phases (0→5),
+verifying after each, then stopping for the user's manual live test. Strictly
+SINGLE-LANE rescue (`RESCUE_MAX_WORKERS = 1`); multi-worker is deferred to 0.2.1.
+No commit/push at any point.
+
+**Phase 0 — baseline established.**
+- **Read-only audit divergence (git):** `git` is **not installed** on this machine and
+  this working copy is **not a git repository** (no `.git`). The plan's Phase 0 git
+  commands (`git status/branch/log`) could not run. The non-negotiable invariant
+  ("preserve ALL existing local changes; no reset/clean/checkout/pull/stash") is
+  **trivially satisfied** — there is no git state to mutate. Reported, not weakened.
+- **Detector is payload-gated (confirmed):** `cloudflare_detection.is_cloudflare_challenge`
+  checks `has_real_payload(html)` FIRST (~line 193) and returns `False` when a real body is
+  present, before any strong/ambient marker — the strong-marker path does NOT short-circuit
+  ahead of payload.
+- **ch-102 fixture present:** `files/test-files/fwn_chapter_102_cleared.html` (sanitized
+  real capture — populated `#article` body + "just a moment" in prose + ambient
+  `/cdn-cgi/challenge-platform/` beacon).
+- **Three ch-102 regression tests present** in `files/tests/test_camoufox_cleared_detection.py`:
+  `test_cleared_fwn_102_with_just_a_moment_in_prose_is_not_a_challenge`,
+  `test_cleared_fwn_102_adapter_extracts_non_empty_body`,
+  `test_cleared_fwn_102_fetch_succeeds_on_first_camoufox_attempt`.
+- **Baseline: `verify` GREEN — 166 passed.** Exactly the expected known baseline (the clean
+  case); the payload-gate fix is already in place. No tests deleted/added in Phase 0.
+
+**Key code-vs-plan divergences logged for later phases** (code is authoritative for
+mechanics; will adapt + note in the final report):
+1. `request_manager.FETCH_TIMEOUT` is a **module global** read in the static `_get_text`;
+   the GUI mutates it (`app.py` `_on_start`). Plan §3.15 wants explicit per-manager timeouts.
+2. **403/404 are raised before the body can be inspected** — HTTP `_get_text` raises
+   `_PermanentStatus` on 403/404; browser `cf_bypass.fetch_with_stealth`/`fetch_camoufox`
+   raise `RuntimeError("HTTP {status}")` on 403/404 BEFORE the CF wait/poll. Plan §3.3 wants
+   body-first classification (403→Challenge after CF wait, 404/410→NotFound) + browser-403
+   clears-first.
+3. CF detection currently surfaces as the internal `_RetryableFetch`; terminal failure is a
+   plain `FetchError`. No typed subclasses, no `HostRateLimiter`, no `last_fetch_info` yet.
+4. FWN browser ladder is camoufox→headful stealth-Chromium with one-engine-per-thread
+   teardown + a `_camoufox_exhausted` run latch (`headless` fixed at construction; switching
+   engines tears the other down) — matches the plan's §3.6 premise.
+5. GUI scrape worker is a **daemon** thread; `_on_close` confirms then `destroy()`s
+   immediately. Plan §4.4 prefers a non-daemon worker + poll-until-exit on close.
+6. GUI **mutates `spec.use_browser`** and constructs/owns the `RequestManager`. Plan
+   §3.14/§3.15 want a per-run `SiteSpec` copy + pipeline-owned manager via a factory seam.
+
+## Current Focus (prior)
 **0.1.3 FWN ladder refinement — added the bounded headful stealth-Chromium fallback
 after camoufox (2026-06-29) — complete on `feature/v0.1.3-headful-camoufox`; `verify`
 green at 157 tests.** The prior 0.1.3 pass made headful camoufox the SOLE FWN browser
@@ -546,6 +1134,78 @@ Notes:
 ---
 
 ## Session Sync Log (newest first)
+
+### 2026-06-30 - HOME-PC - 0.2.0 fully implemented (Phases 0–5); NOT COMMITTED; Unreleased
+0.2.0 fast-primary + single-lane hard-chapter rescue is implemented across all five
+phases and `verify` is green at **233 passed**. **NOT committed, NOT pushed, NOT tagged;
+0.2.0 stays Unreleased/undated** until the user's manual live pass (§7) signs off. No git
+run this session (`git` is not installed on this machine and this working copy is not a
+git repo — the "preserve local changes / no reset" invariant is trivially satisfied).
+
+- **Phase 5 (this entry) — docs + version only.** Changed `md-instructions/CHANGELOG.md`
+  (new `## [0.2.0] — Unreleased`), `md-instructions/Briefing.md` (architecture + Current
+  Version + What Has Been Built + Known Issues + Next Steps), `README.md` (one Headless
+  override note), `md-instructions/handoff.md` (Current Focus + this entry); added
+  `files/tests/test_release_metadata.py` (4 tests). `verify.py` unchanged (its `## [X.Y.Z]`
+  docs pattern already accepts the undated Unreleased heading).
+- **Suite:** 233 passed (Phases 0–4 baseline 229 collected + 4 release-metadata).
+
+**Consolidated code-vs-plan divergences across all 5 phases (and how each was handled):**
+1. **Git unavailable (Phase 0).** No `git`, no `.git`. The plan's Phase-0 git audit
+   couldn't run; the no-mutate-local-changes invariant is trivially met. Reported.
+2. **Host-limiter wait can't use a real-clock `cancel_event.wait` under a fake clock
+   (Phase 1).** It waits via the single injected `sleep`, sliced ≤0.25s with cancel
+   re-checks — deterministic, still promptly cancelable. Adapted, not weakened.
+3. **403 reclassified (Phase 1).** Body-first classification routes 403/CF-503 to
+   `ChallengeFetchError`; `PERMANENT_STATUSES` is now `(404, 410)`. Old `_RetryableFetch`/
+   `_PermanentStatus` kept defined (back-compat) but no longer raised. Deliberate.
+4. **Limiter built but not wired into the live pipeline until Phase 3 (Phase 1 scope).**
+   `host_limiter=None` default kept every existing path byte-for-byte unchanged.
+5. **Rescue per-attempt budget vs nav+CF (Phase 2).** A single REAL attempt can approach
+   2× the budget (nav AND CF wait); the deadline check bounds the LADDER, but the real
+   per-chapter ceiling is ~180s + one attempt's overshoot, and an in-flight `page.goto`
+   may run to its nav timeout. The deterministic suite proves the LOGICAL ≤180 bound.
+   Documented in `_default_fetch`, not weakened.
+6. **Single-engine rescue fetch reaches manager internals (Phase 2).** The default rescue
+   fetch drives one concrete engine via `manager._fetch_uncached_strategy` + parses via
+   `adapter._extract_chapter` so the worker owns escalation precisely; rescued content is
+   intentionally not cached. Same-package use, by design.
+7. **GUI-passed `rm` ignored on the rescue path (Phase 3, transitional) — now CLOSED in
+   Phase 4.** The GUI no longer builds/passes a manager at all; the pipeline owns/replaces
+   it via the factory seam. Divergence retired, not weakened.
+8. **Rescue pool initial mode latched at run start (Phase 3).** If the breaker later
+   switches the PRIMARY to visible, an already-queued rescue job still begins from the
+   headless rung but only ever escalates, so it reaches headful/chromium regardless; after
+   a trip the conductor first retries hard chapters SYNCHRONOUSLY on the visible primary.
+   The "rescue never starts weaker than the primary" invariant holds at construction. Noted.
+9. **Final drain uses thread-coordination polling, not a logical fake-clock wait (Phase 3).**
+   `pool.join(0.1)` loop while draining; the worker makes real progress so it can't hang a
+   fake-clock test (the cancel test proves it). The only LOGICAL waits anywhere are the
+   limiter's and the rescue worker's `_cancelable_sleep`, both off the single injected
+   `sleep`/`monotonic`. No new real-clock logical wait introduced.
+10. **Legacy-path pipeline edit required to drop the `SiteSpec.use_browser` mutation
+    safely (Phase 4).** Removing the GUI mutation exposed that the adapter-less legacy path
+    read `use_browser` off the catalog row (FWN = True). Threaded `runtime_site_spec` + the
+    job's timeout/headless into the legacy branch so behaviour is job-driven and preserved;
+    the sweep logic and the injected-adapter branch are untouched. Minimal, documented — not
+    scope creep. NO invariant was impractical; none was weakened; nothing forced a STOP.
+
+**Open question for the live pass (NOT guessed here):** whether a HEADLESS primary clears
+FreeWebNovel's current Cloudflare at all — and therefore how often the breaker must fall
+back to a visible browser, or hard chapters to the visible rescue lane — is unproven
+offline. Pass A (headful) is the detector baseline (ch-102 should clear on the first
+visible camoufox attempt, NOT rescued); Pass B (headless) exercises the breaker + rescue
+architecture. Both passes run cache-OFF + fresh folder.
+
+**WatchGuard EPDR note (IT security behaviour, NOT a code bug):** on this machine the
+endpoint protection may block the first run of a freshly-written executable/script and
+then allow it on retry — first-run-block-then-allow is expected IT behaviour, not a defect
+in the scraper.
+
+**Cancellation caveat (restated):** Stop / window-close is prompt *between* polls and
+attempts, not necessarily mid-navigation; an in-flight `page.goto` may run to its own
+navigation timeout before the worker thread exits (the non-daemon worker + poll-until-exit
+close waits for that exit before destroying the window).
 
 ### 2026-06-29 - HOME-PC - 0.1.3 ladder refinement (stealth-Chromium fallback)
 Bounded headful stealth-Chromium fallback after camoufox on the FWN path, on

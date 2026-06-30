@@ -232,9 +232,12 @@ def test_launch_failure_still_backs_off_real_transient_blocks(
     with pytest.raises(rm.FetchError):
         mgr.fetch("https://example.com/ch")
 
-    # Only the two transient HTTP-rung failures produced a backoff (5s, 15s); the
-    # browser-rung launch failures added no sleeps.
-    assert sleeps == [5.0, 15.0]
+    # Only the two transient HTTP-rung failures produced a backoff (5s + 15s = 20s
+    # total); the browser-rung launch failures added no sleeps. The backoff is now
+    # slept in cancel-aware slices (<=0.25s — BUG-2), so assert the TOTAL and the
+    # slice cap rather than a per-attempt list.
+    assert all(s <= rm.BACKOFF_WAIT_SLICE for s in sleeps)
+    assert sum(sleeps) == pytest.approx(20.0)
 
 
 class _LaunchFailAdapter:

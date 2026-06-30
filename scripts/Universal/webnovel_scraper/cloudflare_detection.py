@@ -7,12 +7,23 @@ ambient beacon script (the long-standing false-flag that made camoufox "still
 see a Cloudflare challenge" on a real WebNovel chapter page).
 
 Detection rules:
-  * Strong interstitial markers flag immediately — they only ever appear on the
-    live challenge page.
+  * Real structural payload wins. A page that carries a populated chapter body
+    (or a parseable ``__NEXT_DATA__`` / ``g_data.chapInfo`` blob) is a
+    successfully fetched page, not a challenge — so it clears regardless of which
+    Cloudflare marker strings are also present. This is checked FIRST.
+  * Strong interstitial markers (``cf-browser-verification``, ``cf_chl_opt`` …)
+    flag a page that has no real payload. NOTE: one historical "strong" marker,
+    the phrase ``just a moment`` (Cloudflare's interstitial page title), is an
+    ordinary English phrase that legitimately occurs in chapter prose — e.g.
+    "…ending its life just a moment before…". A live FreeWebNovel chapter-102
+    fetch was discarded for exactly this reason: the cleared page rendered the
+    real chapter, but the prose contained "just a moment" and the old
+    flag-immediately rule short-circuited to "challenge". Gating every marker on
+    the absence of real payload (below) is what fixes that without weakening
+    detection of a genuine interstitial (which never carries a populated body).
   * Ambient markers (``/cdn-cgi/challenge-platform/``, ``cf-mitigated``,
-    ``managed-challenge``) flag ONLY when the page carries no real structural
-    payload. They are injected on every protected response, cleared or not, so on
-    their own they prove nothing.
+    ``managed-challenge``) are injected on every protected response, cleared or
+    not, so on their own they prove nothing — same payload gate applies.
   * There is NO length-based clearance. A large body is never treated as a real
     payload by size alone — "real payload" means *structural* evidence only.
 
@@ -30,8 +41,12 @@ from typing import Optional
 
 from bs4 import BeautifulSoup
 
-# Strong interstitial markers — appear ONLY on the live challenge page, so any
-# single one is conclusive evidence of an active challenge.
+# Strong interstitial markers. These now only flag a page that carries NO real
+# structural payload (see ``is_cloudflare_challenge``), so even the loose
+# ``just a moment`` phrase — which is the genuine interstitial's page title but
+# also ordinary chapter prose ("…just a moment before…") — can no longer misflag a
+# cleared chapter whose real body rendered. On a genuine interstitial (no populated
+# body) the payload gate is open and these still flag immediately.
 STRONG_CF_MARKERS = (
     "just a moment",
     "cf-browser-verification",
@@ -161,16 +176,25 @@ def has_real_payload(html: str) -> bool:
 def is_cloudflare_challenge(html: str) -> bool:
     """True only when the HTML is an *active* Cloudflare challenge/interstitial.
 
-    Strong interstitial markers flag immediately. Ambient beacon markers flag
-    only when the page carries no real structural payload, so a successfully
-    fetched chapter page (which still carries the beacon) is never misread as a
-    challenge.
+    Real structural payload is checked FIRST: a page that carries a populated
+    chapter-body container (or a parseable ``__NEXT_DATA__`` / ``g_data.chapInfo``
+    blob) is a successfully fetched page, so it is never a challenge — regardless
+    of which Cloudflare marker strings (strong OR ambient) are also present. This
+    is what lets a cleared FreeWebNovel chapter through even though (a) it still
+    carries the ambient ``/cdn-cgi/challenge-platform/`` beacon and (b) its real
+    prose may contain the phrase "just a moment". Only when there is NO real
+    payload do the strong/ambient markers flag — exactly the genuine-interstitial
+    case (a CF challenge page has no populated chapter body), so this cannot misread
+    a real challenge as cleared.
     """
     if not html:
+        return False
+    # Payload gate: real content present → cleared, no matter what markers say.
+    if has_real_payload(html):
         return False
     h = html.lower()
     if any(m in h for m in STRONG_CF_MARKERS):
         return True
     if any(m in h for m in AMBIENT_CF_MARKERS):
-        return not has_real_payload(html)
+        return True
     return False

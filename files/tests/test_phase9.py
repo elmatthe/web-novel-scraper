@@ -311,7 +311,9 @@ def test_challenge_html_makes_strategy_retryable(tmp_path, monkeypatch) -> None:
     mgr = RequestManager("s", use_cache=False, cache_root=tmp_path)
     challenge = _fixture("wnd_cloudflare_challenge.html")
     monkeypatch.setattr(mgr, "_get_text", lambda session, url: challenge)
-    with pytest.raises(rm._RetryableFetch):
+    # 0.2.0 §3.3: a challenge body surfaces as the typed ChallengeFetchError (still a
+    # FetchError, still retried by the ladder) rather than the old internal marker.
+    with pytest.raises(rm.ChallengeFetchError):
         mgr._fetch_uncached_strategy("https://example/ch", rm.FETCH_STRATEGY_HTTP)
 
 
@@ -346,7 +348,9 @@ def test_single_ambient_beacon_without_payload_is_challenge_or_escalates(
 
     mgr = RequestManager("s", use_cache=False, cache_root=tmp_path)
     monkeypatch.setattr(mgr, "_get_text", lambda session, url: beacon)
-    with pytest.raises(rm._RetryableFetch):
+    # 0.2.0 §3.3: a bare-beacon challenge body surfaces as the typed
+    # ChallengeFetchError (a FetchError) rather than the old internal marker.
+    with pytest.raises(rm.ChallengeFetchError):
         mgr._fetch_uncached_strategy("https://example/ch", rm.FETCH_STRATEGY_HTTP)
     # And nothing was cached for that URL (the challenge body was not returned).
     assert not mgr.cache_path_for("https://example/ch").exists()

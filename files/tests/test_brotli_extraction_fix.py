@@ -101,9 +101,9 @@ def test_garbled_http_response_escalates_and_is_not_cached(tmp_path, monkeypatch
     )
     monkeypatch.setattr(mgr, "_session", _Sess())
 
-    # The single HTTP attempt raises _RetryableFetch internally and, with no
-    # retries left, the ladder gives up with FetchError. Critically, the garbage
-    # was never cached.
+    # The single HTTP attempt raises TransientFetchError internally (an undecodable
+    # body, 0.2.0 §3.3) and, with no retries left, the ladder gives up with a
+    # FetchError. Critically, the garbage was never cached.
     with pytest.raises(rm.FetchError):
         mgr.fetch("https://freewebnovel.com/novel/shadow-slave/chapter-3")
     assert not mgr.cache_path_for(
