@@ -3,7 +3,7 @@
 All notable changes to this project are recorded here. Versions follow semantic
 versioning.
 
-## [0.2.0] — Unreleased
+## [0.2.0] — 2026-06-30
 
 Fast-primary scraping with a **single background hard-chapter rescue lane**. The
 0.1.3 architecture ran one persistent VISIBLE browser for *every* FreeWebNovel
