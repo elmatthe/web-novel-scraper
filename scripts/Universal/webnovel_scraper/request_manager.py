@@ -20,6 +20,7 @@ import random
 import re
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
 from urllib.parse import urlsplit, urlunsplit
@@ -27,7 +28,8 @@ from urllib.parse import urlsplit, urlunsplit
 import requests
 
 from .browser_env import ensure_browsers_path
-from .cloudflare_detection import is_cloudflare_challenge
+from .cloudflare_detection import has_real_payload, is_cloudflare_challenge
+from .host_rate_limiter import HostRateLimiter
 
 logger = logging.getLogger(__name__)
 
@@ -52,11 +54,98 @@ RETRY_SLEEP = 5.0          # backoff base, seconds
 RETRY_BACKOFF_MULTIPLIER = 3.0
 MAX_RETRY_SLEEP = 120.0
 RETRY_JITTER_RATIO = 0.15
-FETCH_TIMEOUT = 30         # per-request timeout, seconds
-PERMANENT_STATUSES = (403, 404)   # never retried — treated as a permanent skip
-RETRY_STATUS_MIN = 500     # >= this is a server error and IS retried
+# The legacy inter-attempt backoff is slept in slices no longer than this so a
+# Stop request (``cancel_event``) aborts the wait within one slice instead of
+# elapsing the full (up to ~138s) backoff — the same cancel-aware discipline as
+# ``HostRateLimiter._wait`` (one injected timing source, no monolithic real-clock
+# sleep). 0.2.0 live-test BUG-2 fix.
+BACKOFF_WAIT_SLICE = 0.25
+
+# Substrings of the Playwright/Camoufox error raised when a page/context/browser
+# has been torn down out from under us (the live BUG-1 — an unfocused headful
+# camoufox window whose page was closed mid-run). Matched by MESSAGE rather than
+# by a specific Playwright error class so the detector does not depend on
+# playwright being importable here and survives Playwright renaming its classes.
+_PAGE_CLOSED_MARKERS = (
+    "has been closed",
+    "target closed",
+    "target page, context or browser has been closed",
+    "browser has been closed",
+    "page has been closed",
+    "context has been closed",
+)
+
+
+def _is_page_closed_error(exc: BaseException) -> bool:
+    """True if ``exc`` looks like a 'target/page/context/browser closed' teardown.
+
+    Detected purely by message substring (never raises, never imports playwright).
+    Used to turn a camoufox page that died mid-navigation into a single
+    recreate-and-retry-within-the-attempt instead of failing the whole rung
+    (0.2.0 live-test BUG-1). A non-closed failure returns False so it escalates
+    normally.
+    """
+    try:
+        msg = str(exc).lower()
+    except Exception:
+        return False
+    return any(marker in msg for marker in _PAGE_CLOSED_MARKERS)
+
+
+def _page_is_alive(page: Any) -> bool:
+    """Whether a cached browser ``page`` can still be reused, without throwing.
+
+    Conservative in the SAFE direction: a page is treated as alive UNLESS it can
+    be positively proven closed. ``page.is_closed()`` returning truthy, or raising
+    (a raising introspection call is itself strong evidence the underlying target
+    is gone), means dead. A page object that does not expose ``is_closed`` at all
+    (e.g. a test fake, or any object we cannot introspect) is treated as ALIVE so
+    the liveness guard NEVER spuriously recreates a healthy page — on a real,
+    healthy camoufox/Playwright page ``is_closed()`` exists and returns ``False``,
+    so the FWN happy path is reused unchanged. 0.2.0 live-test BUG-1.
+    """
+    if page is None:
+        return False
+    is_closed = getattr(page, "is_closed", None)
+    if not callable(is_closed):
+        return True
+    try:
+        return not is_closed()
+    except Exception:
+        return False
+
+
+# Default per-request HTTP timeout, seconds. 0.2.0 (§3.15): this is now only the
+# DEFAULT for the explicit ``RequestManager(http_timeout=…)`` constructor arg — it
+# is no longer mutated at runtime. The pre-0.2.0 race (the GUI assigning to this
+# module global while another thread read it) is gone: each manager carries its
+# own timeouts. Kept as a constant so existing references stay valid.
+FETCH_TIMEOUT = 30
+# 404/410 are the only genuinely PERMANENT statuses (the chapter does not exist).
+# 403 is deliberately NOT here any more: on FreeWebNovel a 403 is a Cloudflare
+# block, classified body-first as a ChallengeFetchError so it can be rescued, not
+# treated as a permanent skip (§3.3). ``PERMANENT_STATUSES`` is kept as an alias of
+# ``NOT_FOUND_STATUSES`` for back-compat callers.
+NOT_FOUND_STATUSES = (404, 410)
+PERMANENT_STATUSES = NOT_FOUND_STATUSES
+RETRY_STATUS_MIN = 500     # >= this is a server error (transient unless a CF body)
+RATE_LIMIT_STATUS = 429
 BROWSER_NAV_TIMEOUT_MS = 60_000
 CF_CLEAR_TIMEOUT = 45.0    # seconds to wait for a Cloudflare challenge to clear
+
+# ── 0.2.0 fast-primary + single-lane rescue constants (plan §3.1) ─────────────
+# Defined here next to the existing ladder constants; the run-config ones are
+# threaded via ScrapeJob (§3.14). 0.2.0 is strictly single-lane: RESCUE_MAX_WORKERS
+# is a HARD cap of 1 (the user-selectable 1–5 toggle is DEFERRED to 0.2.1, §9).
+DEFAULT_DELAY = 3.0                    # inter-fetch, fast path (GUI default → 3.0)
+HOST_MIN_INTERVAL = 3.0                # global per-host floor (§3.4)
+FAST_BROWSER_ATTEMPTS = 2              # persistent-camoufox attempts on the fast path
+FAST_HTTP_PROBE_ATTEMPTS = 2           # ONLY when HTTP-first is on; separate budget
+FAST_PATH_ATTEMPT_TIMEOUT = 15.0       # seconds; short, no large exponential backoff
+RESCUE_WORKERS = 1                     # 0.2.0 is single-lane
+RESCUE_MAX_WORKERS = 1                 # HARD cap in 0.2.0
+RESCUE_MAX_PENDING = 16                # bounded rescue backlog (§3.8)
+RESCUE_MAX_ELAPSED_PER_CHAPTER = 180.0  # monotonic PROCESSING deadline per chapter
 
 FETCH_STRATEGY_HTTP = "http"
 FETCH_STRATEGY_CLOUDSCRAPER = "cloudscraper"
@@ -151,6 +240,26 @@ _STEALTH_STRATEGIES = (
     FETCH_STRATEGY_PLAYWRIGHT_STEALTH_FRESH,
 )
 
+# ── 0.2.0 FAST-PRIMARY ladders (§3.2 / §3.2a) ─────────────────────────────────
+# The fast path is what the conductor (Phase 3) runs as the primary: it makes a
+# *bounded* number of persistent-camoufox attempts and then raises a typed signal
+# (ChallengeFetchError) so the hard chapter is handed to the rescue lane while the
+# primary moves on. Crucially it carries NO stealth-Chromium rung — escalation to
+# stronger engines is the rescue worker's job, so the primary stays fast.
+#
+#   HTTP-first OFF (default):  camoufox(reused) ×FAST_BROWSER_ATTEMPTS
+#   HTTP-first ON:             http ×1, cloudscraper ×1   (FAST_HTTP_PROBE_ATTEMPTS)
+#                              THEN camoufox(reused) ×FAST_BROWSER_ATTEMPTS
+#
+# The optional HTTP probes are EXTRA, never a substitute for the browser budget —
+# so HTTP-first can't burn both attempts on HTTP and never reach the browser, the
+# disaster §3.2a warns about on FWN.
+FAST_BROWSER_LADDER = (FETCH_STRATEGY_CAMOUFOX,) * FAST_BROWSER_ATTEMPTS
+FAST_HTTP_FIRST_LADDER = (
+    (FETCH_STRATEGY_HTTP, FETCH_STRATEGY_CLOUDSCRAPER)[:FAST_HTTP_PROBE_ATTEMPTS]
+    + FAST_BROWSER_LADDER
+)
+
 # Repo-root-relative cache root: files/cache/ (request_manager is at
 # scripts/Universal/webnovel_scraper/, so parents[3] is the repo root).
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -202,15 +311,66 @@ class FetchError(RuntimeError):
     """A fetch failed permanently (all retries exhausted, or a permanent status).
 
     The pipeline records this as a failed chapter and skips it; it is never fatal.
+    The 0.2.0 typed subclasses below let the conductor route a failure correctly
+    (rescue vs terminal) while every existing ``except FetchError`` caller keeps
+    working unchanged (§3.3).
     """
 
 
+class NotFoundFetchError(FetchError):
+    """404/410 — the chapter does not exist. Terminal: NEVER rescued."""
+
+    def __init__(self, message: str, *, status: Optional[int] = None) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+class ChallengeFetchError(FetchError):
+    """A Cloudflare interstitial / block. Eligible for the rescue lane."""
+
+    def __init__(self, message: str, *, status: Optional[int] = None) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+class TransientFetchError(FetchError):
+    """A timeout / 5xx / reset (no CF body). Rescued with backoff; NOT a block."""
+
+    def __init__(self, message: str, *, status: Optional[int] = None) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+class RateLimitedFetchError(FetchError):
+    """A 429. Transient + raises global host pacing; honors a valid Retry-After.
+
+    Distinct from a Cloudflare block: it does NOT count toward the breaker and is
+    NOT submitted to browser rescue (§3.9) — the shared limiter parks the host.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status: Optional[int] = None,
+        retry_after: Optional[float] = None,
+    ) -> None:
+        super().__init__(message)
+        self.status = status
+        self.retry_after = retry_after
+
+
 class _PermanentStatus(Exception):
-    """Internal: a 403/404 that must not be retried."""
+    """Deprecated internal marker (pre-0.2.0). Retained for any external import;
+    the body-first classifier now raises the typed :class:`FetchError` subclasses
+    above instead of this."""
 
 
 class _RetryableFetch(Exception):
-    """Internal: a transient failure eligible for the retry ladder."""
+    """Deprecated internal marker (pre-0.2.0). Retained for any external import;
+    a retryable challenge/transient is now a typed :class:`ChallengeFetchError` /
+    :class:`TransientFetchError`, which the ladder still retries (they are
+    ``FetchError`` subclasses caught by the generic retry branch)."""
 
 
 class ScrapeCancelled(Exception):
@@ -219,6 +379,23 @@ class ScrapeCancelled(Exception):
     The GUI Stop button sets the manager's ``cancel_event``; the pipeline lets
     this propagate to end the run cleanly between (or at the start of) fetches.
     """
+
+
+@dataclass
+class FetchInfo:
+    """Cache-vs-network metadata for the most recent ``fetch`` (§3.8/§3.9).
+
+    The pipeline-owned circuit breaker (Phase 3) consumes this to count ONLY
+    uncached primary *network* challenges — cache hits and resume-skips are not in
+    the breaker's denominator. ``classification`` is one of: ``"cache"``,
+    ``"success"``, ``"challenge"``, ``"transient"``, ``"not_found"``,
+    ``"rate_limited"``.
+    """
+
+    from_cache: bool
+    classification: str
+    status: Optional[int] = None
+    strategy: Optional[str] = None
 
 
 # The Cloudflare challenge detector now lives in ``cloudflare_detection`` and is
@@ -289,13 +466,23 @@ def _strategy_for_attempt(ladder: Sequence[str], attempt: int) -> str:
     return ladder[min(max(1, attempt) - 1, len(ladder) - 1)]
 
 
-def _looks_like_permanent_status(exc: Exception) -> bool:
-    """Best-effort classifier for browser/navigation status errors."""
+def _looks_like_not_found(exc: Exception) -> bool:
+    """True when a browser/navigation error message reports a 404/410.
+
+    The browser engines (cf_bypass) surface a missing chapter as
+    ``RuntimeError("HTTP 404 …")``; this maps that to a terminal NotFound. NOTE:
+    403 is deliberately excluded — a browser-layer 403 is handled body-first (poll
+    for clearance, then classify as a challenge), never as a permanent skip (§3.3).
+    """
     msg = str(exc)
-    for status in PERMANENT_STATUSES:
+    for status in NOT_FOUND_STATUSES:
         if re.search(rf"\bHTTP\s+{status}\b", msg, re.IGNORECASE):
             return True
     return False
+
+
+# Back-compat alias (the helper was renamed when 403 stopped being "permanent").
+_looks_like_permanent_status = _looks_like_not_found
 
 
 # Markers in an exception message that mean a browser ENGINE is not installed /
@@ -346,6 +533,44 @@ def _origin_of(url: str) -> Optional[str]:
     return urlunsplit((parts.scheme, parts.netloc, "/", "", ""))
 
 
+def _parse_retry_after(response: Any) -> Optional[float]:
+    """Best-effort ``Retry-After`` (delta-seconds) from a response, else None.
+
+    Only the integer delta-seconds form is honored (the common case for a 429);
+    an HTTP-date form or anything unparseable returns None, so the limiter falls
+    back to its default cooldown rather than trusting a value it can't read.
+    """
+    headers = getattr(response, "headers", None)
+    if not headers:
+        return None
+    try:
+        raw = headers.get("Retry-After")
+    except Exception:
+        return None
+    if raw is None:
+        return None
+    try:
+        seconds = float(str(raw).strip())
+    except (TypeError, ValueError):
+        return None
+    return seconds if seconds > 0 else None
+
+
+def _classification_for(exc: Optional[BaseException]) -> str:
+    """Map a terminal/last fetch exception to a ``FetchInfo.classification`` tag.
+
+    Only ``"challenge"`` feeds the pipeline breaker (§3.9); a generic/unknown last
+    failure is treated as ``"transient"`` so it never trips the headless breaker.
+    """
+    if isinstance(exc, ChallengeFetchError):
+        return "challenge"
+    if isinstance(exc, RateLimitedFetchError):
+        return "rate_limited"
+    if isinstance(exc, NotFoundFetchError):
+        return "not_found"
+    return "transient"
+
+
 class RequestManager:
     """Fetches HTML over HTTP or a stealth browser, with a shared on-disk cache.
 
@@ -378,6 +603,10 @@ class RequestManager:
         retry_jitter_ratio: float = RETRY_JITTER_RATIO,
         sleep_fn: Callable[[float], None] = time.sleep,
         random_fn: Callable[[], float] = random.random,
+        http_timeout: float = FETCH_TIMEOUT,
+        browser_nav_timeout: float = BROWSER_NAV_TIMEOUT_MS / 1000.0,
+        cloudflare_timeout: float = CF_CLEAR_TIMEOUT,
+        host_limiter: Optional[HostRateLimiter] = None,
     ) -> None:
         self.slug = slug
         self.use_cache = use_cache
@@ -390,6 +619,23 @@ class RequestManager:
         self.retry_jitter_ratio = float(retry_jitter_ratio)
         self._sleep = sleep_fn
         self._random = random_fn
+
+        # Explicit per-manager timeouts (§3.15) — the source of truth, replacing the
+        # mutated module-level FETCH_TIMEOUT global. ``http_timeout`` is the GUI's
+        # "Timeout" field (ordinary HTTP/nav timeout); the 180s rescue deadline is a
+        # SEPARATE internal ceiling threaded per-attempt by the rescue worker.
+        self._http_timeout = float(http_timeout)
+        self._browser_nav_timeout_ms = int(float(browser_nav_timeout) * 1000)
+        self._cloudflare_timeout = float(cloudflare_timeout)
+
+        # Shared, fair, per-host navigation limiter (§3.4). Constructed once per run
+        # and injected into BOTH the primary pipeline manager and the rescue
+        # worker's manager (never per-worker). ``None`` => no pacing (legacy / tests).
+        self.host_limiter = host_limiter
+
+        # Cache-vs-network metadata for the most recent fetch (§3.8). The breaker
+        # reads this to count only uncached primary network challenges.
+        self.last_fetch_info: Optional[FetchInfo] = None
 
         # The GUI Stop button sets this; ``fetch`` checks it and raises
         # ScrapeCancelled so the pipeline can end a run cleanly.
@@ -438,6 +684,7 @@ class RequestManager:
         use_cache: Optional[bool] = None,
         max_retries: Optional[int] = None,
         retry_base_delay: Optional[float] = None,
+        fast_path: bool = False,
     ) -> str:
         """Unified fetch facade used by adapters and the pipeline.
 
@@ -460,7 +707,16 @@ class RequestManager:
         effective_cache = self.use_cache if use_cache is None else use_cache
         caller_retries = self.max_retries if max_retries is None else max(0, int(max_retries))
         base_delay = self.retry_base_delay if retry_base_delay is None else float(retry_base_delay)
-        if use_browser:
+        if use_browser and fast_path:
+            # 0.2.0 fast-primary (§3.2/§3.2a): a BOUNDED camoufox budget then a typed
+            # signal so the conductor hands the hard chapter to rescue. No stealth
+            # rung (that is rescue's job) and no large backoff — the host limiter
+            # paces navigations, so a second sleep here would only double-count.
+            ladder = FAST_HTTP_FIRST_LADDER if self.try_http_first else FAST_BROWSER_LADDER
+            max_attempt_retries = len(ladder) - 1
+            base_delay = 0.0
+            browser_primary = True
+        elif use_browser:
             # Browser-primary (FWN default): bounded two-engine headful ladder
             # camoufox -> camoufox_fresh -> stealth-Chromium. Cap the retry budget to
             # the ladder length so a blocked chapter walks it exactly once — a couple
@@ -538,15 +794,69 @@ class RequestManager:
             self._scraper.headers.update(BROWSER_HEADERS)
         return self._scraper
 
-    @staticmethod
-    def _get_text(session: Any, url: str) -> str:
-        r = session.get(url, timeout=FETCH_TIMEOUT, allow_redirects=True)
-        if r.status_code in PERMANENT_STATUSES:
-            raise _PermanentStatus(f"HTTP {r.status_code} for {url}")
-        if r.status_code >= RETRY_STATUS_MIN:
-            raise RuntimeError(f"HTTP {r.status_code}")
+    def _acquire_nav(self, url: str) -> None:
+        """Gate one TOP-LEVEL navigation through the shared host limiter (§3.4).
+
+        Called immediately before each ``session.get`` / ``cloudscraper.get`` /
+        origin warm-up ``goto`` / chapter ``goto`` / retry nav — NOT for cache reads
+        or browser sub-resources. A no-op when no limiter is injected (legacy/tests).
+        Honors ``cancel_event`` while it waits.
+        """
+        if self.host_limiter is not None:
+            self.host_limiter.acquire(url, cancel_event=self.cancel_event)
+
+    def _get_text(self, session: Any, url: str) -> str:
+        """One HTTP GET, classified BODY-FIRST (§3.3).
+
+        The pre-0.2.0 version raised on 403/5xx *before* the body could be seen, so a
+        Cloudflare interstitial served with a 403/503 was misclassified. Now the body
+        is read first and the classification order is: real payload → success; CF
+        challenge body → ChallengeFetchError; 404/410 → NotFoundFetchError; 429 →
+        RateLimitedFetchError (Retry-After honored); 5xx/other (no CF) →
+        TransientFetchError; a bare 403 with neither payload nor a CF marker →
+        ChallengeFetchError (conservative) + an "unmatched 403 body" log so the live
+        pass can refine the markers.
+        """
+        r = session.get(url, timeout=self._http_timeout, allow_redirects=True)
+        status = getattr(r, "status_code", None)
+        body = r.text or ""
+
+        # (2) Real chapter payload present → success regardless of status code (a
+        # cleared page can still carry a 403/503 + ambient beacon).
+        if has_real_payload(body):
+            return body
+        # (3) Cloudflare challenge body → challenge (a CF-style 503 lands HERE, not
+        # as a generic 5xx).
+        if is_cloudflare_challenge(body):
+            raise ChallengeFetchError(
+                f"Cloudflare challenge body from {url} (HTTP {status})", status=status
+            )
+        # (4) 404 / 410 → terminal not-found.
+        if status in NOT_FOUND_STATUSES:
+            raise NotFoundFetchError(f"HTTP {status} for {url}", status=status)
+        # (5) 429 → rate limited (transient + global host pacing).
+        if status == RATE_LIMIT_STATUS:
+            raise RateLimitedFetchError(
+                f"HTTP 429 (rate limited) for {url}",
+                status=status,
+                retry_after=_parse_retry_after(r),
+            )
+        # (6) 5xx (no CF body) → transient.
+        if status is not None and status >= RETRY_STATUS_MIN:
+            raise TransientFetchError(f"HTTP {status} for {url}", status=status)
+        # (7) Bare 403 with neither payload nor a known CF marker → conservatively a
+        # challenge, logged so the live pass can refine the markers.
+        if status == 403:
+            self._log(
+                f"  unmatched 403 body for {url} (no real payload, no CF marker) — "
+                "treating as a challenge conservatively; capture this body to refine "
+                "the Cloudflare markers."
+            )
+            raise ChallengeFetchError(f"HTTP 403 (unmatched body) for {url}", status=status)
+        # Any other 4xx → let requests raise its standard HTTPError (transient-ish);
+        # a 2xx falls through and returns the body.
         r.raise_for_status()
-        return r.text
+        return body
 
     @staticmethod
     def _warmed_hosts_for(session: Any) -> set:
@@ -612,6 +922,7 @@ class RequestManager:
             # (the real GET below still runs and reports the true outcome).
             self._apply_request_headers(session, referer=None, sec_fetch_site="none")
             try:
+                self._acquire_nav(origin)  # warm-up GET is a top-level nav (§3.4)
                 self._get_text(session, origin)
                 self._log(
                     f"  warmed session on {host} (homepage GET to acquire cf cookies)"
@@ -626,6 +937,7 @@ class RequestManager:
             )
         else:
             self._apply_request_headers(session, referer=None, sec_fetch_site="none")
+        self._acquire_nav(url)  # the real chapter GET is a top-level nav (§3.4)
         return self._get_text(session, url)
 
     def _fetch_uncached_strategy(self, url: str, strategy: str) -> str:
@@ -646,13 +958,29 @@ class RequestManager:
             raise ValueError(f"Unknown fetch strategy: {strategy}")
 
         if _looks_garbled(html):
-            raise _RetryableFetch(
+            raise TransientFetchError(
                 f"undecodable response from {strategy} (an unsupported "
                 "content-encoding); escalating instead of caching garbage"
             )
         if is_cloudflare_challenge(html):
-            raise _RetryableFetch(f"Cloudflare challenge returned by {strategy}")
+            raise ChallengeFetchError(f"Cloudflare challenge returned by {strategy}")
         return html
+
+    def _cancellable_backoff(self, seconds: float) -> None:
+        """Sleep ``seconds`` via the injected ``self._sleep``, but in slices no
+        longer than ``BACKOFF_WAIT_SLICE`` that re-check ``cancel_event`` each
+        slice — so a Stop aborts the legacy inter-attempt backoff within one slice
+        instead of elapsing the full (up to ~138s) wait. One injected timing source
+        (a fake clock drives it deterministically; no monolithic real-clock sleep),
+        mirroring ``HostRateLimiter._wait``. Returns early on cancel; the ladder's
+        loop-top check then raises :class:`ScrapeCancelled`. 0.2.0 BUG-2 fix."""
+        remaining = float(seconds)
+        while remaining > 0.0:
+            if self.cancel_event.is_set():
+                return
+            chunk = remaining if remaining < BACKOFF_WAIT_SLICE else BACKOFF_WAIT_SLICE
+            self._sleep(chunk)
+            remaining -= chunk
 
     def _fetch_with_retry_ladder(
         self,
@@ -668,6 +996,7 @@ class RequestManager:
         if use_cache:
             cached = self._read_cache(cache_path)
             if cached is not None:
+                self.last_fetch_info = FetchInfo(from_cache=True, classification="cache")
                 return cached
 
         max_attempts = max(1, int(max_retries) + 1)
@@ -692,14 +1021,46 @@ class RequestManager:
                 self._log(f"  fetched {len(html) / 1024.0:.1f} KB in {elapsed:.1f} s")
                 if use_cache:
                     self._write_cache(cache_path, html)
+                self.last_fetch_info = FetchInfo(
+                    from_cache=False, classification="success", strategy=strategy
+                )
                 return html
-            except _PermanentStatus as exc:
-                self._log(f"  {exc} - not retrying.")
-                raise FetchError(str(exc)) from exc
+            except ScrapeCancelled:
+                raise
+            except NotFoundFetchError as exc:
+                # 404/410 — terminal, NEVER rescued.
+                self._log(f"  {exc} - not retrying (not found).")
+                self.last_fetch_info = FetchInfo(
+                    from_cache=False, classification="not_found",
+                    status=getattr(exc, "status", None), strategy=strategy,
+                )
+                raise
+            except RateLimitedFetchError as exc:
+                # 429 — park the host for BOTH lanes via the shared limiter, then
+                # surface as terminal. A browser identity from the same IP is the
+                # wrong answer to a site-wide rate limit, so we do NOT walk the rest
+                # of the ladder; the pipeline (Phase 3) retries on the primary within
+                # a bounded rate-limit budget after the cooldown.
+                if self.host_limiter is not None:
+                    self.host_limiter.note_rate_limited(
+                        url, getattr(exc, "retry_after", None)
+                    )
+                self._log(f"  {exc} - host cooldown applied; not escalating to browser.")
+                self.last_fetch_info = FetchInfo(
+                    from_cache=False, classification="rate_limited",
+                    status=getattr(exc, "status", None), strategy=strategy,
+                )
+                raise
             except Exception as exc:
-                if _looks_like_permanent_status(exc):
-                    self._log(f"  {exc} - not retrying.")
-                    raise FetchError(str(exc)) from exc
+                # A browser-layer 404/410 surfaces as RuntimeError("HTTP 404 …") →
+                # terminal not-found. 403 is deliberately NOT here — it is classified
+                # body-first as a challenge (polled for clearance first), never a skip.
+                if _looks_like_not_found(exc):
+                    self._log(f"  {exc} - not retrying (not found).")
+                    self.last_fetch_info = FetchInfo(
+                        from_cache=False, classification="not_found", strategy=strategy
+                    )
+                    raise NotFoundFetchError(str(exc)) from exc
                 last_exc = exc
                 self._log(
                     f"  attempt {attempt}/{max_attempts} via {strategy} failed: {exc}"
@@ -729,8 +1090,21 @@ class RequestManager:
                 self._log(
                     f"  retrying in {delay:.1f}s with {next_strategy}."
                 )
-                self._sleep(delay)
+                # Cancel-aware sliced wait (BUG-2): a Stop during a long backoff
+                # takes effect within one slice; the loop-top check above then
+                # raises ScrapeCancelled on the next iteration.
+                self._cancellable_backoff(delay)
 
+        # Exhausted. Surface the LAST failure's TYPE so the conductor routes it
+        # correctly (ChallengeFetchError → rescue; TransientFetchError → rescue with
+        # backoff). A non-typed last error falls back to a generic FetchError.
+        self.last_fetch_info = FetchInfo(
+            from_cache=False,
+            classification=_classification_for(last_exc),
+            status=getattr(last_exc, "status", None),
+        )
+        if isinstance(last_exc, FetchError):
+            raise last_exc
         raise FetchError(f"Giving up on {url}: {last_exc}")
 
     def fetch_html(self, url: str, use_cache: bool = True) -> str:
@@ -811,22 +1185,40 @@ class RequestManager:
         from .cf_bypass import fetch_with_stealth
 
         page = self._ensure_browser_page()
+        self._acquire_nav(url)  # chapter goto is a top-level nav (§3.4)
         html = fetch_with_stealth(
             page,
             url,
-            nav_timeout=BROWSER_NAV_TIMEOUT_MS,
-            cf_timeout=CF_CLEAR_TIMEOUT,
+            nav_timeout=self._browser_nav_timeout_ms,
+            cf_timeout=self._cloudflare_timeout,
             log_fn=self._log,
         )
         if is_cloudflare_challenge(html):
-            raise _RetryableFetch("Cloudflare challenge still present after browser fetch")
+            raise ChallengeFetchError(
+                "Cloudflare challenge still present after browser fetch"
+            )
         return html
 
     # ── Camoufox path ────────────────────────────────────────────────────────
     def _ensure_camoufox_page(self) -> Any:
-        """Start a Camoufox browser once; reuse its page thereafter."""
-        if self._cf_page is not None:
+        """Start a Camoufox browser once; reuse its page thereafter.
+
+        Before reusing the cached page, verify it is still alive. A headful
+        camoufox page/context can be torn down out from under us mid-run (the
+        live BUG-1 — an unfocused/occluded window whose page was closed), and
+        reusing a dead page fails the whole rung. If the cached page is
+        positively closed, drop the whole browser and build a fresh one within
+        the same attempt. A healthy page (``is_closed()`` → ``False``, the normal
+        FWN case) is reused unchanged, so this guard NEVER triggers on a healthy
+        page — the FWN scope gate / single-lane / ch-102 detector are untouched.
+        """
+        if self._cf_page is not None and _page_is_alive(self._cf_page):
             return self._cf_page
+        if self._cf_page is not None:
+            # Cached page is positively dead — tear the browser down so a fresh
+            # one (with a fresh, re-warmable context) is built below.
+            self._log("  (camoufox page was closed; recreating browser)")
+            self._reset_camoufox()
 
         from .cf_bypass import create_camoufox_browser
 
@@ -868,20 +1260,41 @@ class RequestManager:
         from .cf_bypass import fetch_camoufox
 
         try:
+            self._acquire_nav(origin)  # origin warm-up goto is a top-level nav (§3.4)
             fetch_camoufox(
                 page,
                 origin,
-                nav_timeout=BROWSER_NAV_TIMEOUT_MS,
-                cf_timeout=CF_CLEAR_TIMEOUT,
+                nav_timeout=self._browser_nav_timeout_ms,
+                cf_timeout=self._cloudflare_timeout,
                 log_fn=self._log,
             )
             self._log(
                 f"  warmed camoufox session on {host} "
                 "(origin GET to acquire cf_clearance in the browser context)"
             )
+        except ScrapeCancelled:
+            # A Stop during the warm-up navigation must END the run, never be
+            # swallowed as a best-effort "warm-up skipped" failure by the broad
+            # except below (ScrapeCancelled is an Exception). Re-raise first so it
+            # propagates like the main ladder's existing re-raise (BUG-2 secondary
+            # gap). Matters on the FWN path where the shared limiter can raise it.
+            raise
         except Exception as exc:
+            if _is_page_closed_error(exc):
+                # The page died during warm-up (BUG-1 companion). Do NOT mark the
+                # host warmed and do NOT leave the dead page cached — tearing it
+                # down here and re-raising lets ``_fetch_camoufox_once``'s
+                # recreate-and-retry build a fresh page and re-warm it, instead
+                # of the old behaviour (swallow + mark warmed + hand the caller a
+                # corpse that then fails the chapter goto).
+                self._log(
+                    f"  (camoufox warm-up hit a closed page on {host}; recreating)"
+                )
+                self._reset_camoufox()
+                raise
             self._log(f"  (camoufox warm-up for {host} skipped: {exc})")
-        # Mark warmed even on failure so a flaky origin never re-warms every chapter.
+        # Mark warmed even on a (non-closed) failure so a flaky origin never
+        # re-warms every chapter.
         self._cf_warmed_hosts.add(host)
 
     def _fetch_camoufox_once(self, url: str, *, fresh_context: bool) -> str:
@@ -895,20 +1308,50 @@ class RequestManager:
 
         from .cf_bypass import fetch_camoufox
 
-        page = self._ensure_camoufox_page()
-        # Warm the browser session on this host once before fetching the chapter, so
-        # the chapter request carries the cf_clearance cookie from request #1.
-        self._warm_camoufox_session(page, url)
-        html = fetch_camoufox(
-            page,
-            url,
-            nav_timeout=BROWSER_NAV_TIMEOUT_MS,
-            cf_timeout=CF_CLEAR_TIMEOUT,
-            log_fn=self._log,
+        # The cached camoufox page can die between the liveness check in
+        # ``_ensure_camoufox_page`` and the actual warm-up/goto (BUG-1). Allow at
+        # most ONE recreate-and-retry WITHIN this rung: if warm-up or the chapter
+        # nav raises a 'target closed' teardown on the first try, rebuild the
+        # browser and try once more. A second closed failure (or any non-closed
+        # failure) propagates so the ladder advances normally — no recreate loop.
+        for attempt in range(2):
+            page = self._ensure_camoufox_page()
+            try:
+                # Warm the browser session on this host once before fetching the
+                # chapter, so the chapter request carries the cf_clearance cookie
+                # from request #1.
+                self._warm_camoufox_session(page, url)
+                self._acquire_nav(url)  # chapter goto is a top-level nav (§3.4)
+                html = fetch_camoufox(
+                    page,
+                    url,
+                    nav_timeout=self._browser_nav_timeout_ms,
+                    cf_timeout=self._cloudflare_timeout,
+                    log_fn=self._log,
+                )
+            except ScrapeCancelled:
+                raise
+            except Exception as exc:
+                if attempt == 0 and _is_page_closed_error(exc):
+                    # Page/context was torn down mid-attempt — drop the dead
+                    # browser (idempotent if warm-up already reset it) and retry
+                    # ONCE on a fresh page within the same rung.
+                    self._log(
+                        f"  (camoufox page closed mid-fetch; recreating once: {exc})"
+                    )
+                    self._reset_camoufox()
+                    continue
+                raise
+            if is_cloudflare_challenge(html):
+                raise ChallengeFetchError(
+                    "Cloudflare challenge still present after camoufox fetch"
+                )
+            return html
+        # Unreachable: the loop body always returns or raises (attempt 1 re-raises
+        # any closed error rather than continuing).
+        raise ChallengeFetchError(
+            "Cloudflare challenge still present after camoufox fetch"
         )
-        if is_cloudflare_challenge(html):
-            raise _RetryableFetch("Cloudflare challenge still present after camoufox fetch")
-        return html
 
     def fetch_html_browser(self, url: str, use_cache: bool = True) -> str:
         """Fetch a URL through the Playwright stealth browser. Cached.

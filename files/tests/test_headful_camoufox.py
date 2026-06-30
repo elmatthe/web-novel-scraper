@@ -387,9 +387,11 @@ def test_stealth_launch_failure_is_non_blocking(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(mgr, "_fetch_uncached_strategy", fake_strategy)
     with pytest.raises(rm.FetchError):
         mgr.fetch("https://freewebnovel.com/c/1", use_browser=True)
-    # Camoufox rungs backed off (transient), but the stealth LAUNCH failure added no
-    # sleep — so no 100-second freeze on a missing Chromium.
-    assert sleeps == [5.0, 15.0, 45.0]
+    # Camoufox rungs backed off (5+15+45 = 65s total), but the stealth LAUNCH failure
+    # added no sleep — so no 100-second freeze on a missing Chromium. The backoff is
+    # now slept in cancel-aware slices (<=0.25s — BUG-2); assert the TOTAL + slice cap.
+    assert all(s <= rm.BACKOFF_WAIT_SLICE for s in sleeps)
+    assert sum(sleeps) == pytest.approx(65.0)
 
 
 def test_stealth_launch_failure_run_continues(tmp_path, monkeypatch) -> None:

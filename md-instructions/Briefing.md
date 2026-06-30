@@ -30,8 +30,16 @@ and never ships. The pytest suite is at `files/tests/`, its fixtures at
   maps `site_key -> adapter`. 0.1.0 ships two enabled adapters (`freewebnovel`,
   `webnovel_dynamic`) and three disabled stubs (`empire_novel`, `novel_bin`, `telegraph`).
 - `request_manager.py` â€” HTTP/browser fetching with configurable per-fetch
-  retries, exponential backoff + jitter, and an on-disk HTML cache. **Two fetch
-  shapes (0.1.3):**
+  retries, exponential backoff + jitter, and an on-disk HTML cache. **0.2.0** adds
+  **typed `FetchError` subclasses** (`NotFound` / `Challenge` / `Transient` /
+  `RateLimited`) with **body-first classification** (a real payload is success even
+  under 403/503; 404/410 → NotFound; 429 → RateLimited + limiter cooldown; 5xx →
+  Transient; 403 is no longer permanent), a **fast/HTTP-probe split**
+  (`fetch(..., fast_path=True)` walks a short bounded fast ladder; HTTP probes are
+  extra and never consume the browser budget), **explicit per-manager timeouts**
+  (`http_timeout` / `browser_nav_timeout` / `cloudflare_timeout` — the old mutated
+  module-global `FETCH_TIMEOUT` is retired), and a `last_fetch_info` record for the
+  circuit breaker. **Two fetch shapes (since 0.1.3):**
   - **FreeWebNovel = bounded two-engine HEADFUL browser ladder** (`use_browser=True`).
     Primary: ONE persistent, VISIBLE (headless=False) camoufox browser created once
     per run and reused for every chapter; its session is warmed once per host
@@ -64,11 +72,35 @@ and never ships. The pytest suite is at `files/tests/`, its fixtures at
   interstitial markers flag immediately; ambient beacon markers clear only on
   *structural* payload evidence (`__NEXT_DATA__`, `g_data.chapInfo` with non-empty
   contents, or a real chapter-body container) â€” never by page length.
+- `host_rate_limiter.py` â€” **(0.2.0)** a `HostRateLimiter` shared by the primary and
+  the rescue lane so both obey ONE per-host pace: per-host FIFO ticket ordering (no
+  starvation), positive-only jitter, a global floor `HOST_MIN_INTERVAL = 3.0s`, a
+  `raise_interval` ratchet (never lowers), and a 429 host-cooldown. The `_Pacer` feeds
+  it; the shared effective interval is `max(HOST_MIN_INTERVAL, job.delay, pacer.current)`.
+- `rescue_pool.py` â€” **(0.2.0)** the **single-lane** hard-chapter rescue. `RescuePool`
+  owns ONE dedicated worker thread (`RESCUE_MAX_WORKERS = 1`, a hard cap the constructor
+  enforces; the 1–5 toggle is deferred to 0.2.1) with a bounded job queue
+  (`RESCUE_MAX_PENDING = 16`). The worker builds/owns its own `RequestManager` +
+  `FreeWebNovelAdapter`, walks a fixed monotonically-escalating ladder-as-data
+  (`headless_camoufox` → fresh → `headful_camoufox` → `headful_chromium`) whose initial
+  rung follows the primary, enforces a per-chapter processing deadline
+  (`RESCUE_MAX_ELAPSED_PER_CHAPTER = 180s` from dequeue), and emits exactly ONE terminal
+  `RescueResult` per accepted job (including queued-then-cancelled).
 - `pdf_builder.py` â€” the one ReportLab layout (Letter, Times-Roman body, Helvetica-Bold
   headings, one chapter per page).
-- `pipeline.py` â€” TOC-first, resumable orchestration over the three output modes,
-  with adaptive auto-slowdown (`_Pacer`) and a second-pass sweep over failed
-  chapters (Phase 9).
+- `pipeline.py` â€” TOC-first, resumable orchestration over the three output modes. The
+  legacy HTTP/WebNovel-dynamic path keeps adaptive auto-slowdown (`_Pacer`) and its
+  second-pass sweep. **(0.2.0)** On the FreeWebNovel-browser path a **conductor** runs a
+  fast-primary loop and hands genuinely-hard chapters to the single rescue lane (the SOLE
+  retrier there, built lazily on the first hard chapter), gated by a scope check
+  (`adapter_key == "freewebnovel"` AND `job.use_browser`). It also owns a **headless-only
+  circuit breaker** (armed only on a headless-started run; trips on **≥5 consecutive** OR
+  **≥9-of-20** primary network challenges; recreates the primary as visible and latches),
+  a **TOC/index bootstrap fallback** (headless-block → visible retry → clean abort), and a
+  **429 host cooldown** (`RATE_LIMIT_RETRY_BUDGET = 2`, never escalated to rescue). Config
+  travels on an immutable `ScrapeJob` (`use_browser` / `headless` / `request_timeout` /
+  `rescue_workers == 1`) + a per-run `runtime_site_spec` copy; the pipeline owns/replaces
+  the active manager (no GUI-prebuilt manager, no mutated catalog row).
 - `app.py` â€” the tkinter GUI entry point.
 Networking never lives in parsers; parsing never lives in the GUI; the PDF builder
 knows nothing about sites. `scripts/verify.py` is the mechanical gate (pytest +
@@ -77,41 +109,50 @@ suite in `files/tests/` (a `conftest.py` there puts `scripts/Universal/` on
 `sys.path` so `import webnovel_scraper` resolves).
 
 ## Current Version
-0.1.3 (on branch `feature/v0.1.3-headful-camoufox` â€” pending the user's manual
-live FWN pass). **Headful-camoufox-primary** rewrite of the FreeWebNovel fetch
-path, matched to the legacy scraper. Root cause of the persistent FWN Cloudflare
-failures, confirmed by diffing the now-present legacy file against the current
-code: the rewrite was HTTP-first + headless + a six-engine ladder, and FWN's
-Cloudflare clears for a *visible real browser* but blocks *headless automation*,
-while the relaunch storm made it more aggressive. 0.1.3 makes FWN run through a
-**bounded two-engine HEADFUL ladder**: ONE persistent VISIBLE camoufox browser from
-request #1 (defaults flipped: `headless=False`, FWN catalog rows `use_browser=True`,
-GUI headless OFF / browser ON), reused across chapters with a one-time
-browser-session warm-up, then a bounded fallback to **headful stealth-Chromium** (the
-exact legacy visible engine, historically proven to clear FWN) when camoufox can't
-clear a chapter — persistent + reused via a run latch, never relaunched per chapter.
-Per-chapter cap 4 attempts; the end-of-run sweep is bounded and also gets the
-fallback. HTTP-first is an explicit opt-in toggle (default off); WebNovel-dynamic
-keeps its plain-HTTP fast path.
+**0.2.0 (Unreleased — implemented, pending the user's manual live test).**
+**Fast-primary + single-lane hard-chapter rescue.** 0.1.3 ran one persistent VISIBLE
+browser for *every* FreeWebNovel chapter — correct but slow, since most chapters need
+no bypass. 0.2.0 splits the work: a **fast primary pass** races the easy chapters, and
+only genuinely hard chapters (a real Cloudflare challenge) are handed to **one**
+dedicated background **rescue lane** that escalates a fixed ladder
+(`headless_camoufox` → fresh → `headful_camoufox` → `headful_chromium`) under a 180s
+per-chapter deadline. There is exactly ONE rescue lane (`RESCUE_MAX_WORKERS = 1`, a hard
+cap; the 1–5 toggle is **deferred to 0.2.1**). The primary and rescue share one
+`HostRateLimiter`. A **pipeline-owned, headless-only circuit breaker** (armed only when
+the run started headless; trips on ≥5 consecutive OR ≥9-of-20 primary network challenges)
+recreates the primary as a VISIBLE browser and latches there for the rest of the run, so
+rescue never starts weaker than the primary. Fetch failures are now **typed** with
+**body-first classification**; the old mutated `FETCH_TIMEOUT` global is replaced by
+explicit per-manager timeouts; config travels on an immutable `ScrapeJob` and the pipeline
+(not the GUI) owns/replaces the active manager. The GUI delay default rises to 3.0s, the
+Headless hint is honest about the visible-override + visible rescue browser, rescue/breaker
+activity surfaces in the existing log pane, and the scrape worker is non-daemon with a
+poll-until-exit window-close. Suite: **229 offline tests** (`verify` green: 228 passed,
+1 expected no-Tk-display skip).
 
-**Critical follow-up fix (detection/timing).** A live chapter-102 test proved headful
-camoufox *does* clear FWN's Cloudflare on screen, but the scraper logged "challenge
-still present" every attempt and discarded the chapter. Root cause was NOT bypass — it
-was the shared `cloudflare_detection.has_real_payload` not knowing FreeWebNovel's real
-content container `<div id="article">` (it only knew WebNovel's containers + incidental
-`.m-read`/`class="txt"` wrappers). So a cleared FWN page that still carried Cloudflare's
-ambient `/cdn-cgi/challenge-platform/` beacon scored "no payload" → the beacon tripped
-`is_cloudflare_challenge → True` → the chapter was thrown away. Fix: the detector is now
-content-aware for FWN (`#article` + FWN body selectors added to the structural check,
-with a non-trivial-text guard so an empty shell can't false-clear), and `fetch_camoufox`
-now positively WAITS for the real chapter DOM before capturing (no premature read in the
-post-clearance transitional window). The change only ever recognizes *more* real content,
-never newly flags a page that previously cleared. Suite: **163 offline tests**,
-`verify` green.
+**Honest / open question:** offline tests prove wiring, flow, and lifecycle. Whether a
+**headless** primary can clear FreeWebNovel's *current* live Cloudflare — and therefore how
+often the breaker has to fall back to a visible browser, or hard chapters to the visible
+rescue lane — is unproven and is exactly what the manual live pass (Pass A detector
+baseline, Pass B headless architecture; see Next Steps) answers. Cancellation note: Stop /
+window-close is prompt *between* polls/attempts; an in-flight `page.goto` may still run to
+its own navigation timeout before the worker exits.
 
-**Honest:** offline tests prove the wiring/flow; the next live chapter-102 pass should
-show chapter 102 WRITE on the first camoufox attempt (no escalation, no hang) — only a
-live pass confirms it.
+### Prior: 0.1.3 (headful-camoufox-primary for FreeWebNovel)
+**Headful-camoufox-primary** rewrite of the FreeWebNovel fetch path, matched to the legacy
+scraper. Root cause of the persistent FWN Cloudflare failures, confirmed by diffing the
+now-present legacy file: the rewrite was HTTP-first + headless + a six-engine ladder, and
+FWN's Cloudflare clears for a *visible real browser* but blocks *headless automation*,
+while the relaunch storm made it more aggressive. 0.1.3 ran FWN through a **bounded
+two-engine HEADFUL ladder**: ONE persistent VISIBLE camoufox browser from request #1
+(defaults flipped: `headless=False`, FWN catalog rows `use_browser=True`, GUI headless OFF
+/ browser ON), reused across chapters with a one-time browser-session warm-up, then a
+bounded fallback to **headful stealth-Chromium** (the legacy visible engine) when camoufox
+couldn't clear a chapter. It also shipped the **detection/timing fix**: the shared
+`cloudflare_detection.has_real_payload` is now content-aware for FreeWebNovel (`#article` +
+FWN body selectors, with a non-trivial-text guard) and `fetch_camoufox` positively WAITS
+for the real chapter DOM before capturing — so a page camoufox clears on screen is no longer
+discarded as "challenge still present." Suite at 0.1.3: **163 offline tests**, `verify` green.
 
 ### Legacy diff finding (0.1.3, independently verified)
 This real clone DOES contain `files/legacy-reference/freewebnovel-webscraper.py`
@@ -467,8 +508,47 @@ Suite is **128 offline tests**, `verify` green.
   - `files/tests/test_headful_camoufox.py` (20 cases, both engines mocked);
     `test_phase2.py` + `test_phase8_gui.py` updated. Suite: **157 offline tests**,
     `verify` green.
+- **0.2.0 fast-primary + single-lane hard-chapter rescue (Unreleased) â€” implemented,
+  pending the manual live test.** Built in five phases (each verified before the next):
+  - **Phase 1 â€” typed failures + classification + limiter + run-config.** Typed
+    `FetchError` subclasses + body-first classification (403 no longer permanent; 429 â†’
+    limiter cooldown); fast/HTTP-probe split (`fetch(..., fast_path=True)`); explicit
+    per-manager timeouts (the mutated `FETCH_TIMEOUT` global retired); new
+    `host_rate_limiter.py` (`HostRateLimiter`); `ScrapeJob` run-config
+    (`use_browser`/`headless`/`request_timeout`/`rescue_workers == 1`) + `runtime_site_spec`.
+  - **Phase 2 â€” single-lane `RescuePool` (`rescue_pool.py`).** ONE dedicated worker
+    thread (hard cap `RESCUE_MAX_WORKERS = 1`), bounded queue, ladder-as-data with
+    monotonic escalation + initial-mode-follows-primary, 180s per-chapter deadline,
+    one-terminal-result-per-job (incl. queued-then-cancelled), worker-crash â†’ `pool_failed`.
+  - **Phase 3 â€” pipeline conductor.** Fast-primary loop + the single rescue lane as the
+    sole FWN-browser retirer (lazy, scope-gated to `freewebnovel` + `use_browser`),
+    headless-only circuit breaker (≥5 consecutive OR ≥9-of-20; recreate-visible + latch),
+    TOC bootstrap fallback (headless-block → visible retry → abort), 429 cooldown
+    (`RATE_LIMIT_RETRY_BUDGET = 2`), `RunReport` rescue/breaker metrics. The legacy
+    `_drive`/sweep path (WebNovel-dynamic, injected adapters) is byte-for-byte unchanged.
+  - **Phase 4 â€” GUI wiring.** Delay default 3.0s; the pipeline owns/replaces the manager
+    (no GUI-prebuilt `RequestManager`, no `SiteSpec.use_browser` mutation, `FETCH_TIMEOUT`
+    not written anywhere in `app.py`); honest Headless hint; rescue/breaker lines in the
+    existing log pane (all GUI updates via `self.after`, rescue threads never touch tk);
+    non-daemon worker + poll-until-exit window-close. A small legacy-path edit threads
+    `runtime_site_spec` + job timeout/headless so dropping the spec mutation is safe.
+  - **Phase 5 â€” docs + version.** This CHANGELOG/Briefing/README/handoff pass + a light
+    offline release-metadata test. New test files
+    `test_phase1_rescue_core.py`/`test_phase2_rescue_pool.py`/`test_phase3_rescue_conductor.py`/`test_phase4_gui.py`.
+    Suite: **229 offline tests** (`verify` green: 228 passed, 1 expected no-Tk-display skip).
+    No commit, no tag, no date until the live pass.
 
 ## Known Issues
+- **(0.2.0) Headless-primary clearance of FreeWebNovel â€” the open live question.**
+  0.2.0 lets the primary *start* headless (fast) and arms a circuit breaker that
+  recreates the primary as visible if headless is broadly blocked, with hard chapters
+  going to the visible rescue lane. Whether a **headless** primary actually clears FWN's
+  current Cloudflare at all â€” and therefore how often the breaker trips or chapters fall
+  to rescue â€” is **unproven offline** and is exactly what the manual live pass answers
+  (Pass A baseline headful; Pass B headless architecture). The single rescue lane has full
+  offline lifecycle coverage but has **not** been exercised against a live challenge.
+  Cancellation is prompt *between* polls/attempts, not necessarily mid-navigation (an
+  in-flight `page.goto` may run to its nav timeout before the worker exits).
 - **WebNovel camoufox rescue (was the open Critical):** the most likely root cause
   â€” over-eager challenge detection mis-flagging cleared post-redirect pages â€” is
   **fixed and proven offline** (9D). Honest caveat: whether camoufox actually
@@ -502,23 +582,28 @@ Suite is **128 offline tests**, `verify` green.
   direction.
 
 ## Next Steps
-- **0.1.3 minimal live test (do this first).** On the `feature/v0.1.3-headful-camoufox`
-  branch, Headless unchecked, "Try fast HTTP first" off: scrape ONLY chapter 102
-  first. A visible browser window opens and STAYS open (reused, not relaunching per
-  chapter). Watch the log for **which engine clears 102** — camoufox first, or the
-  headful stealth-Chromium fallback after camoufox is exhausted. If 102 clears,
-  repeat with 175. If the visible browser reaches valid HTML but extraction fails,
-  that is a selector/timing issue, not browser mode. If neither engine clears, FWN
-  has hardened — next lever is a residential proxy or a manual solve in the window.
-- **User's manual live pass** (the older 0.1.0 checklist): run the live
-  scrapes the release log structures but leaves skipped â€” 3 FreeWebNovel chapters
-  across all three output modes (with browser mode for Cloudflare and at least
-  one uncached chapter to validate the retry ladder), 3
-  WebNovel-dynamic chapters, confirm resume skips existing PDFs, Stop cancels
-  cleanly, and output lands in `~/Downloads/{slug}-N` (or a custom browsed folder).
-- After the live pass: decide on the six flagged Minor/Suggestion items, tag
-  0.1.0, force-push the repo as one release, and delete the implementation-plan
-  instruction drop.
+- **0.2.0 manual live pass (do this first â€” §7 of the plan).** **Both passes: HTML
+  cache OFF + a fresh output folder** (the cache is keyed by slug and lives outside the
+  output folder, so a fresh `shadow-slave-N` folder alone does NOT force a fresh fetch â€”
+  a cached chapter would prove nothing).
+  - **Pass A â€” detector baseline (headful).** Shadow Slave / Free Web Novel, **Headless
+    OFF**, **HTTP-first OFF**, **cache OFF**, delay 3.0, chapters 100â€“110, Separate,
+    fresh folder. *Acceptance:* ch-102 succeeds on the **first visible camoufox attempt**,
+    **not** rescued.
+  - **Pass B â€” headless architecture.** Same but **Headless ON**, chapters 100â€“110, cache
+    OFF, fresh folder. Watch whether the headless primary clears chapters, whether the
+    breaker trips and switches to a visible browser, and whether any watch-list chapter
+    enters/exits the single rescue lane. Regression watch list (NOT assumed hard):
+    102, 175, 233, 268, 271, 278, 307, 330, 334, 379, 403, 489, 508, 517, 518, 534, 546,
+    587, 629, 633, 642, 715, 853, 860, 951, 998, 1039, 1251, 1521, 1897, 2018, 2142, 2420,
+    2817, 3019, 3062.
+- **After acceptance:** tag 0.2.0, force-push as one release, and (per the plan) keep the
+  instruction drop until the user says otherwise. 0.2.1 (the user-selectable 1–5 rescue
+  worker toggle) may only start once 0.2.0 is accepted with either a genuine hard chapter
+  having entered+exited the single rescue lane live, or the user explicitly accepting the
+  offline rescue-lifecycle evidence.
+- **Still deferred:** the six Minor/Suggestion items from the Phase 8 hunt (#3â€“#6 open),
+  and the cosmetic "Use browser mode" checkbox rename.
 
 ### Post-0.1.0 cleanup backlog
 Deferred tidy-ups to do AFTER the 0.1.0 live pass and force-push (not before --

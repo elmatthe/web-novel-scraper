@@ -363,7 +363,9 @@ class FreeWebNovelAdapter(BaseAdapter):
         self._log(f"WARNING: {msg}")
 
     # ── contract ─────────────────────────────────────────────────────────────
-    def build_chapter_index(self, spec: SiteSpec) -> list[ChapterMeta]:
+    def build_chapter_index(
+        self, spec: SiteSpec, *, fast_path: bool = False
+    ) -> list[ChapterMeta]:
         """Discover the complete chapter list (TOC-first).
 
         **Approach B — generated URLs (the legacy bug fix).** The legacy
@@ -382,7 +384,15 @@ class FreeWebNovelAdapter(BaseAdapter):
         never silently honoured).
         """
         rm = self._manager(spec)
-        html = rm.fetch(spec.url, use_browser=spec.use_browser)
+        # ``fast_path`` (0.2.0 §3.11): the conductor builds the TOC under the bounded
+        # fast policy so a headless Cloudflare block surfaces a ChallengeFetchError
+        # quickly (for the visible-retry fallback) instead of walking the long ladder.
+        # Only pass the kwarg when set, so the legacy call signature (and every test
+        # fake that mimics it) is unchanged for the default path.
+        if fast_path:
+            html = rm.fetch(spec.url, use_browser=spec.use_browser, fast_path=True)
+        else:
+            html = rm.fetch(spec.url, use_browser=spec.use_browser)
         discovered = self._discover_max_chapter(html, spec)
 
         if spec.chapter_count is not None:
@@ -437,9 +447,19 @@ class FreeWebNovelAdapter(BaseAdapter):
 
         return max(numbers) if numbers else None
 
-    def fetch_chapter(self, meta: ChapterMeta, spec: SiteSpec) -> ChapterContent:
+    def fetch_chapter(
+        self, meta: ChapterMeta, spec: SiteSpec, *, fast_path: bool = False
+    ) -> ChapterContent:
         rm = self._manager(spec)
-        html = rm.fetch(meta.url, use_browser=spec.use_browser)
+        # ``fast_path`` (0.2.0 §3.2): the conductor runs the primary under a bounded
+        # camoufox budget that raises a typed signal so a hard chapter is handed to
+        # the rescue lane while the primary moves on. Default False keeps the legacy
+        # (full-ladder) behaviour for every existing caller and the WND path; only
+        # pass the kwarg when set so existing test fakes keep their signature.
+        if fast_path:
+            html = rm.fetch(meta.url, use_browser=spec.use_browser, fast_path=True)
+        else:
+            html = rm.fetch(meta.url, use_browser=spec.use_browser)
         return self._extract_chapter(html, meta)
 
     def _extract_chapter(self, html: str, meta: ChapterMeta) -> ChapterContent:

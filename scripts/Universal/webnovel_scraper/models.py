@@ -8,7 +8,7 @@ specific site); `ScrapeJob` is one GUI-initiated run.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
 
@@ -132,9 +132,44 @@ class ScrapeJob:
     # Default False — plain HTTP trips FreeWebNovel's Cloudflare, which is exactly
     # why the browser is primary. Threaded into the RequestManager as try_http_first.
     http_first: bool = False
+    # ── 0.2.0 run-config (§3.14) ─────────────────────────────────────────────
+    # The run's behaviour now travels on the (immutable) job rather than being
+    # inferred from a mutated SiteSpec or a module-level global. The pipeline makes
+    # a per-run SiteSpec copy from ``use_browser`` (see ``runtime_site_spec``); the
+    # FWN rescue scope gate is ``adapter_key == "freewebnovel" and use_browser``.
+    use_browser: bool = False          # browser-primary path for this run
+    headless: bool = False             # primary browser headless (False = visible)
+    request_timeout: float = 30.0      # ordinary HTTP/nav timeout, seconds (§3.15);
+    #                                    the 180s rescue deadline is a SEPARATE
+    #                                    internal ceiling, not this field.
+    rescue_workers: int = 1            # 0.2.0 is single-lane — validated == 1 below
+    #                                    (the 1–5 toggle is DEFERRED to 0.2.1, §9).
+
+    def __post_init__(self) -> None:
+        # 0.2.0 invariant #1: strictly single-lane rescue. Reject any other count
+        # here so a stray value can never spin up a second worker (the multi-worker
+        # design is 0.2.1, plan §9).
+        if self.rescue_workers != 1:
+            raise ValueError(
+                "0.2.0 is single-lane: rescue_workers must be 1 "
+                f"(got {self.rescue_workers!r}); 1–5 workers are deferred to 0.2.1."
+            )
 
     def __repr__(self) -> str:
         return (
             f"ScrapeJob({self.novel_slug!r} via {self.adapter_key!r}, "
             f"ch {self.start}-{self.end}, {self.output_mode.value})"
         )
+
+
+def runtime_site_spec(spec: SiteSpec, job: "ScrapeJob") -> SiteSpec:
+    """Return a per-run :class:`SiteSpec` copy whose ``use_browser`` reflects the job.
+
+    The catalog's ``SiteSpec`` rows are shared, long-lived data — mutating one to
+    carry a run's browser choice (the pre-0.2.0 behaviour) leaks that choice into
+    later runs and across threads. Instead the pipeline builds a throwaway copy via
+    ``dataclasses.replace`` and passes *that* to TOC discovery and every chapter
+    fetch, so ``ScrapeJob.use_browser`` actually drives fetching while the catalog
+    row is left untouched (§3.14).
+    """
+    return replace(spec, use_browser=job.use_browser)

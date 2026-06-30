@@ -53,7 +53,10 @@ def test_retry_constants_defined_and_positive() -> None:
     assert rm.MAX_RETRY_SLEEP >= rm.RETRY_SLEEP
     assert rm.FETCH_TIMEOUT > 0
     assert rm.RETRY_STATUS_MIN >= 500
-    assert rm.PERMANENT_STATUSES == (403, 404)
+    # 0.2.0 §3.3: 403 is no longer "permanent" (it is a body-first Cloudflare
+    # challenge, rescuable). The only genuinely permanent statuses are 404/410.
+    assert rm.NOT_FOUND_STATUSES == (404, 410)
+    assert rm.PERMANENT_STATUSES == (404, 410)
 
 
 def test_cloudflare_challenge_detection() -> None:
@@ -155,7 +158,11 @@ def test_fetch_retry_succeeds_on_attempt_2_3_or_4(
     assert mgr.fetch("https://example.com/ch") == "<html>ok</html>"
     assert len(strategies) == success_attempt
     assert strategies == list(rm.DEFAULT_ESCALATION_LADDER[:success_attempt])
-    assert sleeps == [5.0, 15.0, 45.0][: success_attempt - 1]
+    # Backoff is now slept in cancel-aware slices (<=0.25s — BUG-2): assert the TOTAL
+    # of the (success_attempt - 1) backoffs and the slice cap, not a per-attempt list.
+    expected = [5.0, 15.0, 45.0][: success_attempt - 1]
+    assert all(s <= rm.BACKOFF_WAIT_SLICE for s in sleeps)
+    assert sum(sleeps) == pytest.approx(sum(expected))
 
 
 def test_fetch_escalation_ladder_advances_per_attempt(tmp_path, monkeypatch) -> None:
@@ -188,8 +195,10 @@ def test_fetch_escalation_ladder_advances_per_attempt(tmp_path, monkeypatch) -> 
         rm.FETCH_STRATEGY_PLAYWRIGHT_STEALTH,
         rm.FETCH_STRATEGY_PLAYWRIGHT_STEALTH_FRESH,
     ]
-    # Backoff is computed/capped per retry: 5, 15, 45, 120 (capped), 120 (capped).
-    assert sleeps == [5.0, 15.0, 45.0, 120.0, 120.0]
+    # Backoff is computed/capped per retry: 5, 15, 45, 120, 120 (total 305s), now
+    # slept in cancel-aware slices (<=0.25s — BUG-2). Assert the TOTAL + slice cap.
+    assert all(s <= rm.BACKOFF_WAIT_SLICE for s in sleeps)
+    assert sum(sleeps) == pytest.approx(305.0)
 
 
 def test_fetch_use_browser_is_bounded_two_engine_headful(tmp_path, monkeypatch) -> None:
@@ -232,8 +241,11 @@ def test_fetch_use_browser_is_bounded_two_engine_headful(tmp_path, monkeypatch) 
     assert rm.FETCH_STRATEGY_HTTP not in strategies
     assert rm.FETCH_STRATEGY_CLOUDSCRAPER not in strategies
     assert len(strategies) == 4               # the documented per-chapter cap
-    # Three backoffs between the four bounded attempts (5s, 15s, 45s); no storm.
-    assert sleeps == [5.0, 15.0, 45.0]
+    # Three backoffs between the four bounded attempts (5+15+45 = 65s total); no
+    # storm. Backoff now slept in cancel-aware slices (<=0.25s — BUG-2): assert the
+    # TOTAL + slice cap.
+    assert all(s <= rm.BACKOFF_WAIT_SLICE for s in sleeps)
+    assert sum(sleeps) == pytest.approx(65.0)
 
 
 def test_fetch_browser_first_success_does_not_escalate(tmp_path, monkeypatch) -> None:

@@ -78,11 +78,19 @@ That is expected and is how the download clears Cloudflare (just like the older
 tool). Don't close it; it is reused for every chapter and closes itself when the
 run ends.
 
+Keep that window **visible on screen** while it works — a Firefox-based browser may
+have its Cloudflare-challenge timers throttled when its window is minimised or fully
+hidden behind other windows on Windows, which can slow or stall a chapter; if a
+chapter seems stuck, click into the window to bring it forward and it should resume.
+
 You normally won't touch these checkboxes:
 
 - **Use browser mode** — on by default for Free Web Novel; leave it on.
 - **Headless browser** — *advanced*, off by default. Ticking it hides the window,
-  but Cloudflare usually blocks a hidden browser, so leave it **off**.
+  but Cloudflare usually blocks a hidden browser, so leave it **off**. If you do turn
+  it on and Cloudflare broadly blocks the hidden browser, the app automatically opens
+  and keeps a **visible** browser for the rest of the run; individual hard chapters may
+  also open a visible rescue browser to get through.
 - **Try fast HTTP first** — *advanced*, off by default. It tries a couple of quick
   no-browser attempts before the browser. Plain HTTP usually trips Cloudflare on
   Free Web Novel, so leave it **off** unless you're experimenting.

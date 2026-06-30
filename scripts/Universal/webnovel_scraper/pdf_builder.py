@@ -17,7 +17,10 @@ Public API:
 
 from __future__ import annotations
 
+import os
 import re
+import tempfile
+from io import BytesIO
 from pathlib import Path
 
 import pdfplumber
@@ -159,11 +162,40 @@ def create_pdf_from_text(
     doc.build(story)
 
 
+def _atomic_write(path: Path, write_fn) -> None:
+    """Write to a unique temp file in the SAME directory, then ``os.replace()`` it
+    onto ``path`` so a cancel / crash / kill mid-write can never leave a corrupt
+    final file (the publish is atomic on both POSIX and Windows). ``write_fn(file)``
+    does the actual writing into the temp's binary file object. Any failure removes
+    the temp and re-raises, so no ``.part`` artifact is left behind. 0.2.0 BUG-2
+    partial-cleanup fix (applies to FWN and WND output alike)."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(path.parent), prefix=path.name + ".", suffix=".part"
+    )
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as f_out:
+            write_fn(f_out)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
 def remove_single_heading_pages(pdf_path: Path) -> Path:
     """Drop pages that contain only a single chapter heading line.
 
-    Ported verbatim from ``sm_pdf_editor-v8.2.py``; uses ``pdfplumber`` to detect
-    heading-only pages and ``pypdf`` to rewrite the file in place. Returns the
+    Ported from ``sm_pdf_editor-v8.2.py``; uses ``pdfplumber`` to detect
+    heading-only pages and ``pypdf`` to rewrite the file. The rewrite is now
+    ATOMIC (temp-then-``os.replace``, via :func:`_atomic_write`) and reads the
+    source from an in-memory copy so no file handle lingers on the destination —
+    a cancel/crash mid-rewrite can never truncate the existing file. Returns the
     (unchanged) path for chaining.
     """
     pdf_path = Path(pdf_path)
@@ -188,12 +220,14 @@ def remove_single_heading_pages(pdf_path: Path) -> Path:
     if len(pages_to_keep) == total_pages:
         return pdf_path
 
-    reader = PdfReader(str(pdf_path))
+    # Read the source from an in-memory copy so no handle lingers on pdf_path,
+    # then publish atomically (temp-then-os.replace) so the existing file is never
+    # truncated mid-rewrite.
+    reader = PdfReader(BytesIO(pdf_path.read_bytes()))
     writer = PdfWriter()
     for idx in pages_to_keep:
         writer.add_page(reader.pages[idx])
-    with open(pdf_path, "wb") as f_out:
-        writer.write(f_out)
+    _atomic_write(pdf_path, writer.write)
     return pdf_path
 
 
@@ -210,10 +244,32 @@ def chapters_to_text(chapters: list[ChapterContent]) -> str:
 def create_pdf(
     chapters: list[ChapterContent], output_path: Path, title: str
 ) -> Path:
-    """Render chapters into one PDF and strip heading-only pages. Returns the path."""
+    """Render chapters into one PDF and strip heading-only pages. Returns the path.
+
+    The whole build is staged in a temp file in the SAME directory and published
+    onto ``output_path`` with a single atomic ``os.replace`` only after both the
+    ReportLab build and the heading-strip rewrite have fully succeeded — so a
+    cancel / crash / kill at any point leaves NO partial or corrupt final PDF (and
+    no leftover ``.part`` artifact). 0.2.0 BUG-2 partial-cleanup fix; applies to
+    SEPARATE (per-chapter), CHUNKED, and SINGLE output alike."""
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     text = chapters_to_text(chapters)
-    create_pdf_from_text(text, output_path, title=title)
-    remove_single_heading_pages(output_path)
+
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(output_path.parent), prefix=output_path.name + ".", suffix=".part"
+    )
+    os.close(fd)  # ReportLab / pypdf open the path themselves
+    tmp = Path(tmp_name)
+    try:
+        create_pdf_from_text(text, tmp, title=title)
+        remove_single_heading_pages(tmp)  # atomic rewrite of the temp itself
+        os.replace(tmp, output_path)       # atomic publish
+    except BaseException:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
+        raise
     return output_path

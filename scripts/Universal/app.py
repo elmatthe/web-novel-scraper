@@ -30,10 +30,8 @@ from tkinter import filedialog, messagebox, scrolledtext, ttk
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from webnovel_scraper import catalog, pipeline  # noqa: E402
-from webnovel_scraper import request_manager as rm_module  # noqa: E402
 from webnovel_scraper.models import OutputMode, ScrapeJob  # noqa: E402
 from webnovel_scraper.registry import AdapterDisabledError  # noqa: E402
-from webnovel_scraper.request_manager import RequestManager  # noqa: E402
 
 # Adapters that can use the Playwright browser path (Cloudflare). Every other
 # adapter is HTTP-only, so the browser checkboxes are inert when one of those is
@@ -41,10 +39,10 @@ from webnovel_scraper.request_manager import RequestManager  # noqa: E402
 _BROWSER_CAPABLE_ADAPTERS = {"freewebnovel"}
 
 # Inter-fetch delay (seconds) the user sets as the anti-detection / politeness
-# rate-limit knob. 2.0s is a conservative default — high enough to look human,
-# low enough not to crawl. The pipeline can auto-raise it further if the site
-# starts blocking (adaptive auto-slowdown).
-DEFAULT_DELAY = "2.0"
+# rate-limit knob. 3.0s is a conservative default (0.2.0) — high enough to look
+# human, low enough not to crawl. The shared host limiter (and the pipeline's
+# adaptive auto-slowdown) can raise it further if the site starts blocking.
+DEFAULT_DELAY = "3.0"
 DEFAULT_TIMEOUT = "30"     # per-request timeout (matches request_manager default)
 DEFAULT_CHUNK = "10"       # chapters per PDF in CHUNKED mode
 # Headless browser OFF by default (0.1.3). The FreeWebNovel primary path is a
@@ -68,6 +66,10 @@ DEFAULT_OUTPUT_PARENT = Path.home() / "Downloads"
 # "End = all": a sentinel far above any real chapter count. The pipeline clamps
 # the requested range down to the available TOC, so this means "to the end".
 ALL_CHAPTERS = 10 ** 9
+# How often (ms) the window-close sequence re-checks whether the (non-daemon)
+# scrape worker has exited before destroying the window (§4.4). Polled on the Tk
+# event loop via ``self.after`` — never a blocking sleep — so the UI stays alive.
+CLOSE_POLL_MS = 50
 
 
 class ScraperApp(tk.Tk):
@@ -82,6 +84,9 @@ class ScraperApp(tk.Tk):
         self._worker: threading.Thread | None = None
         self._cancel_event: threading.Event | None = None
         self._running = False
+        # Set once a window-close is in progress so the close handler is idempotent
+        # and a late worker callback knows the window is going away (§4.4).
+        self._closing = False
         # Widgets that must be locked while a run is in progress.
         self._locked_inputs: list[tuple[tk.Widget, str]] = []
 
@@ -259,7 +264,12 @@ class ScraperApp(tk.Tk):
         self._headless_var = tk.BooleanVar(value=DEFAULT_HEADLESS)
         self._headless_check = ttk.Checkbutton(
             opt_frame,
-            text="Headless browser (advanced — hides the window; usually blocked by Cloudflare)",
+            text=(
+                "Headless primary browser (advanced). If Cloudflare broadly blocks "
+                "headless mode, the app may automatically open and keep a visible "
+                "browser for the rest of the run; hard chapters may also open a "
+                "visible rescue browser."
+            ),
             variable=self._headless_var,
         )
         self._headless_check.grid(row=1, column=0, sticky="w", padx=(20, 0))
@@ -461,21 +471,17 @@ class ScraperApp(tk.Tk):
             return
         start, end, delay, timeout, mode, chunk = params
 
-        # Honour the timeout field: FETCH_TIMEOUT is read from module globals at
-        # call time in RequestManager._get_text, so setting it here takes effect
-        # without modifying the tested request-manager module.
-        rm_module.FETCH_TIMEOUT = timeout
-
-        # The browser toggle only applies to browser-capable adapters. Set it on
-        # the resolved catalog row for this run (the pipeline re-resolves the same
-        # instance). Reset every run so a prior selection never leaks.
-        spec.use_browser = (
+        # The browser toggle only applies to browser-capable adapters. The choice
+        # travels on the immutable ScrapeJob (the pipeline builds a per-run SiteSpec
+        # copy via runtime_site_spec) — the GUI no longer mutates the shared catalog
+        # row (§3.14). Recomputed every run so a prior selection never leaks.
+        use_browser = (
             self._browser_var.get()
             and spec.adapter_key in _BROWSER_CAPABLE_ADAPTERS
         )
         # HTTP-first only modifies the browser-primary path; it is inert when the
         # browser is not the primary engine for this run.
-        http_first = bool(self._http_first_var.get()) and spec.use_browser
+        http_first = bool(self._http_first_var.get()) and use_browser
 
         # Output location: the parent (default ~/Downloads, or a Browse… choice)
         # plus an optional custom name (blank => novel slug). resolve_output_dir
@@ -494,17 +500,19 @@ class ScraperApp(tk.Tk):
             output_dir=output_dir,
             chunk_size=chunk,
             http_first=http_first,
+            # 0.2.0 run-config (§3.14/§3.15): the run's behaviour now travels on the
+            # immutable job, not a mutated module global. request_timeout is the GUI
+            # Timeout field (ordinary HTTP/nav timeout); the 180s rescue deadline is a
+            # separate internal ceiling. rescue_workers stays 1 (single-lane).
+            use_browser=use_browser,
+            headless=bool(self._headless_var.get()),
+            request_timeout=timeout,
         )
 
-        rm = RequestManager(
-            slug=spec.novel_slug,
-            use_cache=self._cache_var.get(),
-            headless=self._headless_var.get(),
-            try_http_first=http_first,
-            log_fn=self._thread_log,
-            max_retries=job.max_retries,
-            retry_base_delay=job.retry_base_delay,
-        )
+        # The GUI no longer pre-builds a RequestManager (§3.15): the pipeline OWNS
+        # and may REPLACE the active primary manager (TOC fallback / breaker switch),
+        # so it constructs it from the job via the request_manager_factory seam. The
+        # legacy WND/HTTP path likewise builds its own manager from the same job.
         self._cancel_event = threading.Event()
 
         self._set_running(True)
@@ -513,12 +521,16 @@ class ScraperApp(tk.Tk):
         self._append_log(
             f"Starting: {spec.novel_title} via {spec.display_name} "
             f"(chapters {start}-{'all' if end >= ALL_CHAPTERS else end}, "
-            f"{mode.value}{', browser' if spec.use_browser else ''})"
+            f"{mode.value}{', browser' if use_browser else ''})"
         )
         self._append_log(f"Output: {output_dir}")
 
+        # Non-daemon (§4.4): a daemon worker could be killed at interpreter exit
+        # before the pipeline's teardown ``finally`` closes the browser / rescue
+        # pool. The window-close sequence instead signals cancel and waits for this
+        # thread to exit (so teardown always runs) before destroying the window.
         self._worker = threading.Thread(
-            target=self._run_worker, args=(job, rm), daemon=True
+            target=self._run_worker, args=(job,), daemon=False
         )
         self._worker.start()
 
@@ -586,13 +598,14 @@ class ScraperApp(tk.Tk):
 
         return start, end, delay, timeout, mode, chunk
 
-    def _run_worker(self, job: ScrapeJob, rm: RequestManager) -> None:
-        """Daemon-thread body: drive the pipeline, then hand the RM back for
-        teardown. Every UI touch goes through ``self.after`` via the callbacks."""
+    def _run_worker(self, job: ScrapeJob) -> None:
+        """Worker-thread body: drive the pipeline. The pipeline now OWNS and tears
+        down the request manager(s) itself (§3.15) — the GUI no longer pre-builds
+        one. Every UI touch goes through ``self.after`` via the callbacks, which are
+        no-ops once the window is being destroyed, so a late finish never raises."""
         try:
             pipeline.run_scrape(
                 job,
-                request_manager=rm,
                 log=self._thread_log,
                 cancel_event=self._cancel_event,
                 progress_cb=self._thread_progress,
@@ -603,10 +616,9 @@ class ScraperApp(tk.Tk):
             self._thread_log(f"ERROR: {exc}")
         finally:
             try:
-                rm.close()
+                self.after(0, self._on_run_finished)
             except Exception:
-                pass
-            self.after(0, self._on_run_finished)
+                pass  # window already closing/destroyed — nothing to update
 
     def _on_stop(self) -> None:
         if self._cancel_event is not None:
@@ -625,10 +637,18 @@ class ScraperApp(tk.Tk):
 
     # ── Thread-safe UI callbacks (called from the worker thread) ─────────────
     def _thread_log(self, msg: str) -> None:
-        self.after(0, self._append_log, str(msg))
+        # Marshalled onto the Tk thread; swallow the error if the window has been
+        # destroyed mid-close so a late worker/rescue log line never crashes it.
+        try:
+            self.after(0, self._append_log, str(msg))
+        except Exception:
+            pass
 
     def _thread_progress(self, done: int, total: int) -> None:
-        self.after(0, self._set_progress, done, total)
+        try:
+            self.after(0, self._set_progress, done, total)
+        except Exception:
+            pass
 
     def _append_log(self, msg: str) -> None:
         self._log_text.configure(state="normal")
@@ -653,15 +673,48 @@ class ScraperApp(tk.Tk):
         self._refresh_browser_state()
 
     def _on_close(self) -> None:
+        """WM_DELETE_WINDOW handler (§4.4). If a scrape is live, confirm, then start
+        a *graceful* close: signal cancel and poll until the non-daemon worker has
+        exited before destroying the window, so the pipeline's teardown ``finally``
+        (browser + rescue-pool close) always runs. Idempotent — a second close while
+        already tearing down is ignored."""
+        if self._closing:
+            return
         if self._running:
             if not messagebox.askokcancel(
                 "Quit",
                 "A scrape is still running. Stop it and quit?",
             ):
                 return
-            if self._cancel_event is not None:
-                self._cancel_event.set()
-        self.destroy()
+            self._begin_close()
+        else:
+            self.destroy()
+
+    def _begin_close(self) -> None:
+        """Signal cancellation, mark the window closing, and begin polling until the
+        worker thread exits. Separated from ``_on_close`` so a test can drive the
+        poll loop without the modal confirm dialog."""
+        self._closing = True
+        if self._cancel_event is not None:
+            self._cancel_event.set()
+        self._append_log("Closing — waiting for the current chapter to finish…")
+        # Lock the buttons; the window stays up (responsive) while we wait.
+        for btn in (self._stop_btn, self._start_btn):
+            try:
+                btn.configure(state="disabled")
+            except Exception:
+                pass
+        self._poll_close()
+
+    def _poll_close(self) -> None:
+        """Re-scheduled via ``self.after`` (the Tk event loop — no blocking sleep)
+        until the worker thread is gone, then destroy. A test injects a fake
+        ``after`` and steps the callback, so coverage never waits on the real clock."""
+        worker = self._worker
+        if worker is None or not worker.is_alive():
+            self.destroy()
+            return
+        self.after(CLOSE_POLL_MS, self._poll_close)
 
 
 def main() -> None:
