@@ -92,10 +92,26 @@ exact legacy visible engine, historically proven to clear FWN) when camoufox can
 clear a chapter — persistent + reused via a run latch, never relaunched per chapter.
 Per-chapter cap 4 attempts; the end-of-run sweep is bounded and also gets the
 fallback. HTTP-first is an explicit opt-in toggle (default off); WebNovel-dynamic
-keeps its plain-HTTP fast path. Suite: **157 offline tests**, `verify` green.
-**Honest:** offline tests prove the wiring/flow; the live chapter-102 test will show
-which engine clears it (camoufox or the stealth-Chromium fallback) — only a live
-pass confirms it.
+keeps its plain-HTTP fast path.
+
+**Critical follow-up fix (detection/timing).** A live chapter-102 test proved headful
+camoufox *does* clear FWN's Cloudflare on screen, but the scraper logged "challenge
+still present" every attempt and discarded the chapter. Root cause was NOT bypass — it
+was the shared `cloudflare_detection.has_real_payload` not knowing FreeWebNovel's real
+content container `<div id="article">` (it only knew WebNovel's containers + incidental
+`.m-read`/`class="txt"` wrappers). So a cleared FWN page that still carried Cloudflare's
+ambient `/cdn-cgi/challenge-platform/` beacon scored "no payload" → the beacon tripped
+`is_cloudflare_challenge → True` → the chapter was thrown away. Fix: the detector is now
+content-aware for FWN (`#article` + FWN body selectors added to the structural check,
+with a non-trivial-text guard so an empty shell can't false-clear), and `fetch_camoufox`
+now positively WAITS for the real chapter DOM before capturing (no premature read in the
+post-clearance transitional window). The change only ever recognizes *more* real content,
+never newly flags a page that previously cleared. Suite: **163 offline tests**,
+`verify` green.
+
+**Honest:** offline tests prove the wiring/flow; the next live chapter-102 pass should
+show chapter 102 WRITE on the first camoufox attempt (no escalation, no hang) — only a
+live pass confirms it.
 
 ### Legacy diff finding (0.1.3, independently verified)
 This real clone DOES contain `files/legacy-reference/freewebnovel-webscraper.py`

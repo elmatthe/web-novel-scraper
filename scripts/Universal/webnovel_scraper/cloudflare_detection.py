@@ -48,20 +48,41 @@ AMBIENT_CF_MARKERS = ("challenge-platform", "cf-mitigated", "managed-challenge")
 
 # Chapter-body containers/selectors the adapters key off. Lowercased substrings
 # used purely as a cheap prefilter; presence is confirmed structurally below.
+#
+# FreeWebNovel's chapter body lives in ``<div id="article">`` (the FWN adapter's
+# primary container) — the incidental ``.m-read`` / ``class="txt"`` wrapper
+# classes were NOT a reliable signal on a live camoufox-rendered page (Firefox
+# serialization / multi-class / inline-style variance breaks the brittle
+# ``class="txt"`` exact-substring), which is why a fully-cleared FWN chapter that
+# still carried the ambient beacon was misread as a challenge. The stable id-based
+# ``#article`` signal (both quote styles) fixes that.
 _BODY_CONTAINER_MARKERS = (
     "chaptercontent_content",
     "cha-words",
     "cha-content",
     "m-read",
     'class="txt"',
+    'id="article"',
+    "id='article'",
+    "read-content",
+    "chapter-content",
 )
 
 # CSS selectors matching those same containers, used for the structural confirm.
 _BODY_CONTAINER_SELECTOR = (
     "[class*='ChapterContent_content'], "
     "[class*='ChapterContent_container'], "
-    ".cha-words, .cha-content, .m-read, .txt"
+    ".cha-words, .cha-content, .m-read, .txt, "
+    "#article, #chapter-content, .chapter-content, "
+    ".read-content, .novel-content, .chapter-body, .entry-content"
 )
+
+# A matched container must hold at least this many non-space characters of text to
+# count as a real (populated) body. Presence alone is not enough — an empty
+# ``<div id="article"></div>`` shell on a challenge template must NOT clear an
+# ambient beacon. A real chapter body holds thousands of characters, so this is a
+# generous empty-shell guard, not a content-length heuristic.
+_MIN_BODY_TEXT_CHARS = 20
 
 
 def _has_next_data_payload(html: str, h: str) -> bool:
@@ -101,14 +122,23 @@ def _has_g_data_chapter_payload(html: str, h: str) -> bool:
 
 
 def _has_body_container(html: str, h: str) -> bool:
-    """True when a real chapter-body container element exists in the DOM."""
+    """True when a real, populated chapter-body container exists in the DOM.
+
+    Presence alone is not enough: at least one matched container must carry
+    non-trivial text, so an empty ``<div id="article"></div>`` shell on a
+    challenge template is never mistaken for cleared chapter content.
+    """
     if not any(m in h for m in _BODY_CONTAINER_MARKERS):
         return False
     try:
         soup = BeautifulSoup(html, "html.parser")
-        return soup.select_one(_BODY_CONTAINER_SELECTOR) is not None
+        nodes = soup.select(_BODY_CONTAINER_SELECTOR)
     except Exception:
         return False
+    return any(
+        len(node.get_text(" ", strip=True)) >= _MIN_BODY_TEXT_CHARS
+        for node in nodes
+    )
 
 
 def has_real_payload(html: str) -> bool:

@@ -92,7 +92,48 @@ so the claims were checked against it:
   output-folder, non-blocking launch, contained Chromium, HTTP warm-up, resumable
   pipeline, three output modes, PDF build, catalog) are preserved.
 
+### Fixed — premature read + cleared-page CF misdetection on the camoufox FWN path
+A live chapter-102 test proved (visually, on screen) that headful camoufox **does**
+clear FreeWebNovel's Cloudflare challenge — the real chapter rendered in the window —
+yet the scraper logged "Cloudflare challenge still present after camoufox fetch" on
+every attempt, retried, then hung on the stealth rung. The browser had the real
+content; the scraper threw it away. Root cause was **detection/timing, not bypass**:
+- **Cleared-page misdetection (primary).** The shared `cloudflare_detection.has_real_payload`
+  structural check (Phase 9D, built for WebNovel) only recognized WebNovel's containers
+  plus two *incidental* FWN wrapper classes (`.m-read` and the brittle `class="txt"`
+  exact-substring). It had **no knowledge of FreeWebNovel's actual primary content
+  container, `<div id="article">`**. On a live camoufox-cleared FWN chapter — which
+  still carries Cloudflare's ambient `/cdn-cgi/challenge-platform/` beacon, and whose
+  `class="txt"` substring does not survive Firefox serialization / inline-style /
+  multi-class variance — `has_real_payload` returned `False`, the ambient beacon then
+  tripped `is_cloudflare_challenge → True`, and the fetched chapter was discarded at
+  `request_manager._fetch_camoufox_once`. The saved fixtures never reproduced it
+  because they were captured *without* the ambient beacon. **Fix:** the shared detector
+  is now content-aware for FWN — `#article` (the adapter's stable id-based container,
+  both quote styles) plus the FWN body selectors were added to the structural
+  real-payload check, with a **non-trivial-text guard** (`_MIN_BODY_TEXT_CHARS`) so an
+  empty `<div id="article"></div>` shell on a challenge template never false-clears.
+  The change only ever makes the detector recognize *more* real content — it cannot
+  newly flag a page that previously cleared.
+- **Premature read / wait-for-clearance (secondary).** `cf_bypass.fetch_camoufox` now
+  POLLS positively for the real chapter DOM: it breaks the moment `has_real_payload`
+  is true (even with the ambient beacon still present) and otherwise keeps waiting
+  while the page still looks like a challenge — so capture never happens during the
+  post-clearance transitional window where the interstitial is gone but the body has
+  not yet rendered. A non-chapter origin GET (session warm-up) still returns promptly.
+- **Net effect:** with both fixes, a chapter camoufox clears on screen now WRITES on
+  the first camoufox attempt — no escalation, no stealth hang. The stealth-Chromium
+  fallback (already bounded + firm-timeout) remains the last resort but should rarely
+  fire on FWN now.
+
 ### Tests / docs
+- `files/tests/test_camoufox_cleared_detection.py` (NEW, 6 offline cases): the exact
+  live regression — a cleared FWN page with `#article` body **plus** the ambient
+  beacon is classified CLEARED by both detector re-export sites and the browser fetch
+  succeeds on a single camoufox attempt (no escalation); `fetch_camoufox` **waits**
+  through transitional empty-body reads and captures only the populated chapter; a
+  genuine interstitial is still flagged and still escalates (retryable); an empty
+  `#article` shell with only the ambient beacon is still a challenge (text guard).
 - `files/tests/test_headful_camoufox.py` (now 20 offline cases, both engines mocked
   at the `cf_bypass` + `sync_playwright` seams — no real launch): FWN browser-primary
   + visible + HTTP-first-off defaults agree; camoufox created ONCE and warmed once on
@@ -104,13 +145,13 @@ so the claims were checked against it:
   run continues); the end-of-run sweep can rescue via the camoufox→stealth fallback;
   headless can be forced; HTTP-first can be opted in; the non-browser path stays on
   HTTP. Updated `test_phase2.py` (bounded two-engine ladder + HTTP-first-opt-in) and
-  `test_phase8_gui.py` (headless OFF / browser ON / HTTP-first OFF). Suite: **157
+  `test_phase8_gui.py` (headless OFF / browser ON / HTTP-first OFF). Suite: **163
   offline tests**, `verify` green.
-- **Honest status:** offline tests prove the wiring/flow only. The live chapter-102
-  test will now show **which** engine clears it — camoufox first, or the
-  stealth-Chromium fallback — watch the log for which engine succeeds. If neither
-  clears live, FWN has hardened and the next lever is a residential proxy or a manual
-  solve in the visible window.
+- **Honest status:** offline tests prove the wiring/flow only. With the detection/timing
+  fix above, the next live chapter-102 test should show **chapter 102 WRITE on the first
+  camoufox attempt** (the browser already clears it on screen) — no escalation, no hang.
+  If a chapter ever genuinely cannot clear live, the stealth-Chromium fallback is still
+  there, and the last lever is a residential proxy or a manual solve in the visible window.
 
 ## [0.1.2] — 2026-06-29
 
