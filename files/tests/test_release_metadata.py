@@ -2,10 +2,10 @@
 
 A light guard that the docs agree on the current version: the TOP version heading in
 CHANGELOG.md must be the same X.Y.Z that Briefing.md's "Current Version" section states.
-This catches a CHANGELOG bumped without the Briefing (or vice-versa). It deliberately
-does NOT assert a date — 0.2.0 ships ``## [0.2.0] — Unreleased`` (undated) until the
-user's manual live pass, and ``scripts/verify.py``'s ``## [X.Y.Z]`` docs pattern already
-accepts an undated heading, so no verify change was needed.
+This catches a CHANGELOG bumped without the Briefing (or vice-versa). At release time
+0.2.0's heading is stamped from ``## [0.2.0] — Unreleased`` to ``## [0.2.0] — YYYY-MM-DD``
+once the manual live pass signs off; the post-release guard below asserts that stamped,
+dated state. ``scripts/verify.py``'s ``## [X.Y.Z]`` docs pattern accepts either form.
 """
 
 from __future__ import annotations
@@ -52,14 +52,17 @@ def test_changelog_and_briefing_agree_on_version() -> None:
     assert _top_changelog_version() == _briefing_current_version()
 
 
-def test_0_2_0_is_unreleased_and_undated() -> None:
-    """0.2.0 stays Unreleased/undated until the manual live pass — the heading must
-    not have acquired a date, and must be marked Unreleased."""
+def test_0_2_0_is_released_and_dated() -> None:
+    """0.2.0 is released: the manual live pass is signed off and the heading has been
+    stamped — it must carry a YYYY-MM-DD release date and must no longer say
+    Unreleased."""
     text = CHANGELOG.read_text(encoding="utf-8")
     m = re.search(r"^##\s*\[0\.2\.0\][^\n]*", text, re.MULTILINE)
     assert m, "no '## [0.2.0]' heading in CHANGELOG.md"
     heading = m.group(0)
-    assert "Unreleased" in heading, f"0.2.0 heading should say Unreleased: {heading!r}"
-    assert not re.search(r"\d{4}-\d{2}-\d{2}", heading), (
-        f"0.2.0 must stay undated until the live pass: {heading!r}"
+    assert "Unreleased" not in heading, (
+        f"0.2.0 should be released, not Unreleased: {heading!r}"
+    )
+    assert re.search(r"\d{4}-\d{2}-\d{2}", heading), (
+        f"0.2.0 release heading must carry a date: {heading!r}"
     )
