@@ -102,34 +102,53 @@ BROWSER_ESCALATION_LADDER = (
     FETCH_STRATEGY_PLAYWRIGHT_STEALTH_FRESH,
 )
 
-# ── Headful-camoufox PRIMARY ladder (FreeWebNovel default, 0.1.3) ─────────────
-# The 0.1.3 architecture change, matched to the legacy scraper that downloaded
-# whole novels without tripping Cloudflare: a FreeWebNovel chapter is fetched
-# through ONE persistent, VISIBLE (headless=False) camoufox browser from request
-# #1 — no HTTP-first, no six-engine escalation storm. This ladder is deliberately
-# SHORT and camoufox-only:
-#   camoufox -> camoufox -> camoufox_fresh
-# i.e. a couple of retries on the SAME warmed page, then AT MOST ONE fresh-page /
-# fresh-context recovery. The Chromium playwright-stealth rungs are intentionally
-# NOT on this path — routinely walking every engine for every blocked chapter is
-# exactly the "escalation storm" that made Cloudflare more aggressive on the long
-# live run. (Stealth remains reachable only via the legacy
-# DEFAULT_ESCALATION_LADDER, used by the opt-in HTTP-first / non-browser path.)
-# The retry budget on this path is CAPPED to the ladder length in ``fetch`` so a
-# blocked chapter walks it exactly once (≤1 browser recreation), regardless of the
-# job's generous ``max_retries``.
+# ── Bounded TWO-engine headful FWN browser ladder (FreeWebNovel default) ──────
+# 0.1.3, matched to the legacy scraper that downloaded whole novels without
+# tripping Cloudflare. A FreeWebNovel chapter is fetched through a persistent,
+# VISIBLE (headless=False) browser from request #1 — no HTTP-first, no six-engine
+# relaunch storm. The bounded per-chapter ladder is:
+#   camoufox -> camoufox -> camoufox_fresh -> playwright_stealth
+# i.e. a couple of retries on the SAME warmed camoufox page, then ONE fresh-camoufox
+# recovery, then ONE escalation to **headful stealth-Chromium** — the exact engine
+# the legacy scraper used in its default VISIBLE config (camoufox was its
+# headless-only path), so it is the engine historically PROVEN to clear FWN's
+# Cloudflare. Both engines run headful (``headless=False``). The retry budget is
+# CAPPED to the ladder length in ``fetch`` so a blocked chapter walks it exactly
+# once (≤1 camoufox recreation + ≤1 stealth-Chromium escalation), regardless of the
+# job's generous ``max_retries``. No ``playwright_stealth_fresh`` / cloudscraper /
+# http rungs are on this default browser-primary path.
 HEADFUL_PRIMARY_LADDER = (
     FETCH_STRATEGY_CAMOUFOX,
     FETCH_STRATEGY_CAMOUFOX,
     FETCH_STRATEGY_CAMOUFOX_FRESH,
+    FETCH_STRATEGY_PLAYWRIGHT_STEALTH,
 )
 # When the user opts into "try fast HTTP first" ON the browser-primary path, two
-# cheap HTTP rungs are tried before falling back to the same bounded camoufox path.
+# cheap HTTP rungs are tried before the same bounded camoufox -> stealth path.
 HTTP_FIRST_PRIMARY_LADDER = (
     FETCH_STRATEGY_HTTP,
     FETCH_STRATEGY_CLOUDSCRAPER,
     FETCH_STRATEGY_CAMOUFOX,
     FETCH_STRATEGY_CAMOUFOX_FRESH,
+    FETCH_STRATEGY_PLAYWRIGHT_STEALTH,
+)
+# After camoufox has proven unable to clear the challenge once in a run, later
+# chapters (and end-of-run sweep retries) go STRAIGHT to the persistent headful
+# stealth-Chromium engine — reusing the one browser, never relaunching it. This is
+# required for true reuse: camoufox and stealth-Chromium each run their own
+# sync-Playwright loop and cannot coexist on one thread, so replaying the camoufox
+# rungs between two stealth chapters would force a Chromium teardown/relaunch each
+# time. Latching off camoufox after the first fallback keeps the stealth browser
+# alive across every later fallback chapter. Two same-page attempts, no relaunch.
+STEALTH_LATCHED_LADDER = (
+    FETCH_STRATEGY_PLAYWRIGHT_STEALTH,
+    FETCH_STRATEGY_PLAYWRIGHT_STEALTH,
+)
+# The stealth-Chromium strategies (used to set the run latch when either is reached
+# on the browser-primary path).
+_STEALTH_STRATEGIES = (
+    FETCH_STRATEGY_PLAYWRIGHT_STEALTH,
+    FETCH_STRATEGY_PLAYWRIGHT_STEALTH_FRESH,
 )
 
 # Repo-root-relative cache root: files/cache/ (request_manager is at
@@ -394,6 +413,12 @@ class RequestManager:
         # lets Cloudflare seat a cf_clearance cookie in the browser context). One
         # warm-up per host per browser; cleared when the browser is recreated.
         self._cf_warmed_hosts: set = set()
+        # Run latch: set True once camoufox has been exhausted on the browser-primary
+        # path (a chapter reached the stealth-Chromium fallback rung). Subsequent
+        # browser-primary fetches then go straight to the persistent stealth-Chromium
+        # engine (STEALTH_LATCHED_LADDER) instead of replaying camoufox — so the one
+        # stealth browser is reused, never relaunched per chapter.
+        self._camoufox_exhausted = False
 
     # ── lifecycle + unified facade ───────────────────────────────────────────
     def start(self) -> "RequestManager":
@@ -436,25 +461,33 @@ class RequestManager:
         caller_retries = self.max_retries if max_retries is None else max(0, int(max_retries))
         base_delay = self.retry_base_delay if retry_base_delay is None else float(retry_base_delay)
         if use_browser:
-            # Browser-primary (FWN default): bounded headful-camoufox ladder. Cap
-            # the retry budget to the ladder length so a blocked chapter walks it
-            # exactly once — a couple of same-page retries + at most ONE fresh-page
-            # recovery — instead of repeating the strongest rung 5+ times. ``min``
-            # still honours a smaller caller-supplied budget (used by some tests).
-            ladder = (
-                HTTP_FIRST_PRIMARY_LADDER if self.try_http_first
-                else HEADFUL_PRIMARY_LADDER
-            )
+            # Browser-primary (FWN default): bounded two-engine headful ladder
+            # camoufox -> camoufox_fresh -> stealth-Chromium. Cap the retry budget to
+            # the ladder length so a blocked chapter walks it exactly once — a couple
+            # of same-page camoufox retries, ONE fresh-camoufox recovery, ONE
+            # stealth-Chromium escalation — never the six-engine storm. Once camoufox
+            # is exhausted for the run, later chapters go straight to the persistent
+            # stealth-Chromium engine (reused, not relaunched). ``min`` still honours
+            # a smaller caller-supplied budget (used by some tests).
+            if self._camoufox_exhausted:
+                ladder = STEALTH_LATCHED_LADDER
+            elif self.try_http_first:
+                ladder = HTTP_FIRST_PRIMARY_LADDER
+            else:
+                ladder = HEADFUL_PRIMARY_LADDER
             max_attempt_retries = min(caller_retries, len(ladder) - 1)
+            browser_primary = True
         else:
             ladder = DEFAULT_ESCALATION_LADDER
             max_attempt_retries = caller_retries
+            browser_primary = False
         return self._fetch_with_retry_ladder(
             url,
             use_cache=effective_cache,
             ladder=ladder,
             max_retries=max_attempt_retries,
             retry_base_delay=base_delay,
+            browser_primary=browser_primary,
         )
 
     # ── cache helpers ────────────────────────────────────────────────────────
@@ -629,6 +662,7 @@ class RequestManager:
         ladder: Sequence[str],
         max_retries: int,
         retry_base_delay: float,
+        browser_primary: bool = False,
     ) -> str:
         cache_path = self.cache_path_for(url)
         if use_cache:
@@ -643,6 +677,13 @@ class RequestManager:
                 raise ScrapeCancelled(f"Fetch cancelled before requesting {url}")
 
             strategy = _strategy_for_attempt(ladder, attempt)
+            if browser_primary and strategy in _STEALTH_STRATEGIES:
+                # camoufox could not clear this chapter — latch to the legacy
+                # stealth-Chromium engine for the rest of the run so later chapters
+                # reuse the one persistent stealth browser instead of relaunching it
+                # behind a camoufox retry (the two engines cannot coexist on a
+                # thread). Set as soon as the stealth rung is reached.
+                self._camoufox_exhausted = True
             t0 = time.time()
             try:
                 self._log(f"  fetch attempt {attempt}/{max_attempts} via {strategy}")

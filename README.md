@@ -67,9 +67,11 @@ are skipped quickly so a long run never hangs.
 
 Free Web Novel sits behind Cloudflare's bot protection, and Cloudflare clears for
 a **real, visible browser** while it blocks hidden (headless) automation. So for
-Free Web Novel the app now uses a real browser engine (camoufox, downloaded once
-during setup — no admin needed) **from the very first request**, in a **visible
-window**. You don't need to change anything — just press Start.
+Free Web Novel the app uses a real browser engine **from the very first request**,
+in a **visible window** — it tries camoufox first and, if that can't get through,
+automatically falls back to a second visible browser engine (stealth Chromium); both
+are downloaded once during setup, no admin needed. You don't need to change anything
+— just press Start.
 
 **A browser window will open and stay open while a Free Web Novel scrape runs.**
 That is expected and is how the download clears Cloudflare (just like the older

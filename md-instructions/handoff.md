@@ -1,6 +1,43 @@
 # webnovel-scraper - Handoff
 
 ## Current Focus (newest)
+**0.1.3 FWN ladder refinement — added the bounded headful stealth-Chromium fallback
+after camoufox (2026-06-29) — complete on `feature/v0.1.3-headful-camoufox`; `verify`
+green at 157 tests.** The prior 0.1.3 pass made headful camoufox the SOLE FWN browser
+engine and dropped stealth-Chromium. But the legacy diff showed the old scraper's
+proven-working VISIBLE engine was stealth-Chromium (camoufox was its headless-only
+path), so the historically-proven engine was missing from the FWN chain. This pass
+adds it back as a BOUNDED fallback, not the old storm:
+- New FWN per-chapter ladder: `HEADFUL_PRIMARY_LADDER = (camoufox, camoufox,
+  camoufox_fresh, playwright_stealth)`. **Per-chapter cap = 4 attempts** (5 with
+  HTTP-first via `HTTP_FIRST_PRIMARY_LADDER`). camoufox primary (same-page retries +
+  one fresh recovery), then ONE escalation to **headful stealth-Chromium**
+  (`cf_bypass.create_stealth_browser`/`fetch_with_stealth`, run VISIBLE since
+  `self.headless=False`). No `playwright_stealth_fresh`/cloudscraper/http on the
+  default browser path.
+- **Persistent + reused stealth engine via a run latch.** `_camoufox_exhausted` is
+  set the moment a chapter reaches the stealth rung (set in `_fetch_with_retry_ladder`
+  when `browser_primary` + a stealth strategy). Once latched, later chapters + sweep
+  retries use `STEALTH_LATCHED_LADDER = (playwright_stealth, playwright_stealth)` —
+  straight to the ONE persistent stealth-Chromium browser, reused not relaunched.
+  This latch is REQUIRED for true reuse: camoufox and stealth-Chromium each run their
+  own sync-Playwright and can't coexist on a thread, so replaying camoufox between two
+  stealth chapters would force a Chromium teardown/relaunch. Latching off camoufox
+  after the first fallback keeps the one stealth browser alive.
+- Non-blocking launch preserved: a missing/unlaunchable stealth Chromium is an
+  immediate strategy failure (no backoff), chapter recorded failed, run continues.
+  Stealth uses the contained `PLAYWRIGHT_BROWSERS_PATH → files/bin/ms-playwright`
+  (the launcher already installs chromium via `python -m playwright install chromium`
+  — confirmed).
+- `test_headful_camoufox.py` grew 12→20 (both engines mocked at cf_bypass +
+  sync_playwright seams — no real launch): escalates-to-stealth-once, stealth-headful,
+  stealth-created-once-and-reused across fallback chapters, run-latches-after-first-
+  fallback, stealth-launch-failure-non-blocking (unit + pipeline), sweep-uses-fallback.
+  `test_phase2.py` ladder tests updated (4-/5-rung). `verify` green: 157 passed.
+  **Honest:** offline only; the live ch-102 test will show WHICH engine clears it
+  (camoufox or the stealth-Chromium fallback) — watch the log.
+
+## Current Focus (prior)
 **0.1.3 headful-camoufox-primary for FreeWebNovel (2026-06-29) — complete on branch
 `feature/v0.1.3-headful-camoufox`; `verify` green at 153 tests; COMMITTED locally
 (commit a2bd1b4). Push was blocked by the session's permission policy — the user
@@ -217,6 +254,22 @@ Notes:
 
 ## Work Log (newest first)
 
+- 2026-06-29 - Claude Code (HOME-PC): **0.1.3 FWN ladder refinement — bounded headful
+  stealth-Chromium fallback after camoufox** (same `feature/v0.1.3-headful-camoufox`
+  branch, no branch switch). Reason: the legacy diff showed the old scraper's proven
+  VISIBLE engine was stealth-Chromium, which my prior 0.1.3 pass had removed from the
+  FWN chain. Added it back as a bounded fallback: `HEADFUL_PRIMARY_LADDER` now
+  `(camoufox, camoufox, camoufox_fresh, playwright_stealth)` (cap 4/chapter; 5 with
+  HTTP-first), stealth runs headful, persistent + reused via the `_camoufox_exhausted`
+  run latch (`STEALTH_LATCHED_LADDER` for latched chapters/sweep so the one stealth
+  browser is never relaunched). Latch set in `_fetch_with_retry_ladder` when
+  `browser_primary` reaches a stealth rung; `fetch` selects the latched ladder.
+  Non-blocking launch + contained `files/bin/ms-playwright` Chromium preserved
+  (launcher installs chromium — confirmed). `test_headful_camoufox.py` 12→20 (added a
+  `_FakeBrowsers` two-engine mock incl. `sync_playwright`, so no real browser ever
+  launches); `test_phase2.py` ladder tests updated to the 4-/5-rung ladders. `verify`
+  green: **157 passed**. Committed + (attempted) push on the same branch; NO merge/
+  tag/release. **Honest:** offline only; live ch-102 will show which engine clears.
 - 2026-06-29 - Claude Code (HOME-PC): **0.1.3 headful-camoufox-primary for
   FreeWebNovel** on new branch `feature/v0.1.3-headful-camoufox`. Pulled merged
   0.1.2 into `main` (verify green, 138 tests), branched. **Independently diffed the
@@ -493,6 +546,28 @@ Notes:
 ---
 
 ## Session Sync Log (newest first)
+
+### 2026-06-29 - HOME-PC - 0.1.3 ladder refinement (stealth-Chromium fallback)
+Bounded headful stealth-Chromium fallback after camoufox on the FWN path, on
+`feature/v0.1.3-headful-camoufox` (same branch, on top of the prior 0.1.3 commit).
+
+- Changed: `scripts/Universal/webnovel_scraper/request_manager.py`
+  (`HEADFUL_PRIMARY_LADDER` + `HTTP_FIRST_PRIMARY_LADDER` gain a trailing
+  `playwright_stealth` rung; new `STEALTH_LATCHED_LADDER` + `_STEALTH_STRATEGIES`;
+  `_camoufox_exhausted` latch in `__init__`; `fetch` selects the latched ladder;
+  `_fetch_with_retry_ladder` gains `browser_primary` and sets the latch on a stealth
+  rung).
+- Changed: `files/tests/test_headful_camoufox.py` (12→20; new `_FakeBrowsers`
+  two-engine mock incl. `sync_playwright`; updated bounded-recovery tests; new
+  stealth-fallback / reuse / headful / latch / launch-failure / sweep tests).
+- Changed: `files/tests/test_phase2.py` (`test_fetch_use_browser_is_bounded_two_engine_headful`,
+  HTTP-first-opt-in ladder now 5 rungs, `fake_ladder` accepts `browser_primary`).
+- Changed: `README.md`, `md-instructions/CHANGELOG.md` (0.1.3 two-engine ladder),
+  `md-instructions/Briefing.md` (FWN ladder camoufox→stealth, count 153→157),
+  `md-instructions/handoff.md` (this entry + Current Focus + Work Log).
+- Note: `verify` green (**157 passed**). Committed on the branch; push attempted —
+  if blocked, run `git push -u origin feature/v0.1.3-headful-camoufox`. NO merge,
+  tag, or release.
 
 ### 2026-06-29 - HOME-PC - committed (a2bd1b4); push BLOCKED by session policy
 0.1.3 headful-camoufox-primary for FreeWebNovel, on `feature/v0.1.3-headful-camoufox`

@@ -77,6 +77,95 @@ class _FakeCamoufox:
         monkeypatch.setattr(cf_bypass, "fetch_camoufox", fetch)
 
 
+class _FakeBrowsers:
+    """Mocks BOTH browser engines (camoufox + stealth-Chromium) at the cf_bypass /
+    sync_playwright seams — so a test can drive the real RequestManager two-engine
+    fallback logic (create-once, reuse, headful) without launching anything.
+
+    Configure per-engine outcomes: ``camoufox_clears`` / ``stealth_clears`` decide
+    whether each engine returns clean HTML or a Cloudflare challenge page. A callable
+    may be passed for ``stealth_clears`` to vary by attempt (for sweep tests).
+    ``stealth_launch_raises`` simulates a missing/unlaunchable Chromium.
+    """
+
+    def __init__(self, *, camoufox_clears=False, stealth_clears=True,
+                 stealth_launch_raises: Exception | None = None) -> None:
+        self.camoufox_created = 0
+        self.camoufox_exited = 0
+        self.stealth_created = 0
+        self.camoufox_nav: list[str] = []
+        self.stealth_nav: list[str] = []
+        self.camoufox_headless = None
+        self.stealth_headless = None
+        self._camoufox_clears = camoufox_clears
+        self._stealth_clears = stealth_clears
+        self._stealth_launch_raises = stealth_launch_raises
+
+    def install(self, monkeypatch) -> None:
+        import playwright.sync_api as pw_sync
+
+        outer = self
+
+        # ── camoufox ──
+        class _CM:
+            def __exit__(self, *exc) -> None:
+                outer.camoufox_exited += 1
+
+        def create_camoufox(*, headless, **_k):
+            outer.camoufox_created += 1
+            outer.camoufox_headless = headless
+            return _CM(), object()
+
+        def fetch_camoufox(page, url, **_k):
+            outer.camoufox_nav.append(url)
+            return _CLEAN if outer._camoufox_clears else _CHALLENGE
+
+        monkeypatch.setattr(cf_bypass, "create_camoufox_browser", create_camoufox)
+        monkeypatch.setattr(cf_bypass, "fetch_camoufox", fetch_camoufox)
+
+        # ── stealth-Chromium ──
+        class _PW:
+            def stop(self) -> None:
+                pass
+
+        class _SyncPW:
+            def start(self):
+                return _PW()
+
+        class _Page:
+            def close(self) -> None:
+                pass
+
+        class _Ctx:
+            def new_page(self):
+                return _Page()
+
+            def close(self) -> None:
+                pass
+
+        class _Browser:
+            def close(self) -> None:
+                pass
+
+        def create_stealth(pw, *, headless, **_k):
+            if outer._stealth_launch_raises is not None:
+                raise outer._stealth_launch_raises
+            outer.stealth_created += 1
+            outer.stealth_headless = headless
+            return _Browser(), _Ctx()
+
+        def fetch_with_stealth(page, url, **_k):
+            outer.stealth_nav.append(url)
+            clears = outer._stealth_clears
+            if callable(clears):
+                clears = clears(len(outer.stealth_nav))
+            return _CLEAN if clears else _CHALLENGE
+
+        monkeypatch.setattr(pw_sync, "sync_playwright", lambda: _SyncPW())
+        monkeypatch.setattr(cf_bypass, "create_stealth_browser", create_stealth)
+        monkeypatch.setattr(cf_bypass, "fetch_with_stealth", fetch_with_stealth)
+
+
 class _BrowserAdapter:
     """Minimal adapter that drives a REAL RequestManager over the browser-primary
     path (``use_browser=True``) for each chapter — so the run exercises the real
@@ -180,85 +269,176 @@ def test_normal_success_uses_single_camoufox_attempt(tmp_path, monkeypatch) -> N
     assert strategies == [CAMO]   # one attempt, no escalation
 
 
-# ── Bounded failure recovery ─────────────────────────────────────────────────
-def test_blocked_chapter_is_bounded_and_never_runs_six_engines(tmp_path, monkeypatch) -> None:
-    """A chapter that fails every camoufox attempt walks ONLY the short bounded
-    ladder (camoufox, camoufox, camoufox_fresh) — at most ONE fresh recovery — and
-    NEVER touches the Chromium playwright-stealth rungs (the killed storm)."""
+# ── Bounded failure recovery + headful stealth-Chromium fallback ─────────────
+def test_blocked_chapter_escalates_to_stealth_fallback_exactly_once(tmp_path, monkeypatch) -> None:
+    """A chapter camoufox cannot clear walks the bounded two-engine ladder
+    (camoufox, camoufox, camoufox_fresh) and escalates to the headful
+    stealth-Chromium fallback EXACTLY ONCE — never a six-engine storm."""
     strategies: list[str] = []
+
+    def fake_strategy(url, strategy):
+        strategies.append(strategy)
+        if strategy == STEALTH:
+            return _CLEAN          # stealth-Chromium clears what camoufox couldn't
+        raise RuntimeError("Cloudflare challenge still present")
+
     mgr = RequestManager(
         "s", use_cache=False, cache_root=tmp_path, max_retries=6,
         retry_jitter_ratio=0.0, sleep_fn=lambda _s: None,
     )
-    monkeypatch.setattr(
-        mgr, "_fetch_uncached_strategy",
-        lambda url, strategy: strategies.append(strategy) or (_ for _ in ()).throw(
-            RuntimeError("Cloudflare challenge still present")
-        ),
-    )
-    with pytest.raises(rm.FetchError):
-        mgr.fetch("https://freewebnovel.com/c/1", use_browser=True)
+    monkeypatch.setattr(mgr, "_fetch_uncached_strategy", fake_strategy)
+    assert mgr.fetch("https://freewebnovel.com/c/1", use_browser=True) == _CLEAN
 
-    assert strategies == [CAMO, CAMO, CAMO_FRESH]
-    assert strategies.count(CAMO_FRESH) == 1          # ≤1 fresh recovery
-    assert STEALTH not in strategies and STEALTH_FRESH not in strategies
-    assert len(strategies) <= 3                        # retries bounded
+    assert strategies == [CAMO, CAMO, CAMO_FRESH, STEALTH]
+    assert strategies.count(CAMO_FRESH) == 1          # ≤1 fresh camoufox recovery
+    assert strategies.count(STEALTH) == 1             # exactly ONE stealth escalation
+    assert STEALTH_FRESH not in strategies            # no stealth_fresh storm
+    assert len(strategies) == 4                        # the per-chapter cap
 
 
-def test_browser_recreation_is_bounded_to_one_fresh(tmp_path, monkeypatch) -> None:
-    """At the engine seam: a fully-blocked chapter recreates the camoufox browser at
-    most once (the single camoufox_fresh recovery)."""
-    chapter = "https://freewebnovel.com/novel/x/chapter-1"
-    fake = _FakeCamoufox(challenge_urls={chapter})  # chapter always challenges; origin clears
+def test_stealth_fallback_is_headful(tmp_path, monkeypatch) -> None:
+    """The stealth-Chromium fallback runs VISIBLE (headless=False) — the exact legacy
+    engine/config — as does camoufox."""
+    fake = _FakeBrowsers(camoufox_clears=False, stealth_clears=True)
     fake.install(monkeypatch)
     mgr = RequestManager(
         "s", use_cache=False, cache_root=tmp_path, max_retries=6,
         retry_jitter_ratio=0.0, sleep_fn=lambda _s: None,
     )
-    with pytest.raises(rm.FetchError):
-        mgr.fetch(chapter, use_browser=True)
-    # Initial browser + exactly ONE fresh recovery = 2 creations, never a storm.
-    assert fake.created == 2
+    chapter = "https://freewebnovel.com/novel/x/chapter-1"
+    assert mgr.fetch(chapter, use_browser=True) == _CLEAN
+    assert fake.stealth_created == 1
+    assert fake.stealth_headless is False            # headful stealth-Chromium
+    assert fake.camoufox_headless is False           # headful camoufox too
+    # The stealth engine fetched the chapter exactly once (the single fallback).
+    assert fake.stealth_nav.count(chapter) == 1
 
 
-def test_one_failed_chapter_records_and_run_continues_with_bounded_sweep(
-    tmp_path, monkeypatch
-) -> None:
-    """One blocked chapter is recorded failed, the run continues, and the end-of-run
-    sweep re-attempts it with the SAME bounded ladder (no uncontrolled escalation)."""
-    recorded: list[str] = []
-    ch2 = "https://freewebnovel.com/novel/x/chapter-2"
-
-    def fake_strategy(url, strategy):
-        recorded.append(strategy)
-        if url == ch2:
-            raise RuntimeError("Cloudflare challenge still present")
-        return _CLEAN
-
+def test_stealth_fallback_browser_created_once_and_reused(tmp_path, monkeypatch) -> None:
+    """When camoufox can't clear the site, the stealth-Chromium fallback browser is
+    created ONCE per run and reused across every later fallback chapter — never
+    relaunched per chapter."""
+    fake = _FakeBrowsers(camoufox_clears=False, stealth_clears=True)
+    fake.install(monkeypatch)
     mgr = RequestManager(
         "ss", use_cache=False, cache_root=tmp_path, max_retries=6,
         retry_jitter_ratio=0.0, sleep_fn=lambda _s: None,
     )
-    monkeypatch.setattr(mgr, "_fetch_uncached_strategy", fake_strategy)
     adapter = _BrowserAdapter(mgr, count=3)
-
     report = pipeline.run_scrape(
         _job(tmp_path, count=3), adapter=adapter, log=lambda _m: None,
         sleep_fn=lambda _s: None,
     )
 
-    # Chapter 2 failed and stayed failed; 1 and 3 were written; run did not abort.
-    assert report.failed == [2]
+    assert report.failed == []
+    assert len(report.written) == 3
+    # ONE stealth-Chromium browser for the whole run, reused across all 3 chapters.
+    assert fake.stealth_created == 1
+    assert fake.stealth_nav.count("https://freewebnovel.com/novel/x/chapter-1") == 1
+    assert fake.stealth_nav.count("https://freewebnovel.com/novel/x/chapter-2") == 1
+    assert fake.stealth_nav.count("https://freewebnovel.com/novel/x/chapter-3") == 1
+    # camoufox was only created while it was still being tried (before the latch);
+    # it is NOT relaunched for the latched chapters.
+    assert fake.camoufox_created <= 2
+
+
+def test_run_latches_to_stealth_after_first_fallback(tmp_path, monkeypatch) -> None:
+    """After camoufox is exhausted once, later browser-primary fetches go straight to
+    the persistent stealth engine (no camoufox replay → no Chromium relaunch)."""
+    mgr = RequestManager(
+        "s", use_cache=False, cache_root=tmp_path, max_retries=6,
+        retry_jitter_ratio=0.0, sleep_fn=lambda _s: None,
+    )
+    seq: list[str] = []
+
+    def fake_strategy(url, strategy):
+        seq.append(strategy)
+        if strategy in (STEALTH, STEALTH_FRESH):
+            return _CLEAN
+        raise RuntimeError("Cloudflare challenge still present")
+
+    monkeypatch.setattr(mgr, "_fetch_uncached_strategy", fake_strategy)
+    assert mgr.fetch("https://freewebnovel.com/c/1", use_browser=True) == _CLEAN
+    assert mgr._camoufox_exhausted is True
+    seq.clear()
+    # Second chapter: latched → stealth-first, no camoufox at all.
+    assert mgr.fetch("https://freewebnovel.com/c/2", use_browser=True) == _CLEAN
+    assert seq == [STEALTH]
+    assert CAMO not in seq and CAMO_FRESH not in seq
+
+
+def test_stealth_launch_failure_is_non_blocking(tmp_path, monkeypatch) -> None:
+    """A missing/unlaunchable Chromium on the stealth fallback rung is an immediate
+    strategy failure (no long backoff), the chapter is recorded failed, the run
+    continues."""
+    sleeps: list[float] = []
+
+    def fake_strategy(url, strategy):
+        if strategy == STEALTH:
+            raise RuntimeError(
+                "BrowserType.launch: Executable doesn't exist — playwright install"
+            )
+        raise RuntimeError("Cloudflare challenge still present")
+
+    mgr = RequestManager(
+        "s", use_cache=False, cache_root=tmp_path, max_retries=6,
+        retry_jitter_ratio=0.0, sleep_fn=sleeps.append,
+    )
+    monkeypatch.setattr(mgr, "_fetch_uncached_strategy", fake_strategy)
+    with pytest.raises(rm.FetchError):
+        mgr.fetch("https://freewebnovel.com/c/1", use_browser=True)
+    # Camoufox rungs backed off (transient), but the stealth LAUNCH failure added no
+    # sleep — so no 100-second freeze on a missing Chromium.
+    assert sleeps == [5.0, 15.0, 45.0]
+
+
+def test_stealth_launch_failure_run_continues(tmp_path, monkeypatch) -> None:
+    """Pipeline level: stealth Chromium can't launch and camoufox can't clear — both
+    chapters are recorded failed but the run does not abort."""
+    fake = _FakeBrowsers(
+        camoufox_clears=False,
+        stealth_launch_raises=FileNotFoundError("ms-playwright chromium missing"),
+    )
+    fake.install(monkeypatch)
+    mgr = RequestManager(
+        "ss", use_cache=False, cache_root=tmp_path, max_retries=6,
+        retry_jitter_ratio=0.0, sleep_fn=lambda _s: None,
+    )
+    adapter = _BrowserAdapter(mgr, count=2)
+    report = pipeline.run_scrape(
+        _job(tmp_path, count=2), adapter=adapter, log=lambda _m: None,
+        sleep_fn=lambda _s: None,
+    )
     assert not report.cancelled
-    assert len(report.written) == 2
-    # Chapter 2 was attempted on the main pass AND the bounded sweep — each a short
-    # 3-rung camoufox walk (6 total), and NOT ONE stealth rung was ever reached.
-    ch2_attempts = [s for s in recorded if s in (CAMO, CAMO_FRESH)]
-    assert recorded.count(STEALTH) == 0 and recorded.count(STEALTH_FRESH) == 0
-    # main pass (3) + sweep (3) = 6 bounded camoufox attempts for the one bad chapter
-    # (chapters 1 and 3 add one CAMO each on their single successful attempt).
-    assert recorded.count(CAMO_FRESH) == 2          # one fresh recovery per bounded walk
-    assert ch2_attempts.count(CAMO) >= 4
+    assert sorted(report.failed) == [1, 2]
+    assert report.written == []
+    assert fake.stealth_created == 0          # launch never succeeded
+
+
+def test_sweep_can_use_stealth_fallback(tmp_path, monkeypatch) -> None:
+    """The end-of-run sweep can rescue a chapter via the camoufox→stealth-Chromium
+    fallback: camoufox never clears, stealth clears only on the sweep attempt."""
+    # stealth fails on its first two hits (the main pass), clears on the 3rd (sweep).
+    fake = _FakeBrowsers(
+        camoufox_clears=False,
+        stealth_clears=lambda hit: hit >= 3,
+    )
+    fake.install(monkeypatch)
+    mgr = RequestManager(
+        "ss", use_cache=False, cache_root=tmp_path, max_retries=6,
+        retry_jitter_ratio=0.0, sleep_fn=lambda _s: None,
+    )
+    adapter = _BrowserAdapter(mgr, count=1)
+    report = pipeline.run_scrape(
+        _job(tmp_path, count=1), adapter=adapter, log=lambda _m: None,
+        sleep_fn=lambda _s: None,
+    )
+    # Rescued on the sweep via the stealth fallback; one PDF written; browser reused.
+    assert report.rescued == [1]
+    assert report.failed == []
+    assert len(report.written) == 1
+    assert fake.stealth_created == 1          # the one persistent stealth browser
+    assert len(fake.stealth_nav) >= 3         # main-pass tries + the sweep rescue
 
 
 # ── Overrides ─────────────────────────────────────────────────────────────────
