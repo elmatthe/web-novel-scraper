@@ -1,6 +1,50 @@
 # webnovel-scraper - Handoff
 
 ## Current Focus (newest)
+**0.1.3 headful-camoufox-primary for FreeWebNovel (2026-06-29) — complete on branch
+`feature/v0.1.3-headful-camoufox`; `verify` green at 153 tests; COMMITTED locally
+(commit a2bd1b4). Push was blocked by the session's permission policy — the user
+must run `git push -u origin feature/v0.1.3-headful-camoufox` (no merge, no tag, no
+release).** Pulled the merged 0.1.2 work into `main` first (verify green, 138
+tests), branched, then re-architected the FWN fetch path to match the legacy
+scraper.
+
+**Legacy diff (the key deliverable).** This real clone DOES contain
+`files/legacy-reference/freewebnovel-webscraper.py` (the 0.1.2 pass ran on a non-git
+copy that lacked it). Diffed against the current request layer:
+- CONFIRMED: legacy GUI defaulted `playwright_var=True` + `headless_var=False`
+  (lines 1594–1595) → VISIBLE from request #1.
+- CONFIRMED: `HtmlFetcher.start()` made ONE browser/page; `fetch()` reused
+  `self._page` for every chapter (lines 351–497); `reset_browser()` only on a
+  CF/timeout retry (lines 1311–1352) with a backoff schedule — no per-chapter engine
+  ladder.
+- CONFIRMED: with use_playwright=True (default) it never did HTTP-first; no 6-rung
+  ladder.
+- CONFIRMED: no special header/UA/cookie/warm-up trick — just headful + persistent +
+  one-fetch-per-chapter.
+- CORRECTION: legacy gated camoufox behind `and self.playwright_headless` (line 379),
+  so its DEFAULT VISIBLE engine was headful **stealth-Chromium** (`create_stealth_
+  browser`), not camoufox (camoufox was the headless-only path). The fix is
+  engine-independent; 0.1.3 uses headful **camoufox** as primary (stronger
+  anti-detect; the engine this codebase already warms/reuses).
+
+**What changed.** Defaults flipped (`request_manager.py` `headless=False`;
+`catalog.py` 4 FWN rows `use_browser=True`; `app.py` `DEFAULT_HEADLESS=False`,
+`DEFAULT_BROWSER_MODE=True`, `DEFAULT_HTTP_FIRST=False`). One persistent VISIBLE
+camoufox browser reused across chapters + a once-per-host browser-session warm-up
+(`_warm_camoufox_session` navigates the page to the origin so cf_clearance lands in
+the browser context — the 0.1.2 warm-up only warmed the HTTP session). Bounded
+retries: browser-primary walks `HEADFUL_PRIMARY_LADDER = (camoufox, camoufox,
+camoufox_fresh)` with the budget capped to the ladder length (≤1 fresh recovery), no
+stealth rungs; the end-of-run sweep is one pass and thus auto-bounded. HTTP-first is
+opt-in (`ScrapeJob.http_first` / `RequestManager.try_http_first`, GUI checkbox
+default off). WebNovel-dynamic keeps `use_browser=False` plain-HTTP. New
+`test_headful_camoufox.py` (12); `test_phase2.py` + `test_phase8_gui.py` updated.
+**Honest:** offline tests prove wiring/flow only; live headful-camoufox clearance of
+FWN's CURRENT Cloudflare is UNPROVEN — needs a live pass on chapter 102 (visible
+window opens, stays open/reused, 102 succeeds).
+
+## Current Focus (prior)
 **0.1.2 Cloudflare avoidance + fresh-install fixes (2026-06-29) â€” complete on
 branch `feature/v0.1.2-cf-avoidance`; `verify` green at 138 tests; NOT pushed yet
 (see push status below).** Work-PC run (Shadow Slave 100â€“110, fresh GitHub zip)
@@ -173,6 +217,32 @@ Notes:
 
 ## Work Log (newest first)
 
+- 2026-06-29 - Claude Code (HOME-PC): **0.1.3 headful-camoufox-primary for
+  FreeWebNovel** on new branch `feature/v0.1.3-headful-camoufox`. Pulled merged
+  0.1.2 into `main` (verify green, 138 tests), branched. **Independently diffed the
+  legacy `freewebnovel-webscraper.py` (PRESENT in this real git clone, unlike the
+  0.1.2 non-git copy):** confirmed legacy defaulted to a VISIBLE browser from
+  request #1, ONE persistent browser/page reused per chapter, no HTTP-first, no
+  escalation ladder; corrected one claim — its default-visible engine was headful
+  stealth-Chromium (camoufox was gated behind `and self.playwright_headless`, i.e.
+  headless-only). Built the architecture fix engine-independently with headful
+  camoufox: flipped `RequestManager.headless` default to False, set the 4 FWN catalog
+  rows `use_browser=True`, `app.DEFAULT_HEADLESS=False` + browser-mode default ON;
+  added `HEADFUL_PRIMARY_LADDER`/`HTTP_FIRST_PRIMARY_LADDER` and capped the
+  browser-primary retry budget to the ladder length (≤1 fresh recovery, no stealth
+  storm); added `_warm_camoufox_session` (one-time browser-session origin warm-up,
+  cleared on browser recreation); added the opt-in HTTP-first toggle
+  (`ScrapeJob.http_first` / `RequestManager.try_http_first` / GUI checkbox).
+  WebNovel-dynamic untouched (plain HTTP). New `test_headful_camoufox.py` (12);
+  updated `test_phase2.py` + `test_phase8_gui.py` (old-ladder / headless-default
+  assumptions). `verify` green: **153 passed**. Committed locally (a2bd1b4); the
+  branch push was blocked by the session permission policy, so the user must push it
+  (`git push -u origin feature/v0.1.3-headful-camoufox`); did NOT merge, tag, or
+  release. **Honest:** wiring/flow proven offline; live headful-camoufox
+  clearance of FWN's current Cloudflare unproven — minimal live test is chapter 102
+  with Headless off / HTTP-first off (visible window opens, stays open/reused, 102
+  succeeds). The prior Codex/0.1.2 investigation confirmed the current-code side
+  (HTTP-first + headless + 6-rung ladder) of this root cause.
 - 2026-06-29 - Claude Code (CSPW-PC, work PC): **0.1.2 Cloudflare avoidance +
   fresh-install fixes** on new branch `feature/v0.1.2-cf-avoidance`. **Task 1:**
   could NOT diff the legacy scraper (`files/legacy-reference/` is gitignored and
@@ -423,6 +493,40 @@ Notes:
 ---
 
 ## Session Sync Log (newest first)
+
+### 2026-06-29 - HOME-PC - committed (a2bd1b4); push BLOCKED by session policy
+0.1.3 headful-camoufox-primary for FreeWebNovel, on `feature/v0.1.3-headful-camoufox`
+(branched off the merged-0.1.2 `main`). Committed locally; the user must run
+`git push -u origin feature/v0.1.3-headful-camoufox` (no merge/tag/release).
+
+- Changed: `scripts/Universal/webnovel_scraper/request_manager.py` (headless default
+  False; `try_http_first` param + `_cf_warmed_hosts`; `HEADFUL_PRIMARY_LADDER` +
+  `HTTP_FIRST_PRIMARY_LADDER`; bounded browser-primary ladder + retry cap in
+  `fetch`; `_warm_camoufox_session` + warm-up call in `_fetch_camoufox_once`;
+  `_reset_camoufox` clears warmed hosts).
+- Changed: `scripts/Universal/webnovel_scraper/catalog.py` (4 freewebnovel rows
+  `use_browser=True`).
+- Changed: `scripts/Universal/webnovel_scraper/models.py` (`SiteSpec.use_browser`
+  doc; `ScrapeJob.http_first` + max_retries doc).
+- Changed: `scripts/Universal/webnovel_scraper/pipeline.py` (thread `job.http_first`
+  into the pipeline-built RequestManager).
+- Changed: `scripts/Universal/app.py` (`DEFAULT_HEADLESS=False`,
+  `DEFAULT_BROWSER_MODE=True`, `DEFAULT_HTTP_FIRST=False`; browser default ON; new
+  "Try fast HTTP first" checkbox; relabelled browser/headless checkboxes; wire
+  `http_first` into job + RequestManager; `_refresh_browser_state` manages the new
+  checkbox).
+- Added:   `files/tests/test_headful_camoufox.py` (12 cases).
+- Changed: `files/tests/test_phase2.py` (bounded browser-primary ladder + HTTP-first
+  opt-in cases), `files/tests/test_phase8_gui.py` (headless OFF / browser ON /
+  HTTP-first OFF defaults).
+- Changed: `md-instructions/CHANGELOG.md` (0.1.3 section), `md-instructions/Briefing.md`
+  (new FWN fetch architecture + legacy diff + version), `md-instructions/handoff.md`
+  (this entry, Current Focus, Work Log).
+- Note: `verify` green (153 passed). Committed locally (a2bd1b4); push blocked by
+  the session permission policy — user runs
+  `git push -u origin feature/v0.1.3-headful-camoufox`. NOT merged to main, NOT
+  tagged, NOT released. Live headful-camoufox FWN clearance UNPROVEN — needs the
+  chapter-102 live test.
 
 ### 2026-06-29 - CSPW-PC (work PC) - NOT committed / NOT pushed (no git on this PC)
 0.1.2 Cloudflare avoidance + fresh-install fixes. **git is not installed on

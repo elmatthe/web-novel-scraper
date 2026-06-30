@@ -21,6 +21,7 @@ _CATALOG: list[SiteSpec] = [
         enabled=True,
         url="https://freewebnovel.com/novel/shadow-slave",
         base_url="https://freewebnovel.com",
+        use_browser=True,  # FreeWebNovel is Cloudflare-protected: browser-primary
     ),
     SiteSpec(
         novel_slug="shadow-slave",
@@ -64,6 +65,7 @@ _CATALOG: list[SiteSpec] = [
         enabled=True,
         url="https://freewebnovel.com/novel/reverend-insanity",
         base_url="https://freewebnovel.com",
+        use_browser=True,  # FreeWebNovel is Cloudflare-protected: browser-primary
     ),
     SiteSpec(
         novel_slug="renegade-immortal",
@@ -73,6 +75,7 @@ _CATALOG: list[SiteSpec] = [
         enabled=True,
         url="https://freewebnovel.com/novel/renegade-immortal",
         base_url="https://freewebnovel.com",
+        use_browser=True,  # FreeWebNovel is Cloudflare-protected: browser-primary
     ),
     SiteSpec(
         novel_slug="supreme-magus",
@@ -82,6 +85,7 @@ _CATALOG: list[SiteSpec] = [
         enabled=True,
         url="https://freewebnovel.com/novel/supreme-magus-novel",
         base_url="https://freewebnovel.com",
+        use_browser=True,  # FreeWebNovel is Cloudflare-protected: browser-primary
     ),
 ]
 

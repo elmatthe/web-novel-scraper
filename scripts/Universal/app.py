@@ -47,10 +47,20 @@ _BROWSER_CAPABLE_ADAPTERS = {"freewebnovel"}
 DEFAULT_DELAY = "2.0"
 DEFAULT_TIMEOUT = "30"     # per-request timeout (matches request_manager default)
 DEFAULT_CHUNK = "10"       # chapters per PDF in CHUNKED mode
-# Headless browser ON by default — matches the README ("Leave Headless on unless
-# you want to watch the browser work") so a non-technical user doesn't get a
-# browser window popping up unexpectedly when they enable browser mode.
-DEFAULT_HEADLESS = True
+# Headless browser OFF by default (0.1.3). The FreeWebNovel primary path is a
+# persistent VISIBLE camoufox browser — the legacy-matched configuration Cloudflare
+# clears for (a headless browser is exactly what it blocks). A visible browser
+# window WILL appear during a FreeWebNovel scrape; that is expected (like the old
+# tool). An advanced user can still tick "Headless browser" to force it.
+DEFAULT_HEADLESS = False
+# Browser mode ON by default for Cloudflare-protected sites (FreeWebNovel). The
+# checkbox is only active for browser-capable adapters; for the HTTP-only
+# WebNovel-dynamic it is inert and the browser is never forced.
+DEFAULT_BROWSER_MODE = True
+# "Try fast HTTP first" is OPT-IN (default off): plain HTTP trips FreeWebNovel's
+# Cloudflare, which is the whole reason the browser is primary. When enabled it
+# tries a couple of cheap HTTP rungs before falling back to camoufox.
+DEFAULT_HTTP_FIRST = False
 # Default parent for scraped output: the user's Downloads folder. Resolved via
 # Path.home() so it is platform-neutral (never a hardcoded path). The novel slug
 # (or a custom name) plus a "-N" auto-increment is appended by the pipeline.
@@ -238,25 +248,34 @@ class ScraperApp(tk.Tk):
         # Browser mode + cache toggles.
         opt_frame = ttk.Frame(root)
         opt_frame.grid(row=r, column=0, columnspan=3, sticky="w", **pad)
-        self._browser_var = tk.BooleanVar(value=False)
+        self._browser_var = tk.BooleanVar(value=DEFAULT_BROWSER_MODE)
         self._browser_check = ttk.Checkbutton(
             opt_frame,
-            text="Use Playwright browser mode (optional — forces the browser from the first request)",
+            text="Use browser mode (recommended for Free Web Novel — visible browser, clears Cloudflare)",
             variable=self._browser_var,
             command=self._on_browser_toggle,
         )
         self._browser_check.grid(row=0, column=0, sticky="w")
         self._headless_var = tk.BooleanVar(value=DEFAULT_HEADLESS)
         self._headless_check = ttk.Checkbutton(
-            opt_frame, text="Headless browser", variable=self._headless_var
+            opt_frame,
+            text="Headless browser (advanced — hides the window; usually blocked by Cloudflare)",
+            variable=self._headless_var,
         )
         self._headless_check.grid(row=1, column=0, sticky="w", padx=(20, 0))
+        self._http_first_var = tk.BooleanVar(value=DEFAULT_HTTP_FIRST)
+        self._http_first_check = ttk.Checkbutton(
+            opt_frame,
+            text="Try fast HTTP first (may trip Cloudflare — off by default)",
+            variable=self._http_first_var,
+        )
+        self._http_first_check.grid(row=2, column=0, sticky="w", padx=(20, 0))
         self._cache_var = tk.BooleanVar(value=True)
         self._cache_check = ttk.Checkbutton(
             opt_frame, text="Use HTML cache (resume re-runs)",
             variable=self._cache_var,
         )
-        self._cache_check.grid(row=2, column=0, sticky="w")
+        self._cache_check.grid(row=3, column=0, sticky="w")
         r += 1
 
         # Start / Stop.
@@ -412,9 +431,14 @@ class ScraperApp(tk.Tk):
             capable = False
         self._browser_check.configure(state="normal" if capable else "disabled")
         # Headless only matters when browser mode is both available and on.
-        headless_on = capable and self._browser_var.get()
+        browser_on = capable and self._browser_var.get()
         self._headless_check.configure(
-            state="normal" if headless_on else "disabled"
+            state="normal" if browser_on else "disabled"
+        )
+        # HTTP-first is a modifier on the browser-primary path, so it is only
+        # meaningful for a browser-capable adapter with browser mode on.
+        self._http_first_check.configure(
+            state="normal" if browser_on else "disabled"
         )
 
     def _refresh_start_state(self) -> None:
@@ -449,6 +473,9 @@ class ScraperApp(tk.Tk):
             self._browser_var.get()
             and spec.adapter_key in _BROWSER_CAPABLE_ADAPTERS
         )
+        # HTTP-first only modifies the browser-primary path; it is inert when the
+        # browser is not the primary engine for this run.
+        http_first = bool(self._http_first_var.get()) and spec.use_browser
 
         # Output location: the parent (default ~/Downloads, or a Browse… choice)
         # plus an optional custom name (blank => novel slug). resolve_output_dir
@@ -466,12 +493,14 @@ class ScraperApp(tk.Tk):
             use_cache=self._cache_var.get(),
             output_dir=output_dir,
             chunk_size=chunk,
+            http_first=http_first,
         )
 
         rm = RequestManager(
             slug=spec.novel_slug,
             use_cache=self._cache_var.get(),
             headless=self._headless_var.get(),
+            try_http_first=http_first,
             log_fn=self._thread_log,
             max_retries=job.max_retries,
             retry_base_delay=job.retry_base_delay,

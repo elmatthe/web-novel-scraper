@@ -355,6 +355,7 @@ def run_scrape(
             rm = RequestManager(
                 slug=spec.novel_slug,
                 use_cache=job.use_cache,
+                try_http_first=job.http_first,
                 log_fn=log,
                 max_retries=job.max_retries,
                 retry_base_delay=job.retry_base_delay,

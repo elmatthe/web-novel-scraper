@@ -192,13 +192,16 @@ def test_fetch_escalation_ladder_advances_per_attempt(tmp_path, monkeypatch) -> 
     assert sleeps == [5.0, 15.0, 45.0, 120.0, 120.0]
 
 
-def test_fetch_use_browser_starts_on_browser_ladder(tmp_path, monkeypatch) -> None:
+def test_fetch_use_browser_is_bounded_headful_camoufox(tmp_path, monkeypatch) -> None:
+    """0.1.3: browser-primary (FreeWebNovel default) walks the SHORT bounded
+    headful-camoufox ladder — a couple of same-page retries then ONE fresh-page
+    recovery — and never the six-engine storm (no Chromium playwright-stealth)."""
     sleeps: list[float] = []
     mgr = RequestManager(
         "s",
         use_cache=False,
         cache_root=tmp_path,
-        max_retries=1,
+        max_retries=6,           # generous job budget — the browser path caps itself
         retry_jitter_ratio=0.0,
         sleep_fn=sleeps.append,
     )
@@ -206,23 +209,68 @@ def test_fetch_use_browser_starts_on_browser_ladder(tmp_path, monkeypatch) -> No
 
     def fake_strategy(url, strategy):
         strategies.append(strategy)
-        if len(strategies) == 1:
-            raise RuntimeError("browser blocked")
-        return "<html>browser ok</html>"
+        raise RuntimeError("browser blocked")
 
     monkeypatch.setattr(mgr, "_fetch_uncached_strategy", fake_strategy)
 
+    with pytest.raises(rm.FetchError):
+        mgr.fetch("https://example.com/cf", use_browser=True)
+
+    # Exactly the bounded ladder: camoufox, camoufox (same warmed page), then ONE
+    # camoufox_fresh recovery. NOT the full BROWSER_ESCALATION_LADDER, and no
+    # stealth rungs are ever reached on the browser-primary path.
+    assert strategies == list(rm.HEADFUL_PRIMARY_LADDER)
+    assert strategies == [
+        rm.FETCH_STRATEGY_CAMOUFOX,
+        rm.FETCH_STRATEGY_CAMOUFOX,
+        rm.FETCH_STRATEGY_CAMOUFOX_FRESH,
+    ]
+    # At most ONE fresh-page recovery — the storm-killer guarantee.
+    assert strategies.count(rm.FETCH_STRATEGY_CAMOUFOX_FRESH) == 1
+    assert rm.FETCH_STRATEGY_PLAYWRIGHT_STEALTH not in strategies
+    # Two backoffs between the three bounded attempts (5s, 15s); no 5+ retry storm.
+    assert sleeps == [5.0, 15.0]
+
+
+def test_fetch_browser_first_success_does_not_escalate(tmp_path, monkeypatch) -> None:
+    """A normal successful browser-primary fetch uses ONE camoufox attempt and never
+    escalates to a fresh page — the happy-path reuse the long run depends on."""
+    mgr = RequestManager("s", use_cache=False, cache_root=tmp_path)
+    strategies: list[str] = []
+
+    def fake_strategy(url, strategy):
+        strategies.append(strategy)
+        return "<html>browser ok</html>"
+
+    monkeypatch.setattr(mgr, "_fetch_uncached_strategy", fake_strategy)
     assert mgr.fetch("https://example.com/cf", use_browser=True) == "<html>browser ok</html>"
-    # Browser mode starts on the browser ladder: camoufox first, then camoufox_fresh
-    # (with max_retries=1 only the first two rungs are reached here). The full
-    # browser ladder also ends with the playwright_stealth rescue rungs.
-    assert strategies == list(rm.BROWSER_ESCALATION_LADDER[:2])
-    assert strategies[0] == rm.FETCH_STRATEGY_CAMOUFOX
-    assert rm.BROWSER_ESCALATION_LADDER[-2:] == (
-        rm.FETCH_STRATEGY_PLAYWRIGHT_STEALTH,
-        rm.FETCH_STRATEGY_PLAYWRIGHT_STEALTH_FRESH,
+    assert strategies == [rm.FETCH_STRATEGY_CAMOUFOX]
+
+
+def test_fetch_browser_http_first_opt_in_tries_http_then_camoufox(tmp_path, monkeypatch) -> None:
+    """With try_http_first the browser-primary path tries two cheap HTTP rungs before
+    falling back to the bounded camoufox path (still no stealth storm)."""
+    mgr = RequestManager(
+        "s", use_cache=False, cache_root=tmp_path, try_http_first=True,
+        max_retries=6, retry_jitter_ratio=0.0, sleep_fn=lambda _s: None,
     )
-    assert sleeps == [5.0]
+    strategies: list[str] = []
+
+    def fake_strategy(url, strategy):
+        strategies.append(strategy)
+        raise RuntimeError("blocked")
+
+    monkeypatch.setattr(mgr, "_fetch_uncached_strategy", fake_strategy)
+    with pytest.raises(rm.FetchError):
+        mgr.fetch("https://example.com/cf", use_browser=True)
+    assert strategies == list(rm.HTTP_FIRST_PRIMARY_LADDER)
+    assert strategies == [
+        rm.FETCH_STRATEGY_HTTP,
+        rm.FETCH_STRATEGY_CLOUDSCRAPER,
+        rm.FETCH_STRATEGY_CAMOUFOX,
+        rm.FETCH_STRATEGY_CAMOUFOX_FRESH,
+    ]
+    assert rm.FETCH_STRATEGY_PLAYWRIGHT_STEALTH not in strategies
 
 
 def test_camoufox_fresh_reset_rebuilds_browser(tmp_path, monkeypatch) -> None:

@@ -65,23 +65,28 @@ are skipped quickly so a long run never hangs.
 
 ### Cloudflare handling
 
-Some sources (Free Web Novel especially, and occasionally WebNovel) sit behind
-Cloudflare's bot protection, but you normally don't need to do anything about it.
-A normal download starts on the fast path and **automatically switches to a real
-browser engine** (camoufox, downloaded once during setup — no admin needed)
-whenever Cloudflare actually blocks a page, then goes back to the fast path — so
-most runs need no special setting.
+Free Web Novel sits behind Cloudflare's bot protection, and Cloudflare clears for
+a **real, visible browser** while it blocks hidden (headless) automation. So for
+Free Web Novel the app now uses a real browser engine (camoufox, downloaded once
+during setup — no admin needed) **from the very first request**, in a **visible
+window**. You don't need to change anything — just press Start.
 
-Note that turning browser mode **off does not mean "never use the browser"** — it
-just means *start* on the fast path. The app can still escalate to the browser
-engine on its own when a page is blocked. The browser is a starting choice, not a
-hard cap.
+**A browser window will open and stay open while a Free Web Novel scrape runs.**
+That is expected and is how the download clears Cloudflare (just like the older
+tool). Don't close it; it is reused for every chapter and closes itself when the
+run ends.
 
-**Use Playwright browser mode** is an optional override: it forces the browser
-engine from the very first request instead of only when Cloudflare blocks. It's
-only worth ticking if Cloudflare is actively challenging *every* page and you
-want to skip the quick first attempts on each chapter. Leave **Headless** on
-unless you want to watch the browser work.
+You normally won't touch these checkboxes:
+
+- **Use browser mode** — on by default for Free Web Novel; leave it on.
+- **Headless browser** — *advanced*, off by default. Ticking it hides the window,
+  but Cloudflare usually blocks a hidden browser, so leave it **off**.
+- **Try fast HTTP first** — *advanced*, off by default. It tries a couple of quick
+  no-browser attempts before the browser. Plain HTTP usually trips Cloudflare on
+  Free Web Novel, so leave it **off** unless you're experimenting.
+
+WebNovel (Dynamic) is not behind Cloudflare and uses the fast no-browser path
+automatically — no window appears for it.
 
 ## Where the files go
 

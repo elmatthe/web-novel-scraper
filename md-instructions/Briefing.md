@@ -30,14 +30,26 @@ and never ships. The pytest suite is at `files/tests/`, its fixtures at
   maps `site_key -> adapter`. 0.1.0 ships two enabled adapters (`freewebnovel`,
   `webnovel_dynamic`) and three disabled stubs (`empire_novel`, `novel_bin`, `telegraph`).
 - `request_manager.py` â€” HTTP/browser fetching with configurable per-fetch
-  retries, exponential backoff + jitter, and the ordered Cloudflare escalation
-  ladder `http -> cloudscraper -> camoufox -> camoufox_fresh -> playwright_stealth
-  -> playwright_stealth_fresh` (camoufox leads the browser rungs; the Chromium
-  playwright-stealth rungs are the last-resort rescue after a live FWN challenge was
-  found to defeat camoufox). Only one browser engine is live per thread — the fetch
-  methods tear the other engine down before starting one, so the ladder can walk
-  from camoufox into the stealth rungs within a single chapter's attempts. Plus an
-  on-disk HTML cache and the Cloudflare-aware browser path (`cf_bypass.py`).
+  retries, exponential backoff + jitter, and an on-disk HTML cache. **Two fetch
+  shapes (0.1.3):**
+  - **FreeWebNovel = headful camoufox primary** (`use_browser=True`). The chapter
+    is fetched through ONE persistent, VISIBLE (headless=False) camoufox browser
+    created once per run and reused for every chapter; its session is warmed once
+    per host (`_warm_camoufox_session` navigates the same page to the site origin so
+    Cloudflare seats a `cf_clearance` cookie in the browser context). A blocked
+    chapter walks a SHORT bounded ladder `HEADFUL_PRIMARY_LADDER = (camoufox,
+    camoufox, camoufox_fresh)` — a couple of same-page retries then AT MOST ONE
+    fresh-page recovery (retry budget capped to the ladder length) — never the old
+    six-engine storm. This mirrors the legacy scraper (visible persistent browser,
+    one fetch per chapter) that downloaded whole novels without tripping Cloudflare.
+    With the opt-in `try_http_first` two cheap HTTP rungs precede camoufox.
+  - **Non-Cloudflare / opt-in = HTTP path** (`use_browser=False`, e.g.
+    WebNovel-dynamic). Plain HTTP (with the 0.1.2 homepage warm-up + host-derived
+    Referer/Sec-Fetch-Site) escalating through the legacy
+    `DEFAULT_ESCALATION_LADDER` `http -> cloudscraper -> camoufox -> camoufox_fresh
+    -> playwright_stealth -> playwright_stealth_fresh`. Only one browser engine is
+    live per thread — the fetch methods tear the other engine down before starting
+    one. The Cloudflare-aware browser path lives in `cf_bypass.py`.
 - `cloudflare_detection.py` â€” the one shared `is_cloudflare_challenge` detector
   imported by both `request_manager` and `cf_bypass` (so they cannot drift). Strong
   interstitial markers flag immediately; ambient beacon markers clear only on
@@ -56,17 +68,43 @@ suite in `files/tests/` (a `conftest.py` there puts `scripts/Universal/` on
 `sys.path` so `import webnovel_scraper` resolves).
 
 ## Current Version
-0.1.2 (on branch `feature/v0.1.2-cf-avoidance` â€” pending the user's manual live
-full-run from HOME-PC). Adds HTTP-layer Cloudflare *avoidance* (homepage warm-up
-GET + host-derived Referer/Sec-Fetch-Site on top of the existing persistent
-session/cookie reuse), fixes the Chromium install gap so the playwright-stealth
-rungs can actually launch on a fresh setup (contained in `files/bin/ms-playwright`
-via `PLAYWRIGHT_BROWSERS_PATH`), and makes a browser-launch failure a non-blocking
-immediate skip (no more 100-second freeze). Suite: **138 offline tests**, `verify`
-green. The legacy FreeWebNovel scraper could not be diffed this session â€” it is
-gitignored (`files/legacy-reference/`) and was absent â€” so the avoidance is a
-best-practice implementation, not a confirmed port; live confirmation is the
-user's next full run.
+0.1.3 (on branch `feature/v0.1.3-headful-camoufox` â€” pending the user's manual
+live FWN pass). **Headful-camoufox-primary** rewrite of the FreeWebNovel fetch
+path, matched to the legacy scraper. Root cause of the persistent FWN Cloudflare
+failures, confirmed by diffing the now-present legacy file against the current
+code: the rewrite was HTTP-first + headless + a six-engine ladder, and FWN's
+Cloudflare clears for a *visible real browser* but blocks *headless automation*,
+while the relaunch storm made it more aggressive. 0.1.3 makes FWN run through ONE
+persistent VISIBLE camoufox browser from request #1 (defaults flipped:
+`headless=False`, FWN catalog rows `use_browser=True`, GUI headless OFF / browser
+ON), reused across chapters with a one-time browser-session warm-up, with bounded
+retries (`camoufox, camoufox, camoufox_fresh`, ≤1 fresh recovery) and a bounded
+end-of-run sweep. HTTP-first is now an explicit opt-in toggle (default off);
+WebNovel-dynamic keeps its plain-HTTP fast path. Suite: **153 offline tests**,
+`verify` green. **Honest:** offline tests prove the wiring/flow; whether headful
+camoufox clears FWN's *current* live Cloudflare is unproven until a live run (this
+is the legacy working config, but only a live pass confirms it).
+
+### Legacy diff finding (0.1.3, independently verified)
+This real clone DOES contain `files/legacy-reference/freewebnovel-webscraper.py`
+(the 0.1.2 pass ran on a non-git copy that lacked it). Diffed and confirmed:
+legacy GUI defaulted use_playwright=True + headless=False (VISIBLE from request #1);
+`HtmlFetcher.start()` made ONE browser/page reused by `fetch()` for every chapter;
+no HTTP-first, no escalation ladder; the only "trick" was headful + persistent +
+one-fetch-per-chapter. **Correction:** the legacy gated camoufox behind
+`and self.playwright_headless`, so its *default visible* engine was actually
+headful stealth-Chromium, not camoufox (camoufox was its headless-only path). The
+fix is engine-independent; 0.1.3 uses headful camoufox (stronger anti-detect, and
+the engine this codebase already warms/reuses).
+
+### Prior: 0.1.2 (HTTP-layer Cloudflare avoidance)
+Added HTTP-layer Cloudflare *avoidance* (homepage warm-up GET + host-derived
+Referer/Sec-Fetch-Site on top of persistent session/cookie reuse), fixed the
+Chromium install gap so the playwright-stealth rungs can launch on a fresh setup
+(contained in `files/bin/ms-playwright` via `PLAYWRIGHT_BROWSERS_PATH`), and made a
+browser-launch failure a non-blocking immediate skip (no 100-second freeze).
+Suite: **138 offline tests**. (0.1.2 could not diff the legacy file — it was absent
+from that non-git working copy; 0.1.3 did the diff.)
 
 ### Prior: 0.1.1 (release-ready â€” pending the user's manual live-scrape pass + tag/force-push).
 Phase 9 (live-scrape hardening) and its review fixes are implemented; the 0.1.1
@@ -372,6 +410,29 @@ Suite is **128 offline tests**, `verify` green.
     safety net.
   - New `files/tests/test_cf_avoidance.py` (10 cases). Suite: **138 offline tests**,
     `verify` green.
+- **0.1.3 headful-camoufox-primary for FreeWebNovel (2026-06-29) â€” complete on
+  `feature/v0.1.3-headful-camoufox`:** the legacy file (present in this real clone)
+  was diffed and confirmed the FWN failures came from HTTP-first + headless + a
+  six-engine ladder; FWN clears for a VISIBLE persistent browser and blocks headless
+  automation. Fix: FWN now runs through one persistent VISIBLE camoufox browser from
+  request #1.
+  - **Task 1 â€” defaults flipped.** `RequestManager.headless` `True â†’ False`; the
+    four `freewebnovel` catalog rows set `use_browser=True`; `app.DEFAULT_HEADLESS`
+    `True â†’ False`, browser-mode default ON. GUI/job/spec defaults agree.
+  - **Task 2 â€” one persistent warmed visible browser.** Camoufox browser created
+    once per run and reused for every chapter; new `_warm_camoufox_session` warms the
+    *browser* session once per host (origin GET â†’ cf_clearance in the browser
+    context). A normal success never recreates the browser.
+  - **Task 3 â€” killed the storm.** Browser-primary walks the bounded
+    `HEADFUL_PRIMARY_LADDER = (camoufox, camoufox, camoufox_fresh)` with the retry
+    budget capped to the ladder length (â‰¤1 fresh recovery); the stealth rungs are off
+    the FWN path. The end-of-run sweep is one pass and thus auto-bounded. Failed
+    recording, run-continues, and the auto-slowdown pacer retained.
+  - **Task 4 â€” HTTP-first opt-in.** New GUI "Try fast HTTP first" checkbox (default
+    off) + `ScrapeJob.http_first` / `RequestManager.try_http_first`; WebNovel-dynamic
+    keeps `use_browser=False` plain-HTTP fast path; all 0.1.1/0.1.2 fixes preserved.
+  - New `files/tests/test_headful_camoufox.py` (12 cases); `test_phase2.py` +
+    `test_phase8_gui.py` updated. Suite: **153 offline tests**, `verify` green.
 
 ## Known Issues
 - **WebNovel camoufox rescue (was the open Critical):** the most likely root cause
@@ -381,20 +442,21 @@ Suite is **128 offline tests**, `verify` green.
   dependent and can only be confirmed by the user's manual pass; the code can no
   longer fail a chapter that camoufox *did* clear, and intermittent failures now
   get the relentless ladder + second-pass sweep instead of an immediate skip.
-- **FreeWebNovel Cloudflare — 0.1.2 shifts strategy from FIGHT to AVOID; UNPROVEN
-  live.** Both camoufox (0.1.1) and Chromium stealth were live-proven *insufficient*
-  at *clearing* a real FWN managed challenge. 0.1.2's primary fix is therefore to
-  **avoid triggering the challenge in the first place** at the HTTP layer: a
-  once-per-host homepage warm-up GET (acquires `cf_clearance` into the persistent
-  session before chapters, even on resume runs), a correct host-derived `Referer`
-  (was a hardcoded cross-site `webnovel.com` referer — a bot-tell), and
-  `Sec-Fetch-Site` chaining (`none` → `same-origin`). The browser rungs remain the
-  safety net (now actually launchable per the Chromium install fix, and non-blocking
-  if an engine is missing). **Whether avoidance actually stops the live challenges is
-  unconfirmed** — it could not be validated against the legacy scraper (gitignored/
-  absent) and needs the user's next live full run from HOME-PC. If FWN still
-  challenges, the remaining levers are **headful** browser mode, a **residential
-  proxy**, or `nodriver` (strategy 3 in `cf_bypass.py`, not yet wired).
+- **FreeWebNovel Cloudflare — 0.1.3 adopts the legacy headful-persistent-browser
+  architecture; UNPROVEN live.** Both camoufox (0.1.1) and Chromium stealth were
+  live-proven insufficient at *clearing* a real FWN challenge in HEADLESS automation
+  with a per-chapter relaunch ladder; 0.1.2's HTTP-layer avoidance was unconfirmed.
+  The legacy diff (0.1.3) pinpointed the actual working config: a single VISIBLE
+  persistent browser, one fetch per chapter, no escalation storm. 0.1.3 now does
+  exactly that (headful camoufox primary, reused + warmed, bounded retries). The
+  0.1.2 HTTP avoidance is retained on the opt-in HTTP path. **Whether headful
+  camoufox clears FWN's *current* live Cloudflare is unconfirmed** — this matches
+  the legacy working shape but needs a live pass over a known-bad chapter (e.g.
+  102). A visible browser window WILL appear during a FWN scrape (expected). If it
+  still gets challenged, the next levers are a **residential proxy**, a **manual
+  solve** in the visible window, or `nodriver` (strategy 3, not yet wired). If the
+  visible browser reaches valid HTML but extraction fails, that is a selector/timing
+  issue, not browser mode.
 - Both enabled adapters (`freewebnovel`, `webnovel_dynamic`) are implemented;
   `empire_novel`, `novel_bin`, `telegraph` remain intentional disabled stubs for
   a later version.
@@ -404,7 +466,15 @@ Suite is **128 offline tests**, `verify` green.
   direction.
 
 ## Next Steps
-- **User's manual live pass** (the only thing left for 0.1.0): run the live
+- **0.1.3 minimal live test (do this first).** On the `feature/v0.1.3-headful-camoufox`
+  branch, Headless unchecked, "Try fast HTTP first" off: scrape ONLY chapter 102
+  first. Confirm a visible camoufox window opens and STAYS open (reused, not
+  relaunching per chapter) and that 102 succeeds. If 102 clears, repeat with 175. If
+  the visible browser reaches valid HTML but extraction fails, that is a
+  selector/timing issue, not browser mode. If visible camoufox is still challenged,
+  FWN has hardened — next lever is a residential proxy or a manual solve in the
+  window.
+- **User's manual live pass** (the older 0.1.0 checklist): run the live
   scrapes the release log structures but leaves skipped â€” 3 FreeWebNovel chapters
   across all three output modes (with browser mode for Cloudflare and at least
   one uncached chapter to validate the retry ladder), 3
