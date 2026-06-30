@@ -1,14 +1,15 @@
-"""Phase 8 bug-hunt regression tests for GUI defaults (offline).
+"""Phase 8 / 0.1.3 regression tests for GUI defaults (offline).
 
-Covers fix #2: the "Headless browser" checkbox must default **ON**, matching the
-README ("Leave Headless on unless you want to watch the browser work"), so a
-non-technical user who enables browser mode never gets a browser window popping
-up unexpectedly.
+0.1.3 flips the FreeWebNovel fetch architecture to **headful camoufox primary**:
+the "Headless browser" checkbox now defaults **OFF** (visible) — a visible
+persistent camoufox browser is the legacy-matched config Cloudflare clears for,
+whereas a headless browser is what it blocks. Browser mode defaults **ON** and
+"Try fast HTTP first" defaults **OFF** (opt-in).
 
-The GUI is a thin shell. The deterministic assertion is on the module-level
-``DEFAULT_HEADLESS`` constant (no display needed). An end-to-end check that
-actually instantiates the Tk window is included but **skips automatically when no
-display is available** (e.g. headless CI), so the suite stays deterministic.
+The GUI is a thin shell. The deterministic assertions are on the module-level
+default constants (no display needed). The end-to-end checks that instantiate the
+Tk window **skip automatically when no display is available** (e.g. headless CI),
+so the suite stays deterministic.
 """
 
 from __future__ import annotations
@@ -20,18 +21,28 @@ import pytest
 import app
 
 
-def test_headless_default_constant_is_on() -> None:
-    assert app.DEFAULT_HEADLESS is True
+def test_headless_default_constant_is_off() -> None:
+    # Visible browser by default (0.1.3 headful-camoufox-primary architecture).
+    assert app.DEFAULT_HEADLESS is False
 
 
-def test_headless_checkbox_initialises_on() -> None:
+def test_browser_and_http_first_default_constants() -> None:
+    # FreeWebNovel is browser-primary by default; HTTP-first is opt-in.
+    assert app.DEFAULT_BROWSER_MODE is True
+    assert app.DEFAULT_HTTP_FIRST is False
+
+
+def test_headless_checkbox_initialises_off() -> None:
     tk = pytest.importorskip("tkinter")
     try:
         win = app.ScraperApp()
     except tk.TclError as exc:  # no display (headless CI) — not applicable here
         pytest.skip(f"no Tk display available: {exc}")
     try:
-        assert win._headless_var.get() is True
+        assert win._headless_var.get() is False
+        # Browser mode on, HTTP-first off — GUI defaults agree with the constants.
+        assert win._browser_var.get() is True
+        assert win._http_first_var.get() is False
     finally:
         win.destroy()
 

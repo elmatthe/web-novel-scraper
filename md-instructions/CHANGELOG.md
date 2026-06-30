@@ -3,6 +3,156 @@
 All notable changes to this project are recorded here. Versions follow semantic
 versioning.
 
+## [0.1.3] — 2026-06-29
+
+Headful-browser-primary pass for FreeWebNovel, matched to the legacy scraper. Root
+cause of the persistent FWN Cloudflare failures: the rewrite went **HTTP-first +
+headless + a six-engine escalation ladder**, and FWN's Cloudflare clears for a
+*visible real browser* but blocks *headless automation* — and the relaunch storm
+made it more aggressive. The legacy scraper avoided all of this by running one
+persistent VISIBLE browser, one fetch per chapter. This release adopts that
+architecture as a **bounded two-engine headful ladder**: headful camoufox primary
+(persistent, warmed, reused), then a bounded fallback to **headful stealth-Chromium**
+— the exact legacy visible engine — when camoufox can't clear a chapter, with no
+return to the relaunch storm.
+
+### Legacy diff (independently verified this session)
+Unlike the 0.1.2 pass (whose non-git working copy lacked the gitignored legacy
+file), this real clone contains `files/legacy-reference/freewebnovel-webscraper.py`,
+so the claims were checked against it:
+- **Confirmed.** The legacy GUI defaulted `playwright_var=BooleanVar(value=True)`
+  and `headless_var=BooleanVar(value=False)` (lines 1594–1595) — a VISIBLE browser
+  from request #1.
+- **Confirmed.** `HtmlFetcher.start()` created ONE browser+context+page and
+  `fetch()` reused that same `self._page` for every chapter (lines 351–497). The
+  only recreation was `reset_browser()` on a Cloudflare/timeout retry (lines
+  1311–1352), with a backoff schedule — never a per-chapter engine ladder.
+- **Confirmed.** With `use_playwright=True` (the default) the legacy went straight
+  to the browser branch and never did HTTP-first; there was no 6-rung escalation
+  ladder.
+- **Confirmed (no special trick).** No bespoke header/UA/cookie/warm-up scheme —
+  the working ingredient was simply *headful + persistent + one-fetch-per-chapter*.
+- **One correction.** The legacy gated camoufox behind `and self.playwright_headless`
+  (line 379), so in its **default visible** config it actually used **headful
+  stealth-Chromium** (`create_stealth_browser`), not camoufox — camoufox was its
+  *headless-only* path. The architectural fix (headful + persistent + reuse) is
+  engine-independent. 0.1.3 uses **headful camoufox** as the primary engine (stronger
+  anti-detect, and the one this codebase already warms/reuses) **and then falls back
+  to headful stealth-Chromium** — the exact engine the legacy scraper's visible
+  default used, the one historically proven to clear FWN's Cloudflare — when camoufox
+  can't clear a chapter. Best of both, still bounded.
+
+### Changed — headful camoufox is the primary, default FreeWebNovel fetch path
+- **Defaults flipped to visible browser-primary.** `RequestManager.headless`
+  default `True → False` (request_manager.py); the four FreeWebNovel catalog rows
+  now carry `use_browser=True` (catalog.py) so a FWN scrape runs through camoufox
+  in a VISIBLE window from request #1; the GUI "Headless browser" checkbox defaults
+  **OFF** (`app.DEFAULT_HEADLESS True → False`) and browser mode defaults **ON**
+  (`DEFAULT_BROWSER_MODE`). GUI, job, and spec defaults agree. A visible camoufox
+  window WILL appear during a FWN scrape — expected, like the old tool.
+- **One persistent warmed VISIBLE browser, reused across chapters.** The camoufox
+  browser+context+page is created once per run and reused for every chapter (the
+  existing lazy `_ensure_camoufox_page` reuse). New `_warm_camoufox_session`:
+  before the first chapter on a host, the same page navigates to the site origin so
+  Cloudflare seats a `cf_clearance` cookie in the **browser** context (the 0.1.2
+  warm-up only warmed the HTTP session). Warm-up is once per host per browser,
+  best-effort, and cleared when the browser is recreated. A normal successful
+  chapter fetch never recreates the browser/context/page.
+- **Bounded TWO-engine headful ladder (camoufox → stealth-Chromium).**
+  Browser-primary fetches walk a SHORT bounded ladder
+  `HEADFUL_PRIMARY_LADDER = (camoufox, camoufox, camoufox_fresh, playwright_stealth)`
+  — a couple of same-page camoufox retries, ONE fresh-camoufox recovery, then ONE
+  escalation to **headful stealth-Chromium** (`cf_bypass.create_stealth_browser` /
+  `fetch_with_stealth`, run VISIBLE) — with the retry budget capped to the ladder
+  length in `fetch` (**per-chapter cap: 4 attempts**, or 5 with HTTP-first). This
+  brings back ONLY the legacy's proven engine, not the storm: there is no
+  `playwright_stealth_fresh`, no cloudscraper/http on the default browser path. The
+  stealth-Chromium engine obeys the contained `PLAYWRIGHT_BROWSERS_PATH →
+  files/bin/ms-playwright` (the Chromium the launcher already installs) and a
+  missing/unlaunchable Chromium is an immediate non-blocking strategy failure (no
+  100-second freeze; chapter recorded, run continues). **Stealth engine is
+  persistent + reused:** once camoufox is exhausted for the run (a chapter reached
+  the stealth rung), a latch (`_camoufox_exhausted`) routes later chapters and sweep
+  retries straight to the one persistent stealth-Chromium browser
+  (`STEALTH_LATCHED_LADDER`, ≤2 same-page attempts) — never relaunched per chapter
+  (required because the two engines' sync-Playwright loops cannot coexist on a
+  thread, so replaying camoufox between fallbacks would force a Chromium relaunch).
+  The end-of-run sweep is unchanged (one pass over non-permanent failures) and is
+  therefore bounded; it now also gets the camoufox→stealth-Chromium fallback.
+  Failed-chapter recording, run-continues resilience, and the auto-slowdown pacer are
+  all retained.
+- **HTTP-first is now explicit opt-in.** All HTTP/cloudscraper code is kept. A new
+  GUI checkbox "Try fast HTTP first (may trip Cloudflare)" defaults **OFF**
+  (`ScrapeJob.http_first` / `RequestManager.try_http_first`); when enabled the
+  browser-primary path tries two cheap HTTP rungs before camoufox
+  (`HTTP_FIRST_PRIMARY_LADDER`). Non-Cloudflare paths are untouched:
+  WebNovel-dynamic stays `use_browser=False` on its plain-HTTP fast path, and the
+  legacy `DEFAULT_ESCALATION_LADDER` (with the stealth rescue rungs) still backs
+  the non-browser path. All 0.1.1/0.1.2 fixes (brotli, EmptyExtractionError,
+  output-folder, non-blocking launch, contained Chromium, HTTP warm-up, resumable
+  pipeline, three output modes, PDF build, catalog) are preserved.
+
+### Fixed — premature read + cleared-page CF misdetection on the camoufox FWN path
+A live chapter-102 test proved (visually, on screen) that headful camoufox **does**
+clear FreeWebNovel's Cloudflare challenge — the real chapter rendered in the window —
+yet the scraper logged "Cloudflare challenge still present after camoufox fetch" on
+every attempt, retried, then hung on the stealth rung. The browser had the real
+content; the scraper threw it away. Root cause was **detection/timing, not bypass**:
+- **Cleared-page misdetection (primary).** The shared `cloudflare_detection.has_real_payload`
+  structural check (Phase 9D, built for WebNovel) only recognized WebNovel's containers
+  plus two *incidental* FWN wrapper classes (`.m-read` and the brittle `class="txt"`
+  exact-substring). It had **no knowledge of FreeWebNovel's actual primary content
+  container, `<div id="article">`**. On a live camoufox-cleared FWN chapter — which
+  still carries Cloudflare's ambient `/cdn-cgi/challenge-platform/` beacon, and whose
+  `class="txt"` substring does not survive Firefox serialization / inline-style /
+  multi-class variance — `has_real_payload` returned `False`, the ambient beacon then
+  tripped `is_cloudflare_challenge → True`, and the fetched chapter was discarded at
+  `request_manager._fetch_camoufox_once`. The saved fixtures never reproduced it
+  because they were captured *without* the ambient beacon. **Fix:** the shared detector
+  is now content-aware for FWN — `#article` (the adapter's stable id-based container,
+  both quote styles) plus the FWN body selectors were added to the structural
+  real-payload check, with a **non-trivial-text guard** (`_MIN_BODY_TEXT_CHARS`) so an
+  empty `<div id="article"></div>` shell on a challenge template never false-clears.
+  The change only ever makes the detector recognize *more* real content — it cannot
+  newly flag a page that previously cleared.
+- **Premature read / wait-for-clearance (secondary).** `cf_bypass.fetch_camoufox` now
+  POLLS positively for the real chapter DOM: it breaks the moment `has_real_payload`
+  is true (even with the ambient beacon still present) and otherwise keeps waiting
+  while the page still looks like a challenge — so capture never happens during the
+  post-clearance transitional window where the interstitial is gone but the body has
+  not yet rendered. A non-chapter origin GET (session warm-up) still returns promptly.
+- **Net effect:** with both fixes, a chapter camoufox clears on screen now WRITES on
+  the first camoufox attempt — no escalation, no stealth hang. The stealth-Chromium
+  fallback (already bounded + firm-timeout) remains the last resort but should rarely
+  fire on FWN now.
+
+### Tests / docs
+- `files/tests/test_camoufox_cleared_detection.py` (NEW, 6 offline cases): the exact
+  live regression — a cleared FWN page with `#article` body **plus** the ambient
+  beacon is classified CLEARED by both detector re-export sites and the browser fetch
+  succeeds on a single camoufox attempt (no escalation); `fetch_camoufox` **waits**
+  through transitional empty-body reads and captures only the populated chapter; a
+  genuine interstitial is still flagged and still escalates (retryable); an empty
+  `#article` shell with only the ambient beacon is still a challenge (text guard).
+- `files/tests/test_headful_camoufox.py` (now 20 offline cases, both engines mocked
+  at the `cf_bypass` + `sync_playwright` seams — no real launch): FWN browser-primary
+  + visible + HTTP-first-off defaults agree; camoufox created ONCE and warmed once on
+  the happy path; a normal success is a single camoufox attempt; a blocked chapter
+  escalates to the stealth-Chromium fallback **exactly once** (per-chapter cap 4);
+  the stealth fallback is **headful** (headless=False asserted) and its browser is
+  **created once per run and reused** across multiple fallback chapters (run latch);
+  a stealth Chromium launch failure is non-blocking (no backoff, chapter recorded,
+  run continues); the end-of-run sweep can rescue via the camoufox→stealth fallback;
+  headless can be forced; HTTP-first can be opted in; the non-browser path stays on
+  HTTP. Updated `test_phase2.py` (bounded two-engine ladder + HTTP-first-opt-in) and
+  `test_phase8_gui.py` (headless OFF / browser ON / HTTP-first OFF). Suite: **163
+  offline tests**, `verify` green.
+- **Honest status:** offline tests prove the wiring/flow only. With the detection/timing
+  fix above, the next live chapter-102 test should show **chapter 102 WRITE on the first
+  camoufox attempt** (the browser already clears it on screen) — no escalation, no hang.
+  If a chapter ever genuinely cannot clear live, the stealth-Chromium fallback is still
+  there, and the last lever is a residential proxy or a manual solve in the visible window.
+
 ## [0.1.2] — 2026-06-29
 
 Cloudflare-avoidance pass driven by a live work-PC run (Shadow Slave, chapters

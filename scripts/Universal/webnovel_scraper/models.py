@@ -48,7 +48,10 @@ class SiteSpec:
     url: str                   # the novel index / catalog URL on this site
     book_id: str | None = None        # site's own book id (e.g. webnovel_dynamic)
     url_template: str | None = None    # optional chapter-URL template, "{n}" slot
-    use_browser: bool = False          # default HTTP path; browser only on CF challenge
+    use_browser: bool = False          # True -> browser-primary (headful camoufox
+    #                                    from request #1, the FreeWebNovel default in
+    #                                    0.1.3). False -> HTTP path (e.g. the
+    #                                    Cloudflare-free WebNovel-dynamic site).
     base_url: str = ""                 # site origin, e.g. "https://freewebnovel.com"
     chapter_count: int | None = None   # authoritative chapter-count override (else
     #                                    derived from the index page's highest number)
@@ -117,12 +120,18 @@ class ScrapeJob:
     use_cache: bool
     output_dir: Path
     chunk_size: int = 10       # chapters per PDF when output_mode is CHUNKED
-    # Relentless per-chapter retry (Phase 9C): retries AFTER the first attempt, so
-    # 6 means up to 7 escalating attempts per chapter before it is recorded failed.
-    # On top of this, the pipeline runs a second-pass sweep over the failed list
-    # once the main range completes. Generous on purpose for long unattended runs.
+    # Per-chapter retry budget (retries AFTER the first attempt) for the NON-browser
+    # (HTTP / opt-in) path. The browser-primary path (FreeWebNovel default) ignores
+    # this and caps itself to its short bounded ladder (a couple of same-page
+    # retries + ≤1 fresh-page recovery) so it never replays the six-engine storm.
+    # On top of either, the pipeline runs ONE second-pass sweep over the failed
+    # list once the main range completes.
     max_retries: int = 6
     retry_base_delay: float = 5.0
+    # Opt-in: try two cheap HTTP rungs before camoufox on the browser-primary path.
+    # Default False — plain HTTP trips FreeWebNovel's Cloudflare, which is exactly
+    # why the browser is primary. Threaded into the RequestManager as try_http_first.
+    http_first: bool = False
 
     def __repr__(self) -> str:
         return (

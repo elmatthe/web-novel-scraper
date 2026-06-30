@@ -61,7 +61,10 @@ logger = logging.getLogger(__name__)
 # The Cloudflare challenge detector is shared with request_manager via the
 # ``cloudflare_detection`` module so the two can never drift. ``is_cloudflare_
 # challenge`` is re-exported below for callers that import it from cf_bypass.
-from .cloudflare_detection import is_cloudflare_challenge  # noqa: E402
+from .cloudflare_detection import (  # noqa: E402
+    has_real_payload,
+    is_cloudflare_challenge,
+)
 
 # Point Chromium / playwright-stealth at the contained in-repo browser cache the
 # launcher installs into (files/bin/ms-playwright), even when started outside the
@@ -505,9 +508,19 @@ def fetch_camoufox(
 
     Leaner than :func:`fetch_with_stealth`: it relies on Camoufox's own anti-detect
     fingerprint + humanization to clear Cloudflare's managed challenge and only
-    polls page content until it stops looking like a challenge (or ``cf_timeout``
+    polls page content until the real chapter DOM appears (or ``cf_timeout``
     elapses). No turnstile-clicking or extra mouse simulation — those both slow the
     fetch ~10x and are unnecessary for Camoufox, which clears the challenge cold.
+
+    The poll WAITS for clearance rather than reading too early: a freshly-cleared
+    Cloudflare page goes through a transitional window where the interstitial is
+    gone but the real chapter body has not yet rendered. Capturing then would
+    discard a chapter the browser was about to show. So the loop keeps polling
+    while the page still looks like a challenge AND breaks the moment a real,
+    populated chapter-body container is present — even if Cloudflare's ambient
+    ``/cdn-cgi/challenge-platform/`` beacon is still in the page (the cleared-page
+    false-flag this guards against). It returns whatever is on the page once the
+    real content appears or the timeout elapses.
     """
     _log = log_fn or logger.info
     response = page.goto(url, wait_until=wait_until, timeout=nav_timeout)
@@ -517,8 +530,18 @@ def fetch_camoufox(
 
     deadline = time.time() + cf_timeout
     html = _safe_page_content(page)
-    while is_cloudflare_challenge(html) and time.time() < deadline:
-        page.wait_for_timeout(1500)
+    while time.time() < deadline:
+        # Real chapter DOM present → done, ambient beacon notwithstanding. This is
+        # the positive wait-for-content the live FWN bug needed.
+        if has_real_payload(html):
+            break
+        # Otherwise keep waiting only while the page still looks like a challenge
+        # (interstitial markers, or an ambient beacon with no real payload yet). A
+        # page that is neither a challenge nor content-bearing (e.g. a non-chapter
+        # origin GET used for session warm-up) breaks out promptly.
+        if not is_cloudflare_challenge(html):
+            break
+        page.wait_for_timeout(1000)
         html = _safe_page_content(page)
     return html
 
