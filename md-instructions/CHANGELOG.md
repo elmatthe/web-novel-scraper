@@ -3,6 +3,74 @@
 All notable changes to this project are recorded here. Versions follow semantic
 versioning.
 
+## [0.2.1] — Unreleased
+
+- Reusing an output folder for a different novel/site no longer silently mixes
+  TOCs and content: `chapter_index.json` now records the novel, adapter, and
+  source-site identity. If the saved index belongs to a different target, the run
+  logs a warning and automatically rebuilds the TOC for the current novel instead
+  of trusting stale data.
+
+### Fixed — FreeWebNovel chapters addressed by URL slug instead of the site's displayed number
+On some FreeWebNovel novels (confirmed: Supreme Magus), the URL slug in
+`.../chapter-N` counts every page — real chapters plus joke-chapter/glossary
+extras and fractional ".x" side-chapters — while the page header displays the
+author's own numbering. The scraper used the slug as the chapter number, so a
+user typing a displayed chapter number (e.g. 4207) fetched the wrong page
+(slug 4207 displays "Chapter 4192"; the page that actually displays "Chapter
+4207" lives at slug 4222). The offset is not constant — it grows from 2 to 15
+across Supreme Magus and keeps growing as the author publishes more inserts —
+so a fixed per-novel offset was ruled out by measurement.
+
+- **Addressing is now by the site's DISPLAYED chapter number**, not the URL
+  slug. `ChapterMeta`/`ChapterContent.index` mean the displayed number
+  everywhere downstream (filenames, resume matching, the range clamp, PDF
+  headings, `RunReport`); a new `ChapterMeta.slug` field carries the URL slug
+  the adapter actually fetches. `index` is `int | float`: fractional
+  side-chapters ("Chapter 627.2") are kept as their own addressable label
+  under a unique name, sorting naturally between their integer neighbours.
+  Unnumbered/negative extras (a joke chapter, a "Chapter -1" volume glossary)
+  are skipped and logged — no longer silently emitted as a degraded
+  "Chapter N."
+- **Auto-detected per novel, zero extra cost for the common case.**
+  `build_chapter_index` already fetches the index/TOC page to discover the
+  chapter count; that same page's anchors carry both the URL slug and the
+  site's own "Chapter N: Title" text, so identity vs. offset is decided from
+  that SAME fetch — no dedicated probe, no extra network call — for every
+  novel where slug and displayed number already agree (Shadow Slave, Reverend
+  Insanity, Renegade Immortal): output is byte-identical to before, proven by
+  a test asserting the fetch count is unchanged. Only a genuinely offset novel
+  pays a resolution cost: a binary search over the monotone displayed(slug)
+  relationship anchors near the requested range, then a padded per-page walk
+  reconciles each chapter's real displayed number (fetched HTML is cached and
+  reused by the content fetch, so the walk and the real fetch are one network
+  hit per chapter, not two).
+- **The user's requested chapter range bounds the resolution walk.** The
+  pipeline now passes the requested start/end through to
+  `build_chapter_index` as hints, so a live run on an offset novel jumps near
+  the requested range instead of scanning unbounded from slug 1 (a ~4400-slug
+  novel's full-novel walk would otherwise cost ~4400 extra fetches before any
+  content is written). Every other adapter (and every existing test fake) is
+  unaffected — the pipeline only forwards the hints when the adapter's own
+  method declares them, so nothing outside FreeWebNovel's code changed shape.
+- **`chapter_index.json` schema bumped to v2** (rows now carry `slug`) —
+  ANY older index (including a v1 file whose identity still matches) is
+  rebuilt on the next resume rather than trusted, since old rows are
+  slug-space with no slug column at all. One logged TOC re-fetch per affected
+  output folder, then it resumes correctly from then on.
+- New fixtures: sanitized live Supreme Magus captures (`files/test-files/fwn_sm_*.html`)
+  covering the offset regression (slug 4222 → displayed "Chapter 4207"), a
+  fractional side-chapter (slug 630 → "Chapter 627.2"), and the unnumbered
+  joke-chapter/glossary extras. New `files/tests/test_chapter_number_offset.py`
+  covers the model, the fixtures, identity zero-extra-fetch, binary search +
+  bounded walk (including an end-to-end pipeline-level proof that a live-shaped
+  request near a high chapter number stays bounded), and the
+  `_discover_max_chapter` slug-vs-displayed fallback fix.
+- See `md-instructions/DECISIONS.md` for the full reasoning (why `index` means
+  the displayed number, why identity detection is free, why the walk is
+  bounded, why the schema bump supersedes the 0.2.1 legacy-index-trust
+  allowance above).
+
 ## [0.2.0] — 2026-06-30
 
 Fast-primary scraping with a **single background hard-chapter rescue lane**. The

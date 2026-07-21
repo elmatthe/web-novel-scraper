@@ -17,8 +17,9 @@ Design points the plan pins down:
   advances when the injected ``sleep`` runs).
 * **Initial effective interval = max(HOST_MIN_INTERVAL, job.delay)** — set by the
   caller — so a user delay of 10s actually spaces at 10s, not the 3s floor.
-* **Fair / FIFO / no-starvation** via a ticket deque: the front waiter always wins
-  the next slot, so no thread is starved by a busier one.
+* **Fair / FIFO / no-starvation** via a per-host ticket deque: the front waiter
+  for a host always wins that host's next slot, so no thread is starved by a
+  busier one and unrelated hosts do not block each other.
 * The lock is **not held during the wait** — a waiting thread sleeps outside the
   critical section, so reserving the next slot stays cheap.
 * **Positive jitter only**, added *after* the interval (never shortens spacing).
@@ -91,7 +92,7 @@ class HostRateLimiter:
         self._default_cooldown = max(0.0, float(default_cooldown))
 
         self._cond = threading.Condition(threading.Lock())
-        self._waiters: Deque[object] = collections.deque()
+        self._waiters: Dict[str, Deque[object]] = {}
         self._next_allowed: Dict[str, float] = {}
         self._blocked_until: Dict[str, float] = {}
 
@@ -153,7 +154,7 @@ class HostRateLimiter:
         host = normalize_host(url)
         ticket = object()
         with self._cond:
-            self._waiters.append(ticket)
+            self._waiters.setdefault(host, collections.deque()).append(ticket)
             self._cond.notify_all()
         try:
             while True:
@@ -164,7 +165,8 @@ class HostRateLimiter:
                         f"Rate-limiter wait cancelled before navigating {url}"
                     )
                 with self._cond:
-                    is_front = self._waiters[0] is ticket
+                    queue = self._waiters.get(host)
+                    is_front = bool(queue) and queue[0] is ticket
                     now = self._monotonic()
                     allowed_at = max(
                         self._next_allowed.get(host, 0.0),
@@ -172,7 +174,9 @@ class HostRateLimiter:
                     )
                     if is_front and now >= allowed_at:
                         self._next_allowed[host] = now + self._interval + self._jitter()
-                        self._waiters.popleft()
+                        queue.popleft()
+                        if not queue:
+                            self._waiters.pop(host, None)
                         self._cond.notify_all()
                         return
                     wait_for = (allowed_at - now) if is_front else _NON_FRONT_POLL
@@ -186,10 +190,14 @@ class HostRateLimiter:
         except BaseException:
             # Never leave a dangling ticket (it would starve the queue forever).
             with self._cond:
-                try:
-                    self._waiters.remove(ticket)
-                except ValueError:
-                    pass
+                queue = self._waiters.get(host)
+                if queue is not None:
+                    try:
+                        queue.remove(ticket)
+                    except ValueError:
+                        pass
+                    if not queue:
+                        self._waiters.pop(host, None)
                 self._cond.notify_all()
             raise
 

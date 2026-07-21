@@ -29,6 +29,7 @@ network.
 from __future__ import annotations
 
 import collections
+import inspect
 import json
 import logging
 import re
@@ -67,6 +68,12 @@ from .request_manager import (
 logger = logging.getLogger(__name__)
 
 INDEX_FILENAME = "chapter_index.json"
+# v2 (fix-chapter-number-offset): rows carry the URL ``slug`` alongside ``index``,
+# and ``index`` means the site's DISPLAYED chapter number (fractional side-chapters
+# are floats). Older files (v1 dicts and pre-identity bare lists) hold slug-space
+# indexes with no slug column, so they are stale by meaning, not just by shape —
+# the loader rebuilds them rather than trusting them.
+INDEX_SCHEMA_VERSION = 2
 
 # ── 0.2.0 circuit-breaker thresholds (pipeline-owned, headless-only — §3.9) ───
 # The breaker watches PRIMARY network results and, when headless mode is broadly
@@ -289,39 +296,189 @@ def resolve_output_dir(
     return root / f"{name}-{n}"
 
 
-# ── Chapter-index persistence (pipeline-level, output-dir scoped) ─────────────
-def _save_index(index_path: Path, metas: list[ChapterMeta]) -> None:
-    index_path.parent.mkdir(parents=True, exist_ok=True)
-    payload = [
+def _index_identity(spec: SiteSpec) -> dict:
+    """Identity for an output-dir chapter index.
+
+    ``novel_slug`` is the catalog's canonical per-novel id; paired with the
+    adapter and source URLs it prevents a reused output folder from silently
+    driving a run from another novel/site's TOC.
+    """
+    return {
+        "novel_slug": spec.novel_slug,
+        "adapter_key": spec.adapter_key,
+        "source_url": spec.url,
+        "base_url": spec.base_url,
+    }
+
+
+def _identity_summary(identity: Optional[dict]) -> str:
+    if not identity:
+        return "(unknown legacy index)"
+    return (
+        f"novel_slug={identity.get('novel_slug')!r}, "
+        f"adapter_key={identity.get('adapter_key')!r}, "
+        f"source_url={identity.get('source_url')!r}, "
+        f"base_url={identity.get('base_url')!r}"
+    )
+
+
+def _chapter_rows(metas: list[ChapterMeta]) -> list[dict]:
+    return [
         {
             "index": m.index,
             "url": m.url,
             "title": m.title,
             "source_id": m.source_id,
+            "slug": m.slug,
         }
         for m in metas
     ]
+
+
+def _index_number(value: object) -> int | float:
+    """Normalize a persisted chapter index: ints stay ints, fractional
+    side-chapter numbers stay floats (627.2), and an integral float collapses
+    back to int so a round-trip can never turn "Chapter 627" into "627.0"."""
+    if isinstance(value, bool):
+        raise TypeError("chapter index cannot be a bool")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value) if value.is_integer() else value
+    raise TypeError(f"chapter index must be numeric, got {type(value).__name__}")
+
+
+def _metas_from_rows(rows: object) -> Optional[list[ChapterMeta]]:
+    if not isinstance(rows, list) or not rows:
+        return None
+    try:
+        return [
+            ChapterMeta(
+                index=_index_number(d["index"]),
+                url=str(d["url"]),
+                title=d.get("title"),
+                source_id=d.get("source_id"),
+                slug=None if d.get("slug") is None else int(d["slug"]),
+            )
+            for d in rows
+        ]
+    except Exception:
+        return None
+
+
+# ── Chapter-index persistence (pipeline-level, output-dir scoped) ─────────────
+def _save_index(index_path: Path, metas: list[ChapterMeta], spec: SiteSpec) -> None:
+    index_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema_version": INDEX_SCHEMA_VERSION,
+        "identity": _index_identity(spec),
+        "chapters": _chapter_rows(metas),
+    }
     index_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
-def _load_index(index_path: Path) -> Optional[list[ChapterMeta]]:
+def _load_index(
+    index_path: Path,
+    spec: SiteSpec,
+    *,
+    log: Optional[LogFn] = None,
+) -> Optional[list[ChapterMeta]]:
     if not index_path.is_file():
         return None
     try:
         raw = json.loads(index_path.read_text(encoding="utf-8"))
     except Exception:
         return None
-    if not isinstance(raw, list) or not raw:
+    if isinstance(raw, list):
+        # Pre-identity bare-list index (pre-0.2.1). Schema v2 changed what
+        # ``index`` MEANS (displayed number, not URL slug) and added the slug
+        # column, so these old rows can silently point at the wrong chapters on
+        # an offset novel — rebuild instead of trusting them. (Supersedes the
+        # 0.2.1 "legacy lists remain trusted" allowance; one TOC re-fetch, logged.)
+        if log is not None:
+            log(
+                "NOTE: chapter_index.json uses the old pre-identity format; "
+                "rebuilding the TOC under the current schema."
+            )
         return None
-    return [
-        ChapterMeta(
-            index=int(d["index"]),
-            url=str(d["url"]),
-            title=d.get("title"),
-            source_id=d.get("source_id"),
-        )
-        for d in raw
-    ]
+    if not isinstance(raw, dict):
+        return None
+
+    version = raw.get("schema_version")
+    if version != INDEX_SCHEMA_VERSION:
+        # Old-schema dict (v1): rows are slug-space with no slug column — same
+        # staleness-by-meaning as the bare list above. Rebuild, don't trust.
+        if log is not None:
+            log(
+                f"NOTE: chapter_index.json schema v{version!r} is older than the "
+                f"current v{INDEX_SCHEMA_VERSION}; rebuilding the TOC."
+            )
+        return None
+
+    found = raw.get("identity")
+    if isinstance(found, dict):
+        expected = _index_identity(spec)
+        if found != expected:
+            if log is not None:
+                log(
+                    "WARNING: chapter_index.json belongs to a different novel/site; "
+                    "rebuilding the TOC for the current run. "
+                    f"Expected {_identity_summary(expected)}; "
+                    f"found {_identity_summary(found)}."
+                )
+            return None
+
+    # Missing identity in a dict-shaped file is also unknown/trusted for upgrade
+    # compatibility; only an actual identity mismatch forces a rebuild.
+    return _metas_from_rows(raw.get("chapters"))
+
+
+# ── fix-chapter-number-offset: bounded-window TOC hints ──────────────────────
+# An end this large is effectively "no upper bound" (app.py's ALL_CHAPTERS
+# sentinel is 10**9; this threshold is comfortably below that and far above any
+# real chapter count), so it is passed through as ``None`` — a real end_hint
+# this large would otherwise make FreeWebNovelAdapter's binary search converge
+# on the whole discovered slug range anyway, but only after a handful of wasted
+# probe fetches; treating it as "no hint" up front skips that waste for free.
+_UNBOUNDED_END_THRESHOLD = 10**6
+
+
+def _end_hint_for(job: ScrapeJob) -> Optional[int]:
+    return None if job.end >= _UNBOUNDED_END_THRESHOLD else job.end
+
+
+def _build_chapter_index(
+    adapter: object,
+    spec: SiteSpec,
+    *,
+    fast_path: Optional[bool] = None,
+    start_hint: Optional[int] = None,
+    end_hint: Optional[int] = None,
+) -> list[ChapterMeta]:
+    """Call ``adapter.build_chapter_index``, passing ``fast_path``/``start_hint``/
+    ``end_hint`` ONLY when the adapter's own method actually accepts them.
+
+    Every non-FreeWebNovel adapter (and every test fake across the suite) still
+    implements the plain ``BaseAdapter`` contract, ``(self, spec)`` — this keeps
+    every one of those working completely unchanged. Only ``FreeWebNovelAdapter``
+    declares ``start_hint``/``end_hint`` (fix-chapter-number-offset Phase 2), so
+    only it receives the user's requested range — letting its offset-resolution
+    binary search + walk jump near the request instead of scanning unbounded
+    from slug 1 on a genuinely offset novel. Introspection, not a broad
+    try/except, so a real ``TypeError`` raised from inside the call is never
+    silently swallowed."""
+    try:
+        params = inspect.signature(adapter.build_chapter_index).parameters
+    except (TypeError, ValueError):
+        params = {}
+    kwargs: dict = {}
+    if fast_path is not None and "fast_path" in params:
+        kwargs["fast_path"] = fast_path
+    if "start_hint" in params:
+        kwargs["start_hint"] = start_hint
+    if "end_hint" in params:
+        kwargs["end_hint"] = end_hint
+    return adapter.build_chapter_index(spec, **kwargs)  # type: ignore[attr-defined]
 
 
 # ── Filename helpers ─────────────────────────────────────────────────────────
@@ -334,18 +491,24 @@ def _stem_for(spec: SiteSpec) -> str:
 
 def _separate_pdf_name(content: ChapterContent) -> str:
     """The SEPARATE-mode filename: ``safe_filename(heading).pdf``."""
-    return BaseAdapter.safe_filename(content.heading) + ".pdf"
+    stem = BaseAdapter.safe_filename(content.heading).rstrip(".") or "untitled"
+    return stem + ".pdf"
 
 
-def _existing_separate_pdf(output_dir: Path, index: int) -> Optional[Path]:
+def _existing_separate_pdf(output_dir: Path, index: int | float) -> Optional[Path]:
     """Find an already-written SEPARATE PDF for chapter ``index`` without
     fetching. Every heading begins with ``Chapter N`` followed by a non-digit
     (``:`` → ``_`` after ``safe_filename``, or ``.`` when degraded), so the index
     can be matched off the filename alone — that is what makes resume skip the
-    network for chapters already on disk."""
+    network for chapters already on disk.
+
+    The ``(?!\\.\\d)`` guard stops an integer lookup (627) from matching a
+    FRACTIONAL side-chapter's file (``Chapter 627.2_ ....pdf``) — without it the
+    two would collide, since "627" is a valid prefix of "627.2\""""
     if not output_dir.is_dir():
         return None
-    pat = re.compile(rf"^Chapter\s+{index}(?:[^0-9].*)?\.pdf$", re.IGNORECASE)
+    num = re.escape(str(index))
+    pat = re.compile(rf"^Chapter\s+{num}(?!\.\d)(?:[^0-9].*)?\.pdf$", re.IGNORECASE)
     for p in sorted(output_dir.glob("*.pdf")):
         if pat.match(p.name):
             return p
@@ -429,8 +592,16 @@ class _PrimaryEngine:
         self.manager = self._mf(headless=headless)
         self.adapter = self._af(self.manager)
 
-    def build_toc(self) -> list[ChapterMeta]:
-        return self.adapter.build_chapter_index(self.runtime_spec, fast_path=True)  # type: ignore[attr-defined]
+    def build_toc(
+        self, *, start_hint: Optional[int] = None, end_hint: Optional[int] = None
+    ) -> list[ChapterMeta]:
+        return _build_chapter_index(
+            self.adapter,
+            self.runtime_spec,
+            fast_path=True,
+            start_hint=start_hint,
+            end_hint=end_hint,
+        )
 
     def fetch(self, meta: ChapterMeta) -> ChapterContent:
         return self.adapter.fetch_chapter(meta, self.runtime_spec, fast_path=True)  # type: ignore[attr-defined]
@@ -962,14 +1133,14 @@ def _run_with_rescue(
         # 3. TOC bootstrap (§3.11) — runs BEFORE the pool/breaker engage. A persisted
         #    index (resume) is loaded instead of refetched.
         index_path = output_dir / INDEX_FILENAME
-        metas = _load_index(index_path)
+        metas = _load_index(index_path, runtime_spec, log=log)
         if metas is None:
-            metas = _bootstrap_toc(primary, spec, report, log, run_cancel)
+            metas = _bootstrap_toc(primary, spec, report, log, run_cancel, job)
             if not metas:
                 report.warnings.append("The chapter index came back empty; nothing to do.")
                 _collect_warnings(primary.adapter, report)
                 return report
-            _save_index(index_path, metas)
+            _save_index(index_path, metas, runtime_spec)
             log(f"  discovered {len(metas)} chapters; saved {INDEX_FILENAME}.")
         else:
             log(f"  loaded {len(metas)} chapters from {INDEX_FILENAME} (resume).")
@@ -1050,13 +1221,23 @@ def _bootstrap_toc(
     report: RunReport,
     log: LogFn,
     run_cancel: threading.Event,
+    job: ScrapeJob,
 ) -> list[ChapterMeta]:
     """Build the TOC on the primary mode; on a headless Cloudflare block, switch the
     primary visible and retry ONCE; if that still fails, abort cleanly (§3.11). A TOC
-    request is NEVER handed to chapter rescue (it has no ``ChapterMeta``)."""
+    request is NEVER handed to chapter rescue (it has no ``ChapterMeta``).
+
+    The user's requested ``[start, end]`` is passed through as bounded-window
+    hints (fix-chapter-number-offset Phase 3) so a genuinely offset FreeWebNovel
+    novel's binary search + reconciliation walk jumps near the requested range
+    instead of scanning unbounded from slug 1 — a no-op for every identity novel
+    and for every non-FWN adapter (``_build_chapter_index`` only forwards the
+    hints when the adapter's own method declares them)."""
+    start_hint = job.start
+    end_hint = _end_hint_for(job)
     log("Building chapter index (TOC) …")
     try:
-        return primary.build_toc()
+        return primary.build_toc(start_hint=start_hint, end_hint=end_hint)
     except ScrapeCancelled:
         raise
     except ChallengeFetchError as exc:
@@ -1068,7 +1249,7 @@ def _bootstrap_toc(
             primary.switch_to_visible()
             report.primary_switched_visible = True
             try:
-                return primary.build_toc()
+                return primary.build_toc(start_hint=start_hint, end_hint=end_hint)
             except ScrapeCancelled:
                 raise
             except Exception as exc2:
@@ -1218,15 +1399,20 @@ def _drive(
 ) -> RunReport:
     # 3. TOC: load a persisted index (resume) or build + persist it.
     index_path = output_dir / INDEX_FILENAME
-    metas = _load_index(index_path)
+    metas = _load_index(index_path, spec, log=log)
     if metas is None:
         log("Building chapter index (TOC) …")
-        metas = adapter.build_chapter_index(spec)  # type: ignore[attr-defined]
+        # Bounded-window hints (fix-chapter-number-offset Phase 3): a no-op for
+        # every adapter except FreeWebNovelAdapter, which uses them to bound its
+        # offset-resolution walk to near the requested range.
+        metas = _build_chapter_index(
+            adapter, spec, start_hint=job.start, end_hint=_end_hint_for(job)
+        )
         if not metas:
             report.warnings.append("The chapter index came back empty; nothing to do.")
             _collect_warnings(adapter, report)
             return report
-        _save_index(index_path, metas)
+        _save_index(index_path, metas, spec)
         log(f"  discovered {len(metas)} chapters; saved {INDEX_FILENAME}.")
     else:
         log(f"  loaded {len(metas)} chapters from {INDEX_FILENAME} (resume).")

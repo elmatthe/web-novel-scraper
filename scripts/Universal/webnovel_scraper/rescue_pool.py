@@ -275,10 +275,14 @@ class RescuePool:
 
     # ── public lifecycle ──────────────────────────────────────────────────────
     def start(self) -> "RescuePool":
-        if self._thread is not None:
-            return self
-        self._thread = threading.Thread(target=self._run, name="rescue-worker", daemon=self._daemon)
-        self._thread.start()
+        with self._lock:
+            if self._thread is not None:
+                return self
+            thread = threading.Thread(
+                target=self._run, name="rescue-worker", daemon=self._daemon
+            )
+            self._thread = thread
+        thread.start()
         return self
 
     @property

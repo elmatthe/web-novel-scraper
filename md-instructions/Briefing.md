@@ -24,7 +24,10 @@ and never ships. The pytest suite is at `files/tests/`, its fixtures at
 `files/test-files/`. Clean module boundaries under
 `scripts/Universal/webnovel_scraper/`:
 - `models.py` â€” normalized dataclasses (`SiteSpec`, `ChapterMeta`, `ChapterContent`,
-  plus `OutputMode` and `ScrapeJob`).
+  plus `OutputMode` and `ScrapeJob`). **0.2.1:** `ChapterMeta`/`ChapterContent.index`
+  mean the site's DISPLAYED chapter number (`int | float`, fractional for FWN's
+  ".x" side-chapters); `ChapterMeta.slug` carries the URL slug the adapter
+  actually fetches (see DECISIONS.md #003).
 - `catalog.py` â€” the Novel/Site matrix; single source of truth for GUI + pipeline.
 - `adapters/` â€” one module per site behind a `BaseAdapter` ABC (`base.py`); a registry
   maps `site_key -> adapter`. 0.1.0 ships two enabled adapters (`freewebnovel`,
@@ -137,6 +140,13 @@ rescue lane — is unproven and is exactly what the manual live pass (Pass A det
 baseline, Pass B headless architecture; see Next Steps) answers. Cancellation note: Stop /
 window-close is prompt *between* polls/attempts; an in-flight `page.goto` may still run to
 its own navigation timeout before the worker exits.
+
+**0.2.1 (Unreleased, in progress)** layers on top of 0.2.0: the `chapter_index.json`
+novel/site identity gate, and the **FreeWebNovel chapter-number-offset fix** — chapters are
+now addressed by the site's DISPLAYED number, not the URL slug (see the "What Has Been
+Built" entry below and `md-instructions/DECISIONS.md` for the full reasoning). A separate
+0.2.1 bug-hunt pass may be in flight alongside this; see `handoff.md` for the current
+combined state before assuming 0.2.1's scope is final.
 
 ### Prior: 0.1.3 (headful-camoufox-primary for FreeWebNovel)
 **Headful-camoufox-primary** rewrite of the FreeWebNovel fetch path, matched to the legacy
@@ -537,6 +547,60 @@ Suite is **128 offline tests**, `verify` green.
     `test_phase1_rescue_core.py`/`test_phase2_rescue_pool.py`/`test_phase3_rescue_conductor.py`/`test_phase4_gui.py`.
     Suite: **229 offline tests** (`verify` green: 228 passed, 1 expected no-Tk-display skip).
     No commit, no tag, no date until the live pass.
+
+- **0.2.1 FreeWebNovel chapter-number-offset fix (Unreleased) — complete.**
+  Some FreeWebNovel novels (confirmed: Supreme Magus) number the URL slug
+  (`.../chapter-N`) differently from the number the page HEADER displays — the
+  slug counts every page (real chapters plus joke-chapter/glossary extras and
+  fractional ".x" side-chapters), while the header shows the author's own
+  numbering. A user typing a displayed chapter number therefore fetched the
+  wrong page; the offset is not constant (measured 2 → 15 across Supreme
+  Magus, still growing), ruling out a fixed per-novel value. Implemented in
+  three phases, each verified before the next:
+  - **Phase 1 — model + fixtures.** `ChapterMeta`/`ChapterContent.index` now
+    mean the DISPLAYED chapter number (`int | float` — fractional side-chapters
+    like "Chapter 627.2" are kept as their own label); a new `ChapterMeta.slug`
+    field carries the URL slug the adapter fetches. `chapter_index.json`
+    schema bumped 1 → 2 (rows carry `slug`); any older payload — including a
+    v1 file whose identity still matches — is rebuilt rather than trusted,
+    since old rows are slug-space with no slug column. Sanitized live Supreme
+    Magus fixtures added (`files/test-files/fwn_sm_*.html`): the offset
+    regression (slug 4222 → displayed "Chapter 4207"), a fractional
+    side-chapter (slug 630 → "Chapter 627.2"), the joke-chapter/glossary
+    extras, and an index-page slice.
+  - **Phase 2 — offset resolution in `freewebnovel.py`.** Identity vs. offset
+    is auto-detected FOR FREE from the same index-page fetch
+    `build_chapter_index` already makes (its anchors carry both the URL slug
+    and the site's own "Chapter N: Title" text) — an identity novel (Shadow
+    Slave, Reverend Insanity, Renegade Immortal) costs zero extra fetches and
+    is byte-identical to before, proven by a test whose `FakeRM` registers no
+    chapter URLs at all. A genuinely offset novel resolves via a binary search
+    over the monotone displayed(slug) relationship, then a padded per-page
+    walk that reconciles each chapter's real displayed number, skipping
+    unnumbered/negative extras (logged) and keeping fractional labels; fetched
+    HTML is cached and reused by the content fetch (one network hit per
+    chapter, not two). `_existing_separate_pdf`'s resume matcher gained a
+    guard so an integer lookup (627) can't collide with a fractional file
+    (`Chapter 627.2_....pdf`). `_discover_max_chapter` gained a three-tier
+    href fallback (strict → loosened → displayed-text-with-a-warning) so it
+    never silently trusts a displayed-space count as the slug count.
+  - **Phase 3 — pipeline wiring + docs.** The user's requested `[start, end]`
+    now reaches `build_chapter_index` as bounded-window hints from BOTH
+    pipeline call sites (the rescue-conductor's TOC bootstrap and the legacy
+    `_drive` path), via a small `_build_chapter_index` helper that uses
+    `inspect.signature` to pass the hints only when an adapter's own method
+    declares them — every other adapter and test fake (a dozen-plus across the
+    suite) is untouched. A live run on an offset novel now jumps near the
+    requested range instead of scanning unbounded from slug 1. This
+    `DECISIONS.md`/`Changelog.md`/`Briefing.md`/`handoff.md` pass, plus a
+    one-line forward-compat note on the three disabled stub adapters.
+  - New `files/tests/test_chapter_number_offset.py` (24 cases): the model,
+    the fixtures, identity zero-extra-fetch, fractional parsing + resume
+    non-collision, binary search + bounded walk (unit AND an end-to-end
+    `pipeline.run_scrape` proof that a live-shaped request near a high chapter
+    number stays bounded), and the `_discover_max_chapter` fallback fix. See
+    `md-instructions/DECISIONS.md` (new) for the full reasoning behind each
+    design choice.
 
 ## Known Issues
 - **(0.2.0) Headless-primary clearance of FreeWebNovel â€” the open live question.**

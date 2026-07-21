@@ -3,8 +3,9 @@
 This is a *thin shell* over the already-tested package modules: the catalog
 drives the dropdowns, and a Start press builds a :class:`ScrapeJob`, resolves
 the output directory via :func:`pipeline.resolve_output_dir`, and hands the job
-to :func:`pipeline.run_scrape` on a daemon thread. Stop sets a
-``threading.Event`` the pipeline/request-manager honour between chapters.
+to :func:`pipeline.run_scrape` on a non-daemon worker thread. Stop sets a
+``threading.Event`` the pipeline/request-manager honour between chapters; window
+close polls until the worker exits before destroying the Tk root.
 
 No scraping, parsing, or PDF logic lives here — all of that is in the
 ``webnovel_scraper`` package and is covered by the offline test suite. The GUI
@@ -73,7 +74,7 @@ CLOSE_POLL_MS = 50
 
 
 class ScraperApp(tk.Tk):
-    """The single scraper window. All real work happens on a daemon thread."""
+    """The single scraper window. All real work happens on a non-daemon worker."""
 
     def __init__(self) -> None:
         super().__init__()
