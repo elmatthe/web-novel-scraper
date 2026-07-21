@@ -16,6 +16,10 @@ build/
 .claude/
 .codex/
 
+# ── Per-machine workspace config: gitignored ON PURPOSE (see AI-WORKSPACE.md's own
+#    "Dependency and Environment Rules" section) ──────────────────────────────
+AI-WORKSPACE.md
+
 # ── Environment ──────────────────────────────────────────────────────────────
 .env
 
