@@ -49,7 +49,7 @@ may warn you the **first** time you run it ("Windows protected your PC"). Click
 2. Set the **start** and **end** chapter (leave the end blank to grab everything).
 3. Set the **Delay between fetches (seconds)** — this is your anti-detection /
    politeness control. Higher is slower but less likely to be blocked; the default
-   (2 seconds) is a good balance. If the site starts blocking mid-run the app also
+   (3 seconds) is a good balance. If the site starts blocking mid-run the app also
    **raises this delay automatically** to back off, then keeps going.
 4. Choose how to save the chapters:
    - **Separate** — one PDF per chapter

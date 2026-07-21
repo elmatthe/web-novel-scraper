@@ -2,6 +2,11 @@
 
 Known shape: a single flat all-volumes page, structurally unlike a paginated
 TOC. Listed in the GUI (greyed) until a real implementation lands here.
+
+Note for whoever implements this: check whether Telegra.ph's chapter numbering
+(if any) can drift from any URL/slug numbering the same way FreeWebNovel's does
+(see fix-chapter-number-offset, models.py's ``ChapterMeta.index``/``slug``
+split) before assuming the two always agree.
 """
 
 from __future__ import annotations

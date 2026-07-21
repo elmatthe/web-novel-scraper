@@ -29,12 +29,23 @@ logger = logging.getLogger(__name__)
 
 # ── Title / chapter-number regexes (ported) ──────────────────────────────────
 # Accepts colon, dash, or bare-whitespace separators between the number and the
-# title, and allows an empty title (the bare-breadcrumb case).
+# title, and allows an empty title (the bare-breadcrumb case). The number may be
+# fractional ("Chapter 627.2" — FreeWebNovel's side-chapter inserts); a bare
+# trailing dot ("Chapter 100. The End") is NOT a fraction and stays title junk.
 CHAPTER_TITLE_RE = re.compile(
-    r"\bChapter\s+(\d+)(?:\s*[:\-]\s*|\s+)?(.*)$", re.IGNORECASE
+    r"\bChapter\s+(\d+(?:\.\d+)?)(?:\s*[:\-]\s*|\s+)?(.*)$", re.IGNORECASE
 )
 # Looser "Chapter N" finder for index-page link text.
 CHAPTER_LIST_TEXT_RE = re.compile(r"\bChapter\s+(-?\d+)\b", re.IGNORECASE)
+# Anchor-text number for (slug ↔ displayed) pair harvesting: also fractional and
+# negative ("Chapter -1 Volume 2 Glossary" marks a non-chapter insert page).
+_ANCHOR_NUM_RE = re.compile(r"\bChapter\s+(-?\d+(?:\.\d+)?)\b", re.IGNORECASE)
+
+
+def _parse_chapter_number(raw: str) -> int | float:
+    """"627" → 627 (int); "627.2" → 627.2 (float). Fractional side-chapter
+    numbers stay floats so they sort between their integer neighbours."""
+    return float(raw) if "." in raw else int(raw)
 
 # FreeWebNovel injects zero-width / format / non-breaking-space characters
 # between words (notably U+200C Zero-Width Non-Joiner in Reverend Insanity
@@ -94,6 +105,19 @@ _BODY_CONTAINER_SELECTORS = (
 # A discovered chapter count below this for a "known long novel" is suspicious
 # and is surfaced as a warning (never silently trusted).
 _COMPLETENESS_MIN = 10
+
+# ── fix-chapter-number-offset: displayed-number addressing (Phase 2) ─────────
+# Key under which a walk/probe fetch's HTML is cached on ``ChapterMeta.extra`` so
+# ``fetch_chapter`` can reuse it instead of re-fetching the same page a second
+# time (offset-resolution reconciliation and content-fetch become ONE network
+# hit per chapter, not two).
+_PREFETCHED_HTML_KEY = "_prefetched_html"
+
+# Padding (in slugs) added around a binary-search-resolved anchor before/after
+# the walk, absorbing a local run of insert pages (Supreme Magus has a run of
+# five between slugs 629 and 635) so the true boundary isn't missed by a
+# couple of slugs when a caller supplies start_hint/end_hint.
+_WALK_PADDING = 8
 
 
 def _ws(text: str) -> str:
@@ -209,11 +233,12 @@ def _candidate_title_texts(soup: BeautifulSoup) -> list[str]:
 
 
 def _normalize_heading_line(
-    raw: str, fallback_num: Optional[int]
-) -> tuple[Optional[int], str]:
+    raw: str, fallback_num: Optional[int | float]
+) -> tuple[Optional[int | float], str]:
     """Return ``(chapter_number, title_only)``. ``title_only`` is the trimmed
     title text (site junk removed) or ``""`` for a bare-number heading. Returns
-    ``(None, "")`` when the text is not a chapter heading at all."""
+    ``(None, "")`` when the text is not a chapter heading at all. ``chapter_number``
+    is a float for a fractional side-chapter ("Chapter 627.2" → 627.2)."""
     raw = _ws(raw)
     m = CHAPTER_TITLE_RE.search(raw)
     if not m:
@@ -221,7 +246,7 @@ def _normalize_heading_line(
             return fallback_num, ""
         return None, ""
 
-    number = int(m.group(1))
+    number = _parse_chapter_number(m.group(1))
     title = _ws(m.group(2))
 
     # Site-junk trimming only (NOT rewording).
@@ -234,8 +259,8 @@ def _normalize_heading_line(
 
 
 def _extract_title(
-    soup: BeautifulSoup, fallback_num: Optional[int]
-) -> tuple[Optional[int], str]:
+    soup: BeautifulSoup, fallback_num: Optional[int | float]
+) -> tuple[Optional[int | float], str]:
     """Two-pass: prefer a candidate with BOTH a number and a non-empty title;
     fall back to a title-less (bare-breadcrumb) candidate only if nothing
     better exists. Robust to render variation between scrapes."""
@@ -364,24 +389,46 @@ class FreeWebNovelAdapter(BaseAdapter):
 
     # ── contract ─────────────────────────────────────────────────────────────
     def build_chapter_index(
-        self, spec: SiteSpec, *, fast_path: bool = False
+        self,
+        spec: SiteSpec,
+        *,
+        fast_path: bool = False,
+        start_hint: Optional[int | float] = None,
+        end_hint: Optional[int | float] = None,
     ) -> list[ChapterMeta]:
-        """Discover the complete chapter list (TOC-first).
+        """Discover the complete chapter list (TOC-first), addressed by the
+        site's DISPLAYED chapter number (fix-chapter-number-offset).
 
         **Approach B — generated URLs (the legacy bug fix).** The legacy
         scraper looked chapter URLs up in the map parsed from the landing page,
         but FreeWebNovel's index renders only a *slice* of the full list, so any
         chapter in the unrendered gap was silently dropped (the 2261–2327 bug).
+        The index page is used ONLY to learn the highest SLUG (the "newest
+        chapters" widget reliably shows the latest chapter), and chapter URLs
+        are *generated* from a template over ``1..count`` slugs — gap-free by
+        construction.
 
-        Instead, the index page is used ONLY to learn the highest chapter number
-        (the "newest chapters" widget reliably shows the latest chapter), and
-        the chapter URLs are then *generated* from a template over ``1..count``.
-        This is gap-free by construction — ``range(1, count + 1)`` cannot skip a
-        middle chapter regardless of what the landing page rendered.
+        ``spec.chapter_count`` overrides the discovered slug count when set
+        (and a disagreement is surfaced as a warning, never silently honoured).
 
-        ``spec.chapter_count`` overrides the discovered count when set (and a
-        disagreement with the index's highest number is surfaced as a warning,
-        never silently honoured).
+        **Identity-vs-offset (probe-gated, per-novel auto-detected):** most
+        FreeWebNovel novels number slugs and displayed chapters identically. The
+        SAME index-page fetch already made above usually reveals this for FREE —
+        its rendered anchors carry both the URL slug and "Chapter N: Title" link
+        text, so comparing them costs no extra network call. Only when the index
+        page's anchor text is uninformative does one extra probe fetch decide
+        identity vs. offset (rare — real FreeWebNovel TOC pages are informative).
+        An IDENTITY novel returns the exact same generated list as before (zero
+        extra fetches, byte-identical output). An OFFSET novel (confirmed:
+        Supreme Magus) walks forward reconciling each page's ACTUAL displayed
+        number — fractional ".x" side-chapters keep their fractional label,
+        unnumbered/negative extras (joke chapters, glossaries) are skipped and
+        logged. ``start_hint``/``end_hint`` (displayed-space, both optional) let
+        a caller bound that walk to the requested range via a binary search over
+        the monotone displayed(slug) relationship, padded to absorb a local
+        cluster of inserts; omitted, the walk covers the whole discovered slug
+        range (this repo's pipeline does not thread them yet — see Phase 3 note
+        in the fix drop).
         """
         rm = self._manager(spec)
         # ``fast_path`` (0.2.0 §3.11): the conductor builds the TOC under the bounded
@@ -393,7 +440,8 @@ class FreeWebNovelAdapter(BaseAdapter):
             html = rm.fetch(spec.url, use_browser=spec.use_browser, fast_path=True)
         else:
             html = rm.fetch(spec.url, use_browser=spec.use_browser)
-        discovered = self._discover_max_chapter(html, spec)
+        soup = BeautifulSoup(html, "html.parser")
+        discovered, pairs = self._scan_index_page(soup, spec)
 
         if spec.chapter_count is not None:
             count = spec.chapter_count
@@ -417,39 +465,220 @@ class FreeWebNovelAdapter(BaseAdapter):
                 "suspiciously low for a full novel; verify the index page"
             )
 
-        return [
-            ChapterMeta(index=n, url=chapter_url_for(spec, n))
-            for n in range(1, count + 1)
-        ]
+        def _identity_list() -> list[ChapterMeta]:
+            # ``slug`` records the URL slug number each meta is fetched at.
+            # ``index`` equals ``slug`` here — the identity/no-op case.
+            return [
+                ChapterMeta(index=n, url=chapter_url_for(spec, n), slug=n)
+                for n in range(1, count + 1)
+            ]
 
-    def _discover_max_chapter(
-        self, html: str, spec: SiteSpec
-    ) -> Optional[int]:
-        soup = BeautifulSoup(html, "html.parser")
+        if pairs and all(slug == disp for slug, disp in pairs):
+            return _identity_list()
+
+        # Cache of slug -> (html, displayed_number) so a page fetched to decide
+        # identity/resolve the anchor is never fetched again by the walk below.
+        known: dict[int, tuple[str, Optional[int | float]]] = {}
+
+        if not pairs:
+            # Index page gave no free (slug, displayed) evidence at all — one
+            # probe fetch decides identity vs. offset. This is the ONLY case
+            # that costs an extra fetch beyond the index page itself.
+            probe_slug = 1
+            if start_hint is not None:
+                probe_slug = max(1, min(int(round(start_hint)), count))
+            probe_num = self._fetch_and_read(rm, spec, probe_slug, known)
+            if probe_num == probe_slug:
+                return _identity_list()
+            self._warn(
+                f"{spec.novel_slug!r}: URL slug and displayed chapter number "
+                f"disagree (slug {probe_slug} displays "
+                f"{probe_num!r}) — addressing by displayed number."
+            )
+        else:
+            # ≥1 harvested pair disagreed — offset confirmed for free.
+            mismatch = next((p for p in pairs if p[0] != p[1]), pairs[0])
+            self._warn(
+                f"{spec.novel_slug!r}: URL slug and displayed chapter number "
+                f"disagree (slug {mismatch[0]} displays "
+                f"{mismatch[1]!r}) — addressing by displayed number."
+            )
+
+        # ── OFFSET path: resolve the walk window, then reconcile per page ────
+        if start_hint is None and end_hint is None:
+            walk_lo, walk_hi = 1, count
+        else:
+            anchor = self._resolve_slug_for_displayed(
+                rm, spec, start_hint if start_hint is not None else 1, 1, count, known
+            )
+            walk_lo = max(1, anchor - _WALK_PADDING)
+            if end_hint is None:
+                walk_hi = count
+            else:
+                end_anchor = self._resolve_slug_for_displayed(
+                    rm, spec, end_hint, anchor, count, known
+                )
+                walk_hi = min(count, end_anchor + _WALK_PADDING)
+
+        return self._walk_and_reconcile(rm, spec, walk_lo, walk_hi, known)
+
+    def _scan_index_page(
+        self, soup: BeautifulSoup, spec: SiteSpec
+    ) -> tuple[Optional[int], list[tuple[int, int | float]]]:
+        """One pass over the index page's anchors: the highest SLUG (for
+        ``range()`` generation) plus every (slug, displayed) pair where an
+        anchor's own href AND visible text both carry a chapter number — free
+        evidence for the identity-vs-offset decision, no extra fetch."""
         link_re = _chapter_link_re(spec)
         base = spec.base_url or spec.url
         numbers: list[int] = []
+        pairs: list[tuple[int, int | float]] = []
 
         for a in soup.find_all("a", href=True):
             href = _normalize_url(a["href"], base)
             m = link_re.search(href)
-            if m:
-                numbers.append(int(m.group(1)))
+            if not m:
+                continue
+            slug = int(m.group(1))
+            numbers.append(slug)
+            tm = _ANCHOR_NUM_RE.search(_ws(a.get_text(" ", strip=True)))
+            if tm:
+                pairs.append((slug, _parse_chapter_number(tm.group(1))))
 
         if not numbers:
-            # Fallback: scan link text for "Chapter N".
+            # Loosened href fallback: any "/chapter-N" path segment, regardless
+            # of the exact index-URL path — still slug-space (from the URL
+            # itself), just less strictly scoped to this novel's own links.
+            loose_re = re.compile(r"/chapter-(\d+)(?:[/?#]|$)", re.IGNORECASE)
+            for a in soup.find_all("a", href=True):
+                m = loose_re.search(a["href"])
+                if m:
+                    numbers.append(int(m.group(1)))
+
+        if not numbers:
+            # Last resort: anchor TEXT is DISPLAYED-space, not slug-space, so on
+            # an offset novel this count would UNDERSHOOT the true slug count —
+            # never trusted silently.
             for a in soup.find_all("a"):
                 m = CHAPTER_LIST_TEXT_RE.search(_ws(a.get_text(" ", strip=True)))
                 if m:
                     n = int(m.group(1))
                     if n >= 1:
                         numbers.append(n)
+            if numbers:
+                self._warn(
+                    f"{spec.novel_slug!r}: chapter count derived from displayed "
+                    "link text, not URL slugs — may undershoot the true slug "
+                    "count on an offset novel"
+                )
 
-        return max(numbers) if numbers else None
+        discovered = max(numbers) if numbers else None
+        return discovered, pairs
+
+    def _discover_max_chapter(
+        self, html: str, spec: SiteSpec
+    ) -> Optional[int]:
+        """Back-compat wrapper (still used directly by existing tests)."""
+        discovered, _pairs = self._scan_index_page(
+            BeautifulSoup(html, "html.parser"), spec
+        )
+        return discovered
+
+    @staticmethod
+    def _fetch_and_read(
+        rm,
+        spec: SiteSpec,
+        slug: int,
+        known: dict[int, tuple[str, Optional[int | float]]],
+    ) -> Optional[int | float]:
+        """Fetch (or reuse a cached) page for ``slug`` and return its displayed
+        number, caching ``(html, number)`` in ``known`` so neither the binary
+        search, the walk, nor a later ``fetch_chapter`` call ever re-fetches it."""
+        if slug not in known:
+            html = rm.fetch(chapter_url_for(spec, slug), use_browser=spec.use_browser)
+            num, _title = _extract_title(BeautifulSoup(html, "html.parser"), None)
+            known[slug] = (html, num)
+        return known[slug][1]
+
+    def _resolve_slug_for_displayed(
+        self,
+        rm,
+        spec: SiteSpec,
+        target: int | float,
+        lo: int,
+        hi: int,
+        known: dict[int, tuple[str, Optional[int | float]]],
+    ) -> int:
+        """Binary search over the monotone (non-decreasing) displayed(slug)
+        relationship for the LOWEST slug whose displayed number is >= target —
+        the first page addressing that chapter. An unparseable page (extras
+        read as ``None``) is treated as "below target" so the search steps past
+        it rather than stalling. This only needs to be approximately right: the
+        caller pads the result and the per-page walk is the authoritative
+        reconciliation."""
+        best = hi
+        while lo < hi:
+            mid = (lo + hi) // 2
+            num = self._fetch_and_read(rm, spec, mid, known)
+            if num is not None and num >= target:
+                best = mid
+                hi = mid
+            else:
+                lo = mid + 1
+        return best if best is not None else lo
+
+    def _walk_and_reconcile(
+        self,
+        rm,
+        spec: SiteSpec,
+        walk_lo: int,
+        walk_hi: int,
+        known: dict[int, tuple[str, Optional[int | float]]],
+    ) -> list[ChapterMeta]:
+        """Walk slugs ``walk_lo..walk_hi`` in order, reading each page's ACTUAL
+        displayed chapter number. Fractional numbers are kept as their own
+        label; a page with no parseable positive number (joke chapter, negative
+        "Volume Glossary" extras) is skipped and logged, not emitted as a
+        degraded "Chapter N." — that silent mislabel is what this fix removes.
+        Fetched HTML is cached on the returned meta's ``extra`` so
+        ``fetch_chapter`` never re-fetches the same page."""
+        metas: list[ChapterMeta] = []
+        skipped = 0
+        for slug in range(walk_lo, walk_hi + 1):
+            num = self._fetch_and_read(rm, spec, slug, known)
+            html = known[slug][0]
+            if num is None:
+                skipped += 1
+                self._warn(
+                    f"{spec.novel_slug!r}: skipping slug {slug} (no parseable "
+                    "positive chapter number — joke/glossary extra)."
+                )
+                continue
+            metas.append(
+                ChapterMeta(
+                    index=num,
+                    url=chapter_url_for(spec, slug),
+                    slug=slug,
+                    extra={_PREFETCHED_HTML_KEY: html},
+                )
+            )
+        metas.sort(key=lambda m: m.index)
+        if skipped:
+            self._log(
+                f"{spec.novel_slug!r}: resolved {len(metas)} chapter(s) by "
+                f"displayed number over slugs {walk_lo}-{walk_hi} "
+                f"({skipped} extra page(s) skipped)."
+            )
+        return metas
 
     def fetch_chapter(
         self, meta: ChapterMeta, spec: SiteSpec, *, fast_path: bool = False
     ) -> ChapterContent:
+        prefetched = meta.extra.get(_PREFETCHED_HTML_KEY) if meta.extra else None
+        if prefetched is not None:
+            # Reconciliation during build_chapter_index already fetched this
+            # exact page (offset novels) — reuse it instead of fetching twice.
+            return self._extract_chapter(prefetched, meta)
         rm = self._manager(spec)
         # ``fast_path`` (0.2.0 §3.2): the conductor runs the primary under a bounded
         # camoufox budget that raises a typed signal so a hard chapter is handed to

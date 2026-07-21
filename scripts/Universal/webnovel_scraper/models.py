@@ -69,12 +69,26 @@ class ChapterMeta:
 
     `title` may be None/empty, which marks a degraded chapter (no title text
     was discoverable); the body is still fetched and written.
+
+    ``index`` is the chapter number the SITE DISPLAYS in its page header — the
+    number a user types into the range fields — used for ordering, filenames,
+    resume, and the range clamp. It is an ``int`` for ordinary chapters and a
+    ``float`` for fractional side-chapters (FreeWebNovel's "Chapter 627.2"
+    inserts), which sort naturally between their integer neighbours.
+
+    ``slug`` is the site's URL slug number (the ``N`` in ``…/chapter-N``) the
+    page is actually fetched at. On some novels the slug sequence counts insert
+    pages (glossaries, side-chapters) the displayed numbering does not, so slug
+    and displayed number drift apart; carrying both keeps fetching in slug-space
+    and everything user-facing in displayed-space. ``None`` where the adapter
+    does not use slug-numbered URLs (e.g. WebNovel-dynamic).
     """
 
-    index: int                 # 1-based chapter index used for ordering/filenames
+    index: int | float         # displayed chapter number (fractional for .x inserts)
     url: str                   # absolute URL to fetch the chapter from
     title: str | None = None   # title text only (site-junk trimmed), or None
     source_id: str | None = None       # site's own chapter id, if parsed
+    slug: int | None = None            # URL slug number the chapter is fetched at
     extra: dict = field(default_factory=dict)  # adapter-specific fetch hints
 
     @property
@@ -86,7 +100,8 @@ class ChapterMeta:
 class ChapterContent:
     """A fully extracted chapter: resolved title + cleaned body paragraphs."""
 
-    index: int                 # 1-based chapter index
+    index: int | float         # displayed chapter number (fractional for .x inserts;
+    #                            renders naturally in ``heading``: "Chapter 627.2: …")
     title: str                 # resolved title (may be "" for a degraded chapter)
     paragraphs: list[str]      # cleaned body paragraphs (no nav/comment noise)
 

@@ -1,5 +1,83 @@
 # webnovel-scraper - Handoff
 
+## Current Focus — fix-chapter-number-offset (Phases 1-3 ALL COMPLETE; drop deleted)
+**2026-07-20, HOME-PC. Working from `md-instructions/fix-chapter-number-offset.md`
+(now deleted, Phase 3's final step) implementing the investigation's findings
+(`investigate-chapter-number-offset.md`, deleted earlier — offset table + mechanism
+captured in this session's context and in `DECISIONS.md` #002/#003). All three phases
+complete; `verify` GREEN at 286 passed, 1 skipped (the pre-existing, documented
+intermittent no-Tk-display GUI skip — unrelated to this fix). NOT committed. Independent
+of the untracked
+`0.2.1_bug-hunt.md`/`0.2.1_release_plan.md` drops (a separate workstream, presumably
+another agent/session) — this entry documents ONLY the chapter-number-offset fix.**
+
+**Root cause (recap):** some FreeWebNovel novels (confirmed: Supreme Magus) number the
+URL slug (`.../chapter-N`) differently from what the page HEADER displays — the slug
+counts every page (real chapters + joke-chapter/glossary extras + fractional ".x"
+side-chapters), the header shows the author's own numbering. Measured offset 2 → 15
+across Supreme Magus, still growing (not constant — ruled out a fixed per-novel field).
+
+**Phase 1 (model + fixtures + xfail targets) — done.** `ChapterMeta`/`ChapterContent.index`
+now mean the DISPLAYED number (`int | float`); new `ChapterMeta.slug` field. Schema v2
+(`chapter_index.json`) rebuilds any older payload. 5 sanitized Supreme Magus fixtures in
+`files/test-files/fwn_sm_*.html`. `files/tests/test_chapter_number_offset.py` created with
+9 passing pins + 3 xfail targets.
+
+**Phase 2 (offset resolution in `freewebnovel.py`) — done.** Identity vs. offset
+auto-detected FOR FREE from the index page's own anchors (both URL slug and "Chapter N:
+Title" text) — zero extra fetches for an identity novel (Shadow Slave, Reverend Insanity,
+Renegade Immortal), proven by a test whose `FakeRM` has no chapter URLs registered at all.
+A genuinely offset novel resolves via binary search (monotone displayed(slug)) + a padded
+per-page walk, skipping unnumbered/negative extras (logged) and keeping fractional labels;
+fetched HTML is cached on `ChapterMeta.extra` and reused by `fetch_chapter` (one network
+hit per chapter, not two). `_existing_separate_pdf` gained a `(?!\.\d)` guard so 627 can't
+collide with a 627.2 file. `_discover_max_chapter` gained a three-tier href fallback
+(strict → loosened → displayed-text-with-warning). All 3 Phase-1 xfail marks removed (all
+now pass outright, 2 were `strict=True` so this was required). +6 new tests (binary
+search/bounded-walk, 2 `_discover_max_chapter` fallback cases).
+
+**Phase 3 (pipeline wiring + docs) — done.**
+- **Bounded-window wiring (closed the Phase-2 deviation immediately, before the rest of
+  Phase 3):** both `pipeline.py` call sites (`_PrimaryEngine.build_toc` via
+  `_bootstrap_toc`, and the legacy `_drive` path) now pass `job.start`/`job.end` through
+  as `start_hint`/`end_hint`, via a new `_build_chapter_index(adapter, spec, ...)` helper
+  that uses `inspect.signature` to pass the hints ONLY when the adapter's own method
+  declares them — every non-FWN adapter and every test fake (a dozen-plus across the
+  suite) is untouched; proven by the full 285-test run passing unchanged. A live run on
+  an offset novel now jumps near the requested range instead of scanning unbounded from
+  slug 1. New `_end_hint_for(job)` folds the GUI's unbounded-end sentinel (`app.
+  ALL_CHAPTERS = 10**9`) down to `None` (threshold `10**6`) so binary search doesn't waste
+  probes converging on an unreachable target. +2 tests: an end-to-end
+  `pipeline.run_scrape` proof (500-slug synthetic novel, chapter 116 requested, asserts
+  fetch count < 60 vs. the ~120+ an unbounded walk would need) and the end-hint-folding
+  unit test. See `DECISIONS.md` #005.
+- **Docs:** `Changelog.md` (0.2.1 section gained a "Fixed" entry), `Briefing.md`
+  ("Current Version" + a full "What Has Been Built" entry + a `models.py` architecture
+  note), `md-instructions/DECISIONS.md` created (didn't exist — only the untracked
+  template) with 5 entries: #001 schema-v2-rebuilds-everything, #002
+  identity-detection-is-free, #003 index-means-displayed-number, #004
+  no-hint-walks-the-whole-novel, #005 bounded-window-via-introspection.
+- **Stub notes:** `novel_bin.py`/`empire_novel.py`/`telegraph.py` each gained a one-line
+  docstring note for a future implementer to check their site's own slug-vs-displayed
+  numbering before assuming they always agree.
+- **Both drops deleted** as the final step: `investigate-chapter-number-offset.md` was
+  already gone (confirmed at both Phase 1 and Phase 3 start); `fix-chapter-number-offset.md`
+  deleted now.
+
+**Test/verify status:** `verify` GREEN — pytest all passed, deps pinned, docs gate green.
+`files/tests/test_chapter_number_offset.py` is the authoritative suite for this fix (24
+cases: model, fixtures, identity zero-extra-fetch, fractional parsing + resume
+non-collision, binary search + bounded walk unit AND pipeline-level, `_discover_max_chapter`
+fallback fix).
+
+**SAFE TO COMPACT: YES.** All three phases are on disk, `verify` is green, nothing is
+in-flight, both drops are deleted. Next step is the user's own review/acceptance and,
+if desired, a commit covering all three phases (not yet committed — branch/message left
+to the user per this repo's git habits). No further automated phase is pending for this
+fix; if the bounded-window default padding (`_WALK_PADDING = 8`) or the full-walk fallback
+(Decision #004) ever prove too small/slow on a live run, that would be a new, separate
+instruction drop, not a continuation of this one.
+
 ## Current Focus — 0.2.0 live-test bug-fix drop (Phase C DONE; release-prep NEXT)
 **2026-06-30, HOME-PC. Working from `md-instructions/0.2.0_live-test-bug-report-and-fix-plan.md`
 (3 bugs surfaced by the user's first 0.2.0 live test, all on the legacy WND path; NOT 0.2.0

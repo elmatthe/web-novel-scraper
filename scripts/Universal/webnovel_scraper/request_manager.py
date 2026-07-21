@@ -766,6 +766,11 @@ class RequestManager:
                 f"Cache entry {cache_path.name} is garbled (undecodable); re-fetching."
             )
             return None
+        if is_cloudflare_challenge(html):
+            self._log(
+                f"Cache entry {cache_path.name} is a Cloudflare challenge; re-fetching."
+            )
+            return None
         return html
 
     def _write_cache(self, cache_path: Path, html: str) -> None:
