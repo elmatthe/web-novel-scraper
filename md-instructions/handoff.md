@@ -1,5 +1,133 @@
 # webnovel-scraper - Handoff
 
+## Current Focus - duplicate displayed-number output collision fixed
+**2026-07-26, HOME-PC, Codex. Completed on
+`fix/freewebnovel-offset-and-output-collisions`; commit requested in this
+session.** The earlier verification that
+found "no missing integer numbers" needs this explicit caveat: Supreme Magus
+correctly indexed both source slugs **3678 and 3679** as displayed chapter
+**3664**, but SEPARATE output naming and resume detection used only the displayed
+number/title. Both source pages therefore targeted
+`Chapter 3664_ Twisted Reflection (Part 1).pdf`; one silently replaced the other.
+The completed user run reported `Written: 4408, Failed: 0` while only **4407**
+PDFs remained on disk.
+
+**Collision fix:** `pipeline.py` now assigns a deterministic occurrence to every
+TOC row sharing a displayed number. The first keeps the normal filename; later
+rows receive a readable source suffix, such as
+`Chapter 3664_ Twisted Reflection (Part 1) [slug 3679].pdf`. The actual
+`ChapterMeta` now travels through primary and rescue completion callbacks, so
+out-of-order rescue results still select the right destination. Resume matching
+uses the same metadata-aware occurrence rule: one slug's PDF cannot cause a
+different slug to be skipped. A repeated path within one run raises loudly
+instead of overwriting, and the duplicate condition is logged and included in
+the final warnings. `RunReport.written` therefore contains distinct paths.
+
+**Rescue identity follow-up:** `rescue_pool.py` previously rejected a job when
+either its displayed index or URL had already been submitted. It now deduplicates
+by source URL only, preserving true duplicate submissions while allowing
+different URLs with the same displayed number. Focused regression coverage
+proves both source URLs are accepted.
+
+**Regression:** `test_duplicate_displayed_numbers_write_and_resume_as_distinct_pdfs`
+runs two distinct slugs with the same index and title through the real pipeline.
+It asserts two distinguishable files, two distinct `report.written` paths,
+`Written: 2`, an explicit duplicate warning, and a second run that resumes with
+zero fetches and skips both metadata rows independently. The test failed before
+the fix because only slug 3678 was fetched: the newly written base filename made
+slug 3679 look already present during the same run.
+
+**Exact live acceptance:** fresh cache-off, visible-browser Supreme Magus
+`1-5000`, SEPARATE run completed in **13,510.6 seconds**. The live novel advanced
+during this follow-up from the user's prior 4,408-row snapshot to displayed
+chapter **4404** / slug **4419**, so the honest current acceptance target was
+**4,414**, not the now-stale 4,408. Final results:
+
+- `chapter_index.json`: `complete: true`, **4,414 rows**.
+- Output folder: **4,414 distinct PDFs**.
+- Summary: `Written: 4414 PDF(s)`, `Skipped: 0`, `Failed: 0`.
+- Duplicate outputs both present:
+  `Chapter 3664_ Twisted Reflection (Part 1).pdf` and
+  `Chapter 3664_ Twisted Reflection (Part 1) [slug 3679].pdf`.
+
+**Verification:** pre-collision baseline GREEN at **290 passed, 1 skipped**.
+Collision regression demonstrated the failure before implementation. Focused
+offset/pipeline/rescue suites GREEN at **75 passed**. Post-change full `verify`
+GREEN at **292 passed**; dependency and docs gates pass. Renegade Immortal's
+already-verified internal-TOC-gap reporting remains in this same working tree
+and is included in the same commit.
+
+## Current Focus — Supreme Magus whole-novel reconciliation actually verified
+**2026-07-25, HOME-PC, Codex. NOT COMMITTED.** This supersedes the entry that
+called the first compressed reconciliation "implemented and verified." That
+claim was incomplete: it was validated only with a 500-slug synthetic and a
+13-row live range around chapter 4398. The user's real `1-5000`, separate,
+browser-mode run still took minutes of silent TOC fetches and produced no index.
+Pre-change `verify` for this follow-up was GREEN at **288 passed, 1 skipped**.
+
+**Full-range root cause:** the first compressed implementation did engage, but
+recursive bisection degraded to **377 browser page fetches** on a realistic
+4,417-slug / offset-2-to-15 synthetic. Its only reconciliation summary was
+logged after recursion completed, and `chapter_index.json` was saved only after
+`build_chapter_index` returned. At about three seconds per Camoufox fetch this
+was roughly 19 minutes of indistinguishable-from-hung work, all lost on Stop.
+
+**Actual reconciliation fix:** `freewebnovel.py` now exploits the documented
+monotone offset directly: binary-search the next offset transition, infer the
+constant span before it, and fetch only the real insert/discontinuity cluster.
+The real-size synthetic now builds all rows in exactly **131 chapter-page
+fetches**. Search probes log every eight fetches and each resolved prefix logs
+`reconciled through slug N of M (K chapters resolved; F pages fetched)`.
+The existing `count + 64` hard fetch ceiling remains.
+
+**Durability:** `pipeline.py` now atomically writes incremental
+`chapter_index.json` checkpoints with `complete: false`. A stopped/crashed run
+loads those rows as reconciliation seeds; successful completion atomically
+replaces the checkpoint with `complete: true`. Both the rescue-conductor and
+legacy/injected-adapter paths forward checkpoint/resume callbacks only when an
+adapter declares them. Regression proves interruption, on-disk partial load,
+resume forwarding, and final complete replacement.
+
+**Live-only edge cases found and fixed:** the first exact full-range attempt
+checkpointed **960 rows through slug 962**, then failed on a real HTTP 404 at
+slug 1472. Missing slugs are now logged and treated as offset discontinuities,
+not fatal TOC failures. That checkpoint resumed and crossed the failure, but the
+completed index exposed another bug: slugs **3678 and 3679 both display chapter
+3664**, and the index-keyed reconciliation map silently retained only one.
+Reconciliation is now keyed by slug and preserves both duplicate displayed
+numbers. Live missing slugs observed: **1471, 1472, 1653**.
+
+**Final exact live acceptance:** a fresh `Supreme Magus`, chapters `1-5000`,
+separate, visible-browser, cache-off run completed TOC reconciliation in
+**314.1 seconds / 101 chapter-page fetches**. Progress checkpoints were visible
+through slugs 3, 635, 962, 1473, 1654, 1938, 3679, and 4417. It saved a complete
+**4,412-row** `chapter_index.json`, displayed range **1-4402**, with chapter
+3664 represented by both slugs **3678 and 3679**, then wrote
+`Chapter 1_ Prologue.pdf` and `Chapter 2_ Prologue 2.pdf`. The test harness
+intentionally requested Stop after two PDFs; final report was cancelled with
+`Written: 2`, `Failed: 0`.
+
+**Renegade Immortal investigation:** inspected
+`C:\Users\ematthew\Downloads\webscraped-tests\renegade-immortal-1`. The folder
+has **2082 PDFs**, and the persisted `chapter_index.json` also has **2082 rows**,
+so every indexed chapter was written. The silent gap was upstream: the TOC itself
+spans displayed chapters **1-2088** but is missing **1416, 1417, 1418, 1419,
+1421, 1422, 1423, 1424**. There is no persisted run report/failure log in that
+output folder; the code's `RunReport` is in-memory only, and because the missing
+chapters were absent from `in_range`, they were not recorded in `failed` or
+`extraction_failed`.
+
+**Renegade Immortal fix:** `pipeline.py` now detects missing integer chapter
+numbers inside any built/loaded TOC, records them on `RunReport.toc_gaps`, logs a
+clear warning, and includes the gap list in the final summary. This does not
+pretend to recover the missing chapters automatically, but it prevents a run with
+internal TOC gaps from looking complete. Regression added:
+`test_toc_gaps_are_reported_even_when_indexed_chapters_write`.
+
+**Verification:** targeted offset + pipeline tests GREEN at **39 passed**.
+Final full `verify` GREEN at **290 passed, 1 skipped** (the documented
+environment-dependent GUI skip); dependency and docs gates also passed.
+
 ## Current Focus — fix-chapter-number-offset (Phases 1-3 ALL COMPLETE; drop deleted)
 **2026-07-20, HOME-PC. Working from `md-instructions/fix-chapter-number-offset.md`
 (now deleted, Phase 3's final step) implementing the investigation's findings

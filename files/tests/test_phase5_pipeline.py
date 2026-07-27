@@ -73,6 +73,62 @@ class ExplodingAdapter:
         raise AssertionError("fetch_chapter called for a disabled site")
 
 
+class CheckpointAdapter(FakeAdapter):
+    """Exercises the optional incremental TOC checkpoint contract."""
+
+    def __init__(self, *, fail_after_checkpoint: bool) -> None:
+        super().__init__(count=2)
+        self.fail_after_checkpoint = fail_after_checkpoint
+        self.resume_seen: list[ChapterMeta] = []
+
+    def build_chapter_index(
+        self,
+        spec,
+        *,
+        resume_metas=None,
+        index_progress_cb=None,
+    ) -> list[ChapterMeta]:
+        self.built += 1
+        self.resume_seen = list(resume_metas or [])
+        metas = [
+            ChapterMeta(index=n, url=f"https://example/{n}", source_id=str(n))
+            for n in range(1, 3)
+        ]
+        if self.fail_after_checkpoint:
+            assert index_progress_cb is not None
+            index_progress_cb(metas[:1], 1, 2)
+            raise RuntimeError("synthetic interruption after TOC checkpoint")
+        return metas
+
+
+class DuplicateDisplayedNumberAdapter(FakeAdapter):
+    """Two distinct source pages with the same displayed number and title."""
+
+    def __init__(self) -> None:
+        super().__init__(count=2)
+        self.fetched_slugs: list[int | None] = []
+
+    def build_chapter_index(self, spec) -> list[ChapterMeta]:
+        self.built += 1
+        return [
+            ChapterMeta(
+                index=3664,
+                url=f"https://example/{slug}",
+                source_id=str(slug),
+                slug=slug,
+            )
+            for slug in (3678, 3679)
+        ]
+
+    def fetch_chapter(self, meta, spec) -> ChapterContent:
+        self.fetched_slugs.append(meta.slug)
+        return ChapterContent(
+            index=meta.index,
+            title="Twisted Reflection (Part 1)",
+            paragraphs=[f"Distinct body from source slug {meta.slug}."],
+        )
+
+
 def _job(tmp_path, mode: OutputMode, *, start=1, end=5, chunk_size=10) -> ScrapeJob:
     return ScrapeJob(
         novel_slug=ENABLED_NOVEL,
@@ -158,6 +214,39 @@ def test_resume_skips_existing_separate_pdfs(tmp_path) -> None:
     assert len(_pdfs(tmp_path)) == 5  # unchanged
 
 
+def test_duplicate_displayed_numbers_write_and_resume_as_distinct_pdfs(tmp_path) -> None:
+    logs: list[str] = []
+    first = DuplicateDisplayedNumberAdapter()
+    report = pipeline.run_scrape(
+        _job(tmp_path, OutputMode.SEPARATE, start=3664, end=3664),
+        adapter=first,
+        log=logs.append,
+    )
+
+    assert first.fetched_slugs == [3678, 3679]
+    assert _pdfs(tmp_path) == [
+        "Chapter 3664_ Twisted Reflection (Part 1) [slug 3679].pdf",
+        "Chapter 3664_ Twisted Reflection (Part 1).pdf",
+    ]
+    assert len(report.written) == 2
+    assert len(set(report.written)) == 2
+    assert "Written: 2 PDF(s)" in report.summary()
+    assert any("displayed chapter 3664 occurs 2 times" in line for line in logs)
+
+    second = DuplicateDisplayedNumberAdapter()
+    resumed = pipeline.run_scrape(
+        _job(tmp_path, OutputMode.SEPARATE, start=3664, end=3664),
+        adapter=second,
+        log=lambda _message: None,
+    )
+
+    assert second.built == 0
+    assert second.fetched_slugs == []
+    assert resumed.skipped_existing == [3664, 3664]
+    assert resumed.written == []
+    assert len(_pdfs(tmp_path)) == 2
+
+
 def test_resume_skips_existing_single_pdf(tmp_path) -> None:
     pipeline.run_scrape(
         _job(tmp_path, OutputMode.SINGLE), adapter=FakeAdapter(count=3),
@@ -210,6 +299,56 @@ def test_exhausted_chapter_failure_recorded_and_run_continues(tmp_path) -> None:
     assert "failed chapters: 2" in report.summary()
     assert any("chapter 2 FAILED" in line for line in log_lines)
     assert any("Second-pass sweep" in line for line in log_lines)
+
+
+def test_toc_gaps_are_reported_even_when_indexed_chapters_write(tmp_path) -> None:
+    class GapAdapter(FakeAdapter):
+        def build_chapter_index(self, spec) -> list[ChapterMeta]:
+            self.built += 1
+            return [
+                ChapterMeta(index=n, url=f"https://example/{n}", source_id=str(n))
+                for n in (1, 2, 4, 5)
+            ]
+
+    log_lines: list[str] = []
+    adapter = GapAdapter()
+    report = pipeline.run_scrape(
+        _job(tmp_path, OutputMode.SEPARATE, start=1, end=5),
+        adapter=adapter,
+        log=log_lines.append,
+    )
+
+    assert adapter.fetched == [1, 2, 4, 5]
+    assert report.failed == []
+    assert report.toc_gaps == [3]
+    assert len(report.written) == 4
+    assert any("missing integer chapter number" in line for line in log_lines)
+    assert "TOC gaps" in report.summary()
+    assert "3" in report.summary()
+
+
+def test_incomplete_toc_checkpoint_is_persisted_and_resumed(tmp_path) -> None:
+    job = _job(tmp_path, OutputMode.SEPARATE, start=1, end=2)
+    first = CheckpointAdapter(fail_after_checkpoint=True)
+
+    with pytest.raises(RuntimeError, match="synthetic interruption"):
+        pipeline.run_scrape(job, adapter=first, log=lambda _m: None)
+
+    spec = catalog.get_spec(ENABLED_NOVEL, ENABLED_KEY)
+    index_path = tmp_path / pipeline.INDEX_FILENAME
+    assert index_path.is_file()
+    assert pipeline._load_index(index_path, spec) is None
+    partial = pipeline._load_partial_index(index_path, spec)
+    assert [meta.index for meta in partial] == [1]
+
+    second = CheckpointAdapter(fail_after_checkpoint=False)
+    report = pipeline.run_scrape(job, adapter=second, log=lambda _m: None)
+
+    assert [meta.index for meta in second.resume_seen] == [1]
+    assert len(report.written) == 2
+    completed = pipeline._load_index(index_path, spec)
+    assert completed is not None
+    assert [meta.index for meta in completed] == [1, 2]
 
 
 # ── Disabled-adapter refusal (defense in depth) ──────────────────────────────

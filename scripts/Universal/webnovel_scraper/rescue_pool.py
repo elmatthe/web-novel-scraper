@@ -264,7 +264,6 @@ class RescuePool:
         self._lock = threading.Lock()
         self._accepting = True
         self._stopping = False
-        self._seen_indices: set[int] = set()
         self._seen_urls: set[str] = set()
         self.jobs_submitted = 0
         self.jobs_completed = 0
@@ -305,25 +304,23 @@ class RescuePool:
         """Enqueue a hard chapter for rescue. Returns True if accepted.
 
         Cancellation-aware backpressure (§3.8): never silently drops a chapter and
-        never bypasses the cap. A chapter already submitted (same index or URL) is
-        ignored (returns False). When the backlog is full this **blocks** until a
+        never bypasses the cap. A source page already submitted (same URL) is
+        ignored (returns False). Different URLs sharing a displayed chapter number
+        remain distinct jobs. When the backlog is full this **blocks** until a
         slot frees or the run is cancelled — intentional backpressure, the honest
         caveat being that the primary may pause here when rescue is saturated.
         """
-        index = meta.index
         url = meta.url
         with self._lock:
             if not self._accepting or self._cancel_event.is_set():
                 return False
-            if index in self._seen_indices or url in self._seen_urls:
+            if url in self._seen_urls:
                 return False
-            self._seen_indices.add(index)
             self._seen_urls.add(url)
 
         while True:
             if self._cancel_event.is_set() or not self._accepting:
                 with self._lock:
-                    self._seen_indices.discard(index)
                     self._seen_urls.discard(url)
                 return False
             try:

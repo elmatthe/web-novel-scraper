@@ -29,6 +29,7 @@ from webnovel_scraper import catalog, pipeline
 from webnovel_scraper.adapters import freewebnovel as fwn
 from webnovel_scraper.adapters.freewebnovel import FreeWebNovelAdapter
 from webnovel_scraper.models import ChapterContent, ChapterMeta, ScrapeJob
+from webnovel_scraper.request_manager import NotFoundFetchError
 
 FIXTURES = Path(__file__).resolve().parents[2] / "files" / "test-files"
 
@@ -275,9 +276,17 @@ class SlugSynthesizingRM:
 
     _SLUG_RE = re.compile(r"/chapter-(\d+)$")
 
-    def __init__(self, index_html: str, index_url: str) -> None:
+    def __init__(
+        self,
+        index_html: str,
+        index_url: str,
+        label_fn=_synth_displayed_label,
+        missing_slugs: set[int] | None = None,
+    ) -> None:
         self.index_html = index_html
         self.index_url = index_url
+        self.label_fn = label_fn
+        self.missing_slugs = missing_slugs or set()
         self.fetched: list[str] = []
 
     def fetch(self, url, *, use_browser=False, use_cache=None, fast_path=False) -> str:
@@ -287,7 +296,9 @@ class SlugSynthesizingRM:
         m = self._SLUG_RE.search(url)
         assert m, f"unexpected URL in synthetic test: {url}"
         slug = int(m.group(1))
-        label = _synth_displayed_label(slug)
+        if slug in self.missing_slugs:
+            raise NotFoundFetchError(f"HTTP 404 for {url}", status=404)
+        label = self.label_fn(slug)
         header = f"Chapter {label} Synthetic Title" if label else "-9 Unnumbered extra"
         return (
             "<html><head><title>x</title></head><body>"
@@ -330,6 +341,119 @@ def test_binary_search_and_bounded_walk_resolve_displayed_number_to_slug() -> No
     assert len(rm.fetched) < 60, (
         f"expected a bounded walk, fetched {len(rm.fetched)} URLs"
     )
+
+
+def test_full_range_offset_index_uses_compressed_walk_not_every_slug() -> None:
+    """Supreme Magus live shape: a user asks for ``1-5000`` while the site has
+    fewer slugs and a growing slug-vs-displayed offset. The previous offset
+    path treated that as "walk slug 1 through latest" and fetched essentially
+    every chapter page before writing ``chapter_index.json`` or a single PDF.
+    The compressed reconciler infers constant-offset spans and only walks near
+    extras/discontinuities."""
+    index_url = SM_SPEC.url
+    index_html = "<html><body>" + "".join(
+        f"<a href='{index_url}/chapter-{n}'>x</a>" for n in (498, 499, 500)
+    ) + "</body></html>"
+    rm = SlugSynthesizingRM(index_html, index_url)
+    adapter = FreeWebNovelAdapter(request_manager=rm)
+
+    metas = adapter.build_chapter_index(SM_SPEC, start_hint=1, end_hint=5000)
+
+    by_index = {m.index: m.slug for m in metas}
+    assert by_index[1] == 4
+    assert by_index[116] == 119
+    assert by_index[116.5] == 120
+    assert by_index[496] == 500
+    assert len(metas) == 497  # 1..496 plus the fractional 116.5 insert
+
+    chapter_fetches = [u for u in rm.fetched if "/chapter-" in u]
+    assert len(chapter_fetches) < 120, (
+        "full-range offset reconciliation should not fetch every slug before "
+        f"content starts; fetched {len(chapter_fetches)} chapter pages"
+    )
+
+
+def test_real_size_full_range_offset_reconciliation_stays_observably_bounded() -> None:
+    """Model the actual Supreme Magus scale and offset growth.
+
+    The novel starts with two unnumbered extras and accumulates eleven
+    fractional inserts, one missing slug, and one duplicate displayed number
+    across 4,417 slugs, growing from offset 2 to offset 15. A full ``1-5000``
+    request must not degrade into a near-linear browser walk.
+    """
+    count = 4417
+    insert_slugs = {
+        630,
+        631,
+        632,
+        633,
+        634,
+        1200,
+        2200,
+        2700,
+        3200,
+        3600,
+        4300,
+    }
+    missing_slugs = {1472}
+    duplicate_number_slugs = {3679}
+
+    def full_size_label(slug: int) -> str | None:
+        if slug <= 2:
+            return None
+        earlier_inserts = sum(insert < slug for insert in insert_slugs)
+        earlier_missing = sum(missing < slug for missing in missing_slugs)
+        earlier_duplicates = sum(
+            duplicate < slug for duplicate in duplicate_number_slugs
+        )
+        if slug in insert_slugs:
+            run_start = slug
+            while run_start - 1 in insert_slugs:
+                run_start -= 1
+            inserts_before_run = sum(insert < run_start for insert in insert_slugs)
+            previous_integer = run_start - 3 - inserts_before_run
+            fractional_position = slug - run_start + 1
+            return f"{previous_integer - earlier_missing}.{fractional_position}"
+        if slug in duplicate_number_slugs:
+            return str(
+                slug
+                - 3
+                - earlier_inserts
+                - earlier_missing
+                - earlier_duplicates
+            )
+        return str(
+            slug - 2 - earlier_inserts - earlier_missing - earlier_duplicates
+        )
+
+    index_url = SM_SPEC.url
+    index_html = (
+        "<html><body>"
+        f"<a href='{index_url}/chapter-{count}'>Chapter 4402 Latest</a>"
+        "</body></html>"
+    )
+    rm = SlugSynthesizingRM(
+        index_html,
+        index_url,
+        label_fn=full_size_label,
+        missing_slugs=missing_slugs,
+    )
+    logs: list[str] = []
+    adapter = FreeWebNovelAdapter(request_manager=rm, log=logs.append)
+
+    metas = adapter.build_chapter_index(SM_SPEC, start_hint=1, end_hint=5000)
+
+    by_index = {m.index: m.slug for m in metas}
+    assert by_index[1] == 3
+    assert by_index[4402] == 4417
+    assert len(metas) == 4414
+    duplicate_index = int(full_size_label(3679))
+    assert [m.slug for m in metas if m.index == duplicate_index] == [3678, 3679]
+    chapter_fetches = [u for u in rm.fetched if "/chapter-" in u]
+    assert len(chapter_fetches) == 131
+    assert any("slug 1472 is missing" in line for line in logs)
+    assert any("locating next chapter-number offset change" in line for line in logs)
+    assert any("reconciled through slug 4417 of 4417" in line for line in logs)
 
 
 # ── Phase 3: pipeline wiring — job.start/end reach the adapter as hints ──────

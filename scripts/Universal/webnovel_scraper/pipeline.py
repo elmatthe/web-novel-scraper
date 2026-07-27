@@ -179,6 +179,7 @@ class RunReport:
     failed: list[int] = field(default_factory=list)          # ch. still failed after sweep
     permanent_failed: list[int] = field(default_factory=list)  # 403/404 — not swept
     extraction_failed: list[int] = field(default_factory=list)  # fetched OK but no body — not swept, not a block
+    toc_gaps: list[int] = field(default_factory=list)          # missing integer numbers inside the TOC span
     rescued: list[int] = field(default_factory=list)         # ch. saved by rescue (or 2nd-pass sweep)
     warnings: list[str] = field(default_factory=list)        # adapter + pipeline warnings
     cancelled: bool = False
@@ -230,6 +231,13 @@ class RunReport:
                 "  Extraction failures (page fetched but no body found): "
                 f"{len(self.extraction_failed)}"
             )
+        if self.toc_gaps:
+            preview = ", ".join(str(i) for i in self.toc_gaps[:20])
+            more = " ..." if len(self.toc_gaps) > 20 else ""
+            lines.append(
+                "  TOC gaps (chapter numbers absent from chapter_index.json): "
+                f"{preview}{more}"
+            )
         if self.auto_slowdowns:
             lines.append(
                 f"  Auto-slowdown raised the inter-fetch delay to "
@@ -245,6 +253,10 @@ class RunReport:
             )
         if self.warnings:
             lines.append(f"  Warnings: {len(self.warnings)}")
+            for warning in self.warnings[:5]:
+                lines.append(f"    warning: {warning}")
+            if len(self.warnings) > 5:
+                lines.append(f"    ... {len(self.warnings) - 5} more warning(s)")
         return "\n".join(lines)
 
 
@@ -367,14 +379,23 @@ def _metas_from_rows(rows: object) -> Optional[list[ChapterMeta]]:
 
 
 # ── Chapter-index persistence (pipeline-level, output-dir scoped) ─────────────
-def _save_index(index_path: Path, metas: list[ChapterMeta], spec: SiteSpec) -> None:
+def _save_index(
+    index_path: Path,
+    metas: list[ChapterMeta],
+    spec: SiteSpec,
+    *,
+    complete: bool = True,
+) -> None:
     index_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "schema_version": INDEX_SCHEMA_VERSION,
         "identity": _index_identity(spec),
+        "complete": complete,
         "chapters": _chapter_rows(metas),
     }
-    index_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    temp_path = index_path.with_name(f"{index_path.name}.tmp")
+    temp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    temp_path.replace(index_path)
 
 
 def _load_index(
@@ -428,9 +449,61 @@ def _load_index(
                 )
             return None
 
+    if raw.get("complete", True) is False:
+        if log is not None:
+            log(
+                "NOTE: chapter_index.json contains an incomplete TOC "
+                "reconciliation checkpoint; resuming its resolved rows."
+            )
+        return None
+
     # Missing identity in a dict-shaped file is also unknown/trusted for upgrade
     # compatibility; only an actual identity mismatch forces a rebuild.
     return _metas_from_rows(raw.get("chapters"))
+
+
+def _load_partial_index(index_path: Path, spec: SiteSpec) -> list[ChapterMeta]:
+    """Load only a current-schema, identity-matching incomplete checkpoint."""
+    if not index_path.is_file():
+        return []
+    try:
+        raw = json.loads(index_path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    if not isinstance(raw, dict) or raw.get("complete", True) is not False:
+        return []
+    if raw.get("schema_version") != INDEX_SCHEMA_VERSION:
+        return []
+    if raw.get("identity") != _index_identity(spec):
+        return []
+    return _metas_from_rows(raw.get("chapters")) or []
+
+
+def _missing_integer_chapters(metas: list[ChapterMeta]) -> list[int]:
+    integers = sorted(
+        {m.index for m in metas if isinstance(m.index, int) and not isinstance(m.index, bool)}
+    )
+    if len(integers) < 2:
+        return []
+    present = set(integers)
+    return [n for n in range(integers[0], integers[-1] + 1) if n not in present]
+
+
+def _record_toc_gaps(metas: list[ChapterMeta], report: RunReport, log: LogFn) -> None:
+    gaps = _missing_integer_chapters(metas)
+    if not gaps:
+        return
+    report.toc_gaps = gaps
+    preview = ", ".join(str(i) for i in gaps[:20])
+    more = " ..." if len(gaps) > 20 else ""
+    warning = (
+        "chapter_index.json has missing integer chapter number(s) inside its "
+        f"available range: {preview}{more}. These chapters will not be fetched "
+        "unless the TOC is rebuilt with corrected numbering."
+    )
+    if warning not in report.warnings:
+        report.warnings.append(warning)
+    log(f"WARNING: {warning}")
 
 
 # ── fix-chapter-number-offset: bounded-window TOC hints ──────────────────────
@@ -454,6 +527,10 @@ def _build_chapter_index(
     fast_path: Optional[bool] = None,
     start_hint: Optional[int] = None,
     end_hint: Optional[int] = None,
+    resume_metas: Optional[list[ChapterMeta]] = None,
+    index_progress_cb: Optional[
+        Callable[[list[ChapterMeta], int, int], None]
+    ] = None,
 ) -> list[ChapterMeta]:
     """Call ``adapter.build_chapter_index``, passing ``fast_path``/``start_hint``/
     ``end_hint`` ONLY when the adapter's own method actually accepts them.
@@ -478,6 +555,10 @@ def _build_chapter_index(
         kwargs["start_hint"] = start_hint
     if "end_hint" in params:
         kwargs["end_hint"] = end_hint
+    if "resume_metas" in params:
+        kwargs["resume_metas"] = resume_metas
+    if "index_progress_cb" in params:
+        kwargs["index_progress_cb"] = index_progress_cb
     return adapter.build_chapter_index(spec, **kwargs)  # type: ignore[attr-defined]
 
 
@@ -489,14 +570,54 @@ def _stem_for(spec: SiteSpec) -> str:
     return re.sub(r"\s+", "_", safe).strip("_") or spec.novel_slug
 
 
-def _separate_pdf_name(content: ChapterContent) -> str:
-    """The SEPARATE-mode filename: ``safe_filename(heading).pdf``."""
+def _chapter_identity(meta: ChapterMeta) -> tuple:
+    """Stable identity for one TOC row, including its source-space location."""
+    return (meta.index, meta.slug, meta.source_id, meta.url)
+
+
+def _separate_occurrences(
+    metas: list[ChapterMeta],
+) -> dict[tuple, tuple[int, int]]:
+    """Map each TOC row to its 1-based occurrence and displayed-number count."""
+    grouped: dict[int | float, list[ChapterMeta]] = {}
+    for meta in metas:
+        grouped.setdefault(meta.index, []).append(meta)
+
+    occurrences: dict[tuple, tuple[int, int]] = {}
+    for group in grouped.values():
+        count = len(group)
+        for ordinal, meta in enumerate(group, start=1):
+            occurrences[_chapter_identity(meta)] = (ordinal, count)
+    return occurrences
+
+
+def _duplicate_pdf_suffix(meta: ChapterMeta, occurrence: tuple[int, int]) -> str:
+    """Return a readable suffix for later rows sharing a displayed number."""
+    ordinal, count = occurrence
+    if count <= 1 or ordinal == 1:
+        return ""
+    if meta.slug is not None:
+        return f" [slug {meta.slug}]"
+    return f" [occurrence {ordinal}]"
+
+
+def _separate_pdf_name(
+    content: ChapterContent,
+    meta: ChapterMeta | None = None,
+    occurrence: tuple[int, int] = (1, 1),
+) -> str:
+    """Build a SEPARATE filename, disambiguating repeated displayed numbers."""
     stem = BaseAdapter.safe_filename(content.heading).rstrip(".") or "untitled"
-    return stem + ".pdf"
+    suffix = _duplicate_pdf_suffix(meta, occurrence) if meta is not None else ""
+    return stem + suffix + ".pdf"
 
 
-def _existing_separate_pdf(output_dir: Path, index: int | float) -> Optional[Path]:
-    """Find an already-written SEPARATE PDF for chapter ``index`` without
+def _existing_separate_pdf(
+    output_dir: Path,
+    meta: ChapterMeta | int | float,
+    occurrence: tuple[int, int] = (1, 1),
+) -> Optional[Path]:
+    """Find an already-written SEPARATE PDF for one TOC row without
     fetching. Every heading begins with ``Chapter N`` followed by a non-digit
     (``:`` → ``_`` after ``safe_filename``, or ``.`` when degraded), so the index
     can be matched off the filename alone — that is what makes resume skip the
@@ -507,12 +628,65 @@ def _existing_separate_pdf(output_dir: Path, index: int | float) -> Optional[Pat
     two would collide, since "627" is a valid prefix of "627.2\""""
     if not output_dir.is_dir():
         return None
+    index = meta.index if isinstance(meta, ChapterMeta) else meta
     num = re.escape(str(index))
     pat = re.compile(rf"^Chapter\s+{num}(?!\.\d)(?:[^0-9].*)?\.pdf$", re.IGNORECASE)
+    suffix = (
+        _duplicate_pdf_suffix(meta, occurrence)
+        if isinstance(meta, ChapterMeta)
+        else ""
+    )
+    duplicate_suffix = re.compile(r" \[(?:slug \d+|occurrence \d+)\]$", re.IGNORECASE)
     for p in sorted(output_dir.glob("*.pdf")):
-        if pat.match(p.name):
-            return p
+        if not pat.match(p.name):
+            continue
+        if suffix:
+            if p.stem.endswith(suffix):
+                return p
+            continue
+        if occurrence[1] > 1 and duplicate_suffix.search(p.stem):
+            continue
+        return p
     return None
+
+
+def _record_duplicate_output_numbers(
+    metas: list[ChapterMeta],
+    report: RunReport,
+    log: LogFn,
+) -> None:
+    counts: dict[int | float, int] = {}
+    for meta in metas:
+        counts[meta.index] = counts.get(meta.index, 0) + 1
+    for index, count in counts.items():
+        if count < 2:
+            continue
+        warning = (
+            f"displayed chapter {index} occurs {count} times in chapter_index.json; "
+            "later source pages use slug-suffixed filenames so every PDF remains distinct."
+        )
+        if warning not in report.warnings:
+            report.warnings.append(warning)
+            log(f"WARNING: {warning}")
+
+
+def _write_separate_pdf(
+    content: ChapterContent,
+    meta: ChapterMeta,
+    occurrence: tuple[int, int],
+    output_dir: Path,
+    spec: SiteSpec,
+    report: RunReport,
+    log: LogFn,
+) -> None:
+    path = output_dir / _separate_pdf_name(content, meta, occurrence)
+    if path in report.written:
+        raise RuntimeError(
+            f"refusing to overwrite duplicate SEPARATE output path: {path.name}"
+        )
+    pdf_builder.create_pdf([content], path, title=spec.novel_title)
+    report.written.append(path)
+    log(f"  wrote {path.name}")
 
 
 def _chunks(metas: list[ChapterMeta], size: int) -> Iterable[list[ChapterMeta]]:
@@ -593,7 +767,14 @@ class _PrimaryEngine:
         self.adapter = self._af(self.manager)
 
     def build_toc(
-        self, *, start_hint: Optional[int] = None, end_hint: Optional[int] = None
+        self,
+        *,
+        start_hint: Optional[int] = None,
+        end_hint: Optional[int] = None,
+        resume_metas: Optional[list[ChapterMeta]] = None,
+        index_progress_cb: Optional[
+            Callable[[list[ChapterMeta], int, int], None]
+        ] = None,
     ) -> list[ChapterMeta]:
         return _build_chapter_index(
             self.adapter,
@@ -601,6 +782,8 @@ class _PrimaryEngine:
             fast_path=True,
             start_hint=start_hint,
             end_hint=end_hint,
+            resume_metas=resume_metas,
+            index_progress_cb=index_progress_cb,
         )
 
     def fetch(self, meta: ChapterMeta) -> ChapterContent:
@@ -654,7 +837,7 @@ class _RescueConductor:
         log: LogFn,
         run_cancel: threading.Event,
         state: "_Progress",
-        on_content: Callable[[int, ChapterContent], None],
+        on_content: Callable[[ChapterMeta, ChapterContent], None],
         contents: dict,
     ) -> None:
         self.job = job
@@ -740,7 +923,7 @@ class _RescueConductor:
         if kind == "success":
             if not self._from_cache():
                 self.breaker.record_network(is_challenge=False)
-            self._store_content(meta.index, payload)
+            self._store_content(meta, payload)
             return
         if kind == "not_found":
             self.breaker.record_network(is_challenge=False)
@@ -816,7 +999,7 @@ class _RescueConductor:
             if kind == "success":
                 if not self._from_cache():
                     self.breaker.record_network(is_challenge=False)
-                self._store_content(meta.index, payload)
+                self._store_content(meta, payload)
                 return
             if kind == "rate_limited":
                 continue  # still limited — the next nav waits the (re-applied) cooldown
@@ -860,11 +1043,12 @@ class _RescueConductor:
         # Otherwise it was a duplicate already owned by rescue — its result will come.
 
     # ── terminal helpers ──────────────────────────────────────────────────────
-    def _store_content(self, index: int, content: ChapterContent) -> None:
+    def _store_content(self, meta: ChapterMeta, content: ChapterContent) -> None:
+        index = meta.index
         self.contents[index] = content
         if index in self.report.failed:
             self.report.failed.remove(index)  # a prior transient now cleared
-        self.on_content(index, content)  # SEPARATE writes promptly; others store
+        self.on_content(meta, content)  # SEPARATE writes promptly; others store
         self.state.tick()
 
     def _fail(self, index: int, *, permanent: bool = False, extraction: bool = False) -> None:
@@ -884,7 +1068,7 @@ class _RescueConductor:
             if idx not in self.report.rescued:
                 self.report.rescued.append(idx)
             self.report.rescue_strategy[idx] = res.strategy
-            self._store_content(idx, res.content)  # ticks + writes SEPARATE
+            self._store_content(res.meta, res.content)  # ticks + writes SEPARATE
             self.log(f"  chapter {idx} rescued ({res.strategy}).")
         elif res.status == rp.RESCUE_EXHAUSTED:
             if idx not in self.report.failed:
@@ -1135,7 +1319,24 @@ def _run_with_rescue(
         index_path = output_dir / INDEX_FILENAME
         metas = _load_index(index_path, runtime_spec, log=log)
         if metas is None:
-            metas = _bootstrap_toc(primary, spec, report, log, run_cancel, job)
+            resume_metas = _load_partial_index(index_path, runtime_spec)
+
+            def checkpoint_index(
+                partial: list[ChapterMeta], _through: int, _total: int
+            ) -> None:
+                resume_metas[:] = partial
+                _save_index(index_path, partial, runtime_spec, complete=False)
+
+            metas = _bootstrap_toc(
+                primary,
+                spec,
+                report,
+                log,
+                run_cancel,
+                job,
+                resume_metas=resume_metas,
+                index_progress_cb=checkpoint_index,
+            )
             if not metas:
                 report.warnings.append("The chapter index came back empty; nothing to do.")
                 _collect_warnings(primary.adapter, report)
@@ -1146,6 +1347,7 @@ def _run_with_rescue(
             log(f"  loaded {len(metas)} chapters from {INDEX_FILENAME} (resume).")
 
         metas.sort(key=lambda m: m.index)
+        _record_toc_gaps(metas, report, log)
         avail_lo, avail_hi = metas[0].index, metas[-1].index
         start = max(job.start, avail_lo)
         end = min(job.end, avail_hi)
@@ -1168,7 +1370,9 @@ def _run_with_rescue(
         # 4. Drive the fast primary pass + rescue lane, then assemble output.
         contents: dict[int, ChapterContent] = {}
         state = _Progress(total=len(in_range), cb=progress_cb)
-        on_content = _make_on_content(job, spec, output_dir, report, log, contents)
+        on_content = _make_on_content(
+            job, spec, output_dir, in_range, report, log, contents
+        )
         conductor = _RescueConductor(
             job=job, spec=spec, runtime_spec=runtime_spec, primary=primary,
             breaker=breaker, pacer=pacer, limiter=limiter, pool_factory=pool_factory,
@@ -1222,6 +1426,11 @@ def _bootstrap_toc(
     log: LogFn,
     run_cancel: threading.Event,
     job: ScrapeJob,
+    *,
+    resume_metas: Optional[list[ChapterMeta]] = None,
+    index_progress_cb: Optional[
+        Callable[[list[ChapterMeta], int, int], None]
+    ] = None,
 ) -> list[ChapterMeta]:
     """Build the TOC on the primary mode; on a headless Cloudflare block, switch the
     primary visible and retry ONCE; if that still fails, abort cleanly (§3.11). A TOC
@@ -1237,7 +1446,12 @@ def _bootstrap_toc(
     end_hint = _end_hint_for(job)
     log("Building chapter index (TOC) …")
     try:
-        return primary.build_toc(start_hint=start_hint, end_hint=end_hint)
+        return primary.build_toc(
+            start_hint=start_hint,
+            end_hint=end_hint,
+            resume_metas=resume_metas,
+            index_progress_cb=index_progress_cb,
+        )
     except ScrapeCancelled:
         raise
     except ChallengeFetchError as exc:
@@ -1249,7 +1463,12 @@ def _bootstrap_toc(
             primary.switch_to_visible()
             report.primary_switched_visible = True
             try:
-                return primary.build_toc(start_hint=start_hint, end_hint=end_hint)
+                return primary.build_toc(
+                    start_hint=start_hint,
+                    end_hint=end_hint,
+                    resume_metas=resume_metas,
+                    index_progress_cb=index_progress_cb,
+                )
             except ScrapeCancelled:
                 raise
             except Exception as exc2:
@@ -1272,21 +1491,30 @@ def _make_on_content(
     job: ScrapeJob,
     spec: SiteSpec,
     output_dir: Path,
+    in_range: list[ChapterMeta],
     report: RunReport,
     log: LogFn,
     contents: dict,
-) -> Callable[[int, ChapterContent], None]:
+) -> Callable[[ChapterMeta, ChapterContent], None]:
     """For SEPARATE, write each chapter's PDF promptly as its content lands (§3.12);
     for CHUNKED/SINGLE the content is folded into the file at the end (it is already
     held in ``contents``), so the callback is a no-op there."""
     if job.output_mode is not OutputMode.SEPARATE:
-        return lambda _index, _content: None
+        return lambda _meta, _content: None
 
-    def _write(_index: int, content: ChapterContent) -> None:
-        path = output_dir / _separate_pdf_name(content)
-        pdf_builder.create_pdf([content], path, title=spec.novel_title)
-        report.written.append(path)
-        log(f"  wrote {path.name}")
+    occurrences = _separate_occurrences(in_range)
+    _record_duplicate_output_numbers(in_range, report, log)
+
+    def _write(meta: ChapterMeta, content: ChapterContent) -> None:
+        _write_separate_pdf(
+            content,
+            meta,
+            occurrences[_chapter_identity(meta)],
+            output_dir,
+            spec,
+            report,
+            log,
+        )
 
     return _write
 
@@ -1303,9 +1531,11 @@ def _plan_fetch_list(
     fetching. Skipped chapters are recorded + ticked here (their terminal state is
     'already present'), exactly as the legacy modes resume."""
     if job.output_mode is OutputMode.SEPARATE:
+        occurrences = _separate_occurrences(in_range)
         out: list[ChapterMeta] = []
         for meta in in_range:
-            if _existing_separate_pdf(output_dir, meta.index) is not None:
+            occurrence = occurrences[_chapter_identity(meta)]
+            if _existing_separate_pdf(output_dir, meta, occurrence) is not None:
                 report.skipped_existing.append(meta.index)
                 state.tick()
             else:
@@ -1402,11 +1632,24 @@ def _drive(
     metas = _load_index(index_path, spec, log=log)
     if metas is None:
         log("Building chapter index (TOC) …")
+        resume_metas = _load_partial_index(index_path, spec)
+
+        def checkpoint_index(
+            partial: list[ChapterMeta], _through: int, _total: int
+        ) -> None:
+            resume_metas[:] = partial
+            _save_index(index_path, partial, spec, complete=False)
+
         # Bounded-window hints (fix-chapter-number-offset Phase 3): a no-op for
         # every adapter except FreeWebNovelAdapter, which uses them to bound its
         # offset-resolution walk to near the requested range.
         metas = _build_chapter_index(
-            adapter, spec, start_hint=job.start, end_hint=_end_hint_for(job)
+            adapter,
+            spec,
+            start_hint=job.start,
+            end_hint=_end_hint_for(job),
+            resume_metas=resume_metas,
+            index_progress_cb=checkpoint_index,
         )
         if not metas:
             report.warnings.append("The chapter index came back empty; nothing to do.")
@@ -1418,6 +1661,7 @@ def _drive(
         log(f"  loaded {len(metas)} chapters from {INDEX_FILENAME} (resume).")
 
     metas.sort(key=lambda m: m.index)
+    _record_toc_gaps(metas, report, log)
     avail_lo, avail_hi = metas[0].index, metas[-1].index
 
     # 4. Clamp the requested range to the available TOC.
@@ -1556,18 +1800,26 @@ def _sweepable(report: RunReport) -> list[int]:
 def _run_separate(job, spec, adapter, output_dir, in_range, report, log,
                   cancel_event, state, pacer) -> None:
     by_index = {m.index: m for m in in_range}
+    occurrences = _separate_occurrences(in_range)
+    _record_duplicate_output_numbers(in_range, report, log)
 
-    def _write(content: ChapterContent) -> None:
-        path = output_dir / _separate_pdf_name(content)
-        pdf_builder.create_pdf([content], path, title=spec.novel_title)
-        report.written.append(path)
-        log(f"  wrote {path.name}")
+    def _write(meta: ChapterMeta, content: ChapterContent) -> None:
+        _write_separate_pdf(
+            content,
+            meta,
+            occurrences[_chapter_identity(meta)],
+            output_dir,
+            spec,
+            report,
+            log,
+        )
 
     for meta in in_range:
         if _cancelled(cancel_event):
             report.cancelled = True
             return
-        existing = _existing_separate_pdf(output_dir, meta.index)
+        occurrence = occurrences[_chapter_identity(meta)]
+        existing = _existing_separate_pdf(output_dir, meta, occurrence)
         if existing is not None:
             report.skipped_existing.append(meta.index)
             state.tick()
@@ -1577,7 +1829,7 @@ def _run_separate(job, spec, adapter, output_dir, in_range, report, log,
             sleep_after=True,
         )
         if content is not None:
-            _write(content)
+            _write(meta, content)
         state.tick()
 
     # Second-pass sweep (Phase 9C): re-attempt every non-permanent failed chapter
@@ -1598,7 +1850,7 @@ def _run_separate(job, spec, adapter, output_dir, in_range, report, log,
             if content is not None:
                 report.failed.remove(index)
                 report.rescued.append(index)
-                _write(content)
+                _write(by_index[index], content)
 
 
 def _fetch_block_with_sweep(

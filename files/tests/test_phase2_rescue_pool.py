@@ -227,19 +227,20 @@ def test_initial_mode_follows_visible_primary_skips_headless_steps() -> None:
 
 
 # ── no double-submit ──────────────────────────────────────────────────────────
-def test_no_double_submit_by_index_or_url() -> None:
+def test_no_double_submit_by_url_but_duplicate_display_numbers_are_distinct() -> None:
     def fetch_fn(meta, **kw):
         return _content(meta.index)
 
     pool = _make_pool(fetch_fn=fetch_fn).start()
     assert pool.submit(_meta(1)) is True
-    assert pool.submit(_meta(1)) is False               # same index/URL ignored
-    assert pool.submit(ChapterMeta(index=99, url=_meta(1).url)) is False  # same URL
+    assert pool.submit(_meta(1)) is False  # same index and URL ignored
+    assert pool.submit(ChapterMeta(index=99, url=_meta(1).url)) is False
+    assert pool.submit(ChapterMeta(index=1, url="https://example/chapter-99")) is True
     assert pool.submit(_meta(2)) is True
 
     results = _drain_to_terminal(pool)
-    assert {r.meta.index for r in results} == {1, 2}
-    assert pool.jobs_submitted == 2
+    assert sorted(r.meta.index for r in results) == [1, 1, 2]
+    assert pool.jobs_submitted == 3
 
 
 # ── same-thread ownership; rescue adapter is a distinct instance ──────────────
