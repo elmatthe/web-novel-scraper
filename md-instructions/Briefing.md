@@ -112,6 +112,16 @@ suite in `files/tests/` (a `conftest.py` there puts `scripts/Universal/` on
 `sys.path` so `import webnovel_scraper` resolves).
 
 ## Current Version
+**Status as of 2026-10-17 (v0.3.0 Checkpoint 00 reconciliation):** 0.2.0 was
+**released** on 2026-06-30 (tag `v0.2.0`, the latest GitHub release); the
+"Unreleased" wording directly below is historical. 0.2.1 is merged to `main`
+but untagged and unreleased. v0.3.0 is in progress on
+`feature/v0.3.0-modernization` (based on `577b5db`). Its scope is the
+PDF-Splitter-style UI, manifest-first chapter lists, Lord of the Mysteries 1/2 on
+validated `.net`/`.com` sources, and TXT/PDF output. See `handoff.md` and
+`Web-Novel-Scraper-v0.3.0-Implementation-Plan.md` for current state. The rest of
+this section describes 0.2.0/0.2.1 as built.
+
 **0.2.0 (Unreleased — implemented, pending the user's manual live test).**
 **Fast-primary + single-lane hard-chapter rescue.** 0.1.3 ran one persistent VISIBLE
 browser for *every* FreeWebNovel chapter — correct but slow, since most chapters need

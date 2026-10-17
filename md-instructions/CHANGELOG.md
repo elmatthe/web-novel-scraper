@@ -11,6 +11,39 @@ versioning.
   logs a warning and automatically rebuilds the TOC for the current novel instead
   of trusting stale data.
 
+### Fixed — whole-novel FreeWebNovel reconciliation, repeated displayed numbers, TOC gaps
+Commit `577b5db` (2026-07-27). It was local-only until it became the base of the
+v0.3.0 working branch `feature/v0.3.0-modernization` (2026-10-17).
+
+- **Faster, resumable offset reconciliation.** `freewebnovel.py` binary-searches
+  each offset transition and fetches only the real insert/discontinuity clusters.
+  A realistic 4,417-slug synthetic needs 131 chapter-page fetches. The live
+  Supreme Magus TOC reconciled in 314 s with 101 fetches. Progress is logged as
+  `reconciled through slug N of M`. The `count + 64` fetch ceiling is unchanged.
+- **Checkpointed chapter index.** `pipeline.py` atomically writes
+  `chapter_index.json` with `complete: false` while reconciling. A stopped or
+  crashed run resumes from those rows, and success replaces the file with
+  `complete: true`.
+- **Missing source pages are not fatal.** A 404 slug during reconciliation (live
+  Supreme Magus: 1471, 1472, 1653) is logged and treated as an offset
+  discontinuity.
+- **Repeated displayed numbers keep both chapters.** When two source pages show
+  the same chapter number (Supreme Magus 3664 at slugs 3678 and 3679), both are
+  indexed and both PDFs are written. The later one gets a ` [slug N]` filename
+  suffix. Resume matching is per source page. A repeated output path within one
+  run raises an error instead of overwriting, and the duplicate is listed in the
+  final warnings. Before this fix, one PDF silently replaced the other: the run
+  reported `Written: 4408` but left 4,407 files on disk.
+- **Rescue deduplicates by URL.** `rescue_pool.py` deduplicates jobs by source URL
+  only, so two pages that show the same chapter number are both rescued.
+- **TOC gaps are reported.** Integer chapter numbers missing inside a TOC
+  (Renegade Immortal: 1416–1419, 1421–1424) are logged, stored on
+  `RunReport.toc_gaps` and listed in the final summary. Such a run no longer
+  looks complete.
+- Tests: regression coverage for each fix; full gate 292 passed. Live acceptance:
+  Supreme Magus `1-5000`, one PDF per chapter, visible browser, cache off.
+  It produced a complete 4,414-row index, 4,414 distinct PDFs and `Failed: 0`.
+
 ### Fixed — FreeWebNovel chapters addressed by URL slug instead of the site's displayed number
 On some FreeWebNovel novels (confirmed: Supreme Magus), the URL slug in
 `.../chapter-N` counts every page — real chapters plus joke-chapter/glossary

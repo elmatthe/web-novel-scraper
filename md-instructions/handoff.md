@@ -1,5 +1,65 @@
 # webnovel-scraper - Handoff
 
+## Current Snapshot — v0.3.0 Checkpoint 00 complete (planning/baseline only)
+**2026-10-17 · HOME-PC (Windows 11) · Claude Code (Opus 5.5) · branch
+`feature/v0.3.0-modernization`**
+
+- **Active plan:** `md-instructions/Web-Novel-Scraper-v0.3.0-Implementation-Plan.md`
+  (owner-approved; §1 "Verified baseline", step 01.0, §8 clarifications C1–C15).
+- **Base:** `577b5db` = `main` (`e7dc407`) plus the previously unpushed FWN
+  offset/duplicate-output fix commit (owner-approved base, 2026-10-17). The first
+  push of this branch publishes `577b5db`. `fix/freewebnovel-offset-and-output-collisions`
+  stays a local branch at the same commit.
+- **Release state (verified against Git/GitHub):** v0.2.0 is the latest release
+  and tag (2026-06-30). 0.2.1 was merged to `main` via PR #4 but never tagged.
+  v0.3.0 supersedes it (plan §8 C3).
+- **Last verification:** `scripts/verify.py` at `577b5db`, run in a clean
+  temporary worktree (since removed) with `.venv` Python 3.13.12. **PASS:
+  pytest 292 passed; deps PASS; docs PASS.** All pinned dependencies were already
+  installed. Nothing was installed or changed, and there was no live scraping.
+- **Pending manual test:** none for 00. Next manual gate: the Windows UI visual
+  gate at the end of 01.
+- **Next exact action:** Checkpoint 01, step **01.0**. Commit the local flat
+  `scripts/` layout. Repair `files/tests/conftest.py`, both launchers'
+  `MAIN_SCRIPT`, and `parents[3]` → `parents[2]` in `request_manager.py` and
+  `browser_env.py`. Add the in-repo-path regression test and run the gate in place
+  (expect ≥292 passed). Then start the 01 theme/shell work using plan §8 C5.
+
+### Uncommitted local state (deliberately NOT in the Checkpoint 00 commit)
+- `scripts/Universal/*` is moved to `scripts/*` (byte-identical to `577b5db`), and
+  `scripts/Windows/.gitkeep` and `scripts/MacOS/.gitkeep` are deleted. The owner
+  approved adopting the flat layout; it lands in 01.0. **Until then, do not run
+  the app or scrape from this checkout:** in-place tests cannot import, the
+  launchers point at a missing `scripts/Universal/app.py`, and cache/browser paths
+  would resolve above the repository.
+- `md-instructions/0.2.1_release_plan.md`, `0.2.1_bug-hunt.md` and
+  `Decisions-template.md` are deleted locally. They will be committed with 01.0
+  unless the owner objects.
+- `scripts/scripts-to-use-from-my-other-repo's-GUIs/` holds owner-supplied
+  ACT/PDF-Splitter reference copies. It is untracked: **never commit it**, and
+  delete it after the 02 borrowing. The PDF-Splitter copies are newer than GitHub
+  `edcbd4f`.
+- `AI-WORKSPACE.md` is local and gitignored by design.
+
+### Open issues carried forward
+- 0.2.1 live items never run: BUG-1/BUG-3 (Cloudflare recovery reproduction) and
+  BUG-2 (Stop latency and atomic write under failure). Covered by 06; plan §8 C3.
+- Headless clearance of live FWN Cloudflare is unproven. Decision 6 must reuse
+  the breaker's run-wide latch to visible (plan §8 C9).
+- Older Phase-8 suggestions #3–#6 (see the Open Issues table below). Re-check them
+  against the code before acting; 0.2.1 may have closed some.
+- The launchers install Python 3.12 but development uses 3.13 (plan §8 C13).
+  OneDrive-redirected Downloads is not resolved (C7). Mojibake in
+  Briefing/handoff and handoff length are docs debt for 07 (C14).
+
+### Log (newest first)
+- 2026-10-17 — Checkpoint 00: branch created at `577b5db`; baseline verify PASS
+  (292). Plan finalized (§1 verified baseline, step 01.0, §8 C1–C15). Briefing
+  "Current Version" status and CHANGELOG `577b5db` entries reconciled. No
+  application code, requirements or environment changes.
+
+---
+
 ## Current Focus - duplicate displayed-number output collision fixed
 **2026-07-26, HOME-PC, Codex. Completed on
 `fix/freewebnovel-offset-and-output-collisions`; commit requested in this
