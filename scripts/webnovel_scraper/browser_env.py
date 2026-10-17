@@ -26,10 +26,10 @@ from pathlib import Path
 
 _ENV_VAR = "PLAYWRIGHT_BROWSERS_PATH"
 
-# request_manager/cf_bypass live at scripts/Universal/webnovel_scraper/, so
-# parents[3] is the repo root — the same depth the cache root uses.
+# request_manager/cf_bypass live at scripts/webnovel_scraper/, so
+# parents[2] is the repo root — the same depth the cache root uses.
 CONTAINED_BROWSERS_PATH = (
-    Path(__file__).resolve().parents[3] / "files" / "bin" / "ms-playwright"
+    Path(__file__).resolve().parents[2] / "files" / "bin" / "ms-playwright"
 )
 
 

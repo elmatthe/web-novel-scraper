@@ -261,8 +261,8 @@ FAST_HTTP_FIRST_LADDER = (
 )
 
 # Repo-root-relative cache root: files/cache/ (request_manager is at
-# scripts/Universal/webnovel_scraper/, so parents[3] is the repo root).
-_REPO_ROOT = Path(__file__).resolve().parents[3]
+# scripts/webnovel_scraper/, so parents[2] is the repo root).
+_REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CACHE_ROOT = _REPO_ROOT / "files" / "cache"
 
 USER_AGENT = (

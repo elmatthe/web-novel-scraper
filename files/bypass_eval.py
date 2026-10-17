@@ -25,7 +25,7 @@ import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(REPO / "scripts" / "Universal"))
+sys.path.insert(0, str(REPO / "scripts"))
 
 from webnovel_scraper import cf_bypass  # noqa: E402
 from webnovel_scraper.adapters import freewebnovel as fwn_ad  # noqa: E402

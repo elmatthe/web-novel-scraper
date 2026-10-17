@@ -16,13 +16,15 @@ titles and bodies are preserved as published.
   post-processing), pytest (tests)
 
 ## Architecture
-The repo follows the AI-WORKSPACE cross-platform layout: program code ships from
-`scripts/` (shared code in `scripts/Universal/`, with `scripts/Windows/` and
-`scripts/MacOS/` for OS-only glue), while dev-only material (the pytest suite,
-fixtures, QA logs, runtime cache/output, legacy reference) lives under `files/`
-and never ships. The pytest suite is at `files/tests/`, its fixtures at
-`files/test-files/`. Clean module boundaries under
-`scripts/Universal/webnovel_scraper/`:
+Program code ships from a flat `scripts/` folder: the GUI entry point
+`scripts/app.py`, the package `scripts/webnovel_scraper/`, `scripts/verify.py`
+and `scripts/requirements.txt`. (v0.3.0 step 01.0 moved the code out of the old
+`scripts/Universal/` subfolder and dropped the empty `scripts/Windows/` and
+`scripts/MacOS/` placeholders; the code was already cross-platform.) Dev-only
+material (the pytest suite, fixtures, QA logs, runtime cache/output, legacy
+reference) lives under `files/` and never ships. The pytest suite is at
+`files/tests/`, its fixtures at `files/test-files/`. Clean module boundaries
+under `scripts/webnovel_scraper/`:
 - `models.py` â€” normalized dataclasses (`SiteSpec`, `ChapterMeta`, `ChapterContent`,
   plus `OutputMode` and `ScrapeJob`). **0.2.1:** `ChapterMeta`/`ChapterContent.index`
   mean the site's DISPLAYED chapter number (`int | float`, fractional for FWN's
@@ -108,11 +110,11 @@ and never ships. The pytest suite is at `files/tests/`, its fixtures at
 Networking never lives in parsers; parsing never lives in the GUI; the PDF builder
 knows nothing about sites. `scripts/verify.py` is the mechanical gate (pytest +
 dependency-pinning + docs-freshness) run before every phase commit; it runs the
-suite in `files/tests/` (a `conftest.py` there puts `scripts/Universal/` on
+suite in `files/tests/` (a `conftest.py` there puts `scripts/` on
 `sys.path` so `import webnovel_scraper` resolves).
 
 ## Current Version
-**Status as of 2026-10-17 (v0.3.0 Checkpoint 00 reconciliation):** 0.2.0 was
+**Status as of 2026-10-17:** 0.2.0 was
 **released** on 2026-06-30 (tag `v0.2.0`, the latest GitHub release); the
 "Unreleased" wording directly below is historical. 0.2.1 is merged to `main`
 but untagged and unreleased. v0.3.0 is in progress on

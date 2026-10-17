@@ -25,8 +25,8 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
-# When launched as ``python scripts/Universal/app.py`` the script's own
-# directory (scripts/Universal) is sys.path[0], so the package import resolves.
+# When launched as ``python scripts/app.py`` the script's own
+# directory (scripts/) is sys.path[0], so the package import resolves.
 # Add it explicitly too, so launching via an absolute path also works.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 

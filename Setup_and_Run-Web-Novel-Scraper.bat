@@ -17,7 +17,7 @@ cd /d "%~dp0"
 ::       camoufox (anti-detect Firefox, the primary browser rung) AND Chromium
 ::       (for the playwright-stealth last-resort rungs). Both are contained in the
 ::       repo / per-user cache - no admin, nothing system-wide.
-::    5. Launches the GUI (scripts\Universal\app.py). On every later run it acts
+::    5. Launches the GUI (scripts\app.py). On every later run it acts
 ::       as the launcher.
 ::
 ::  SELF-HEALING: delete .venv (to move/shrink/reset the repo) and re-run -- it
@@ -45,7 +45,7 @@ set "PYTHON_INSTALLER_URL=https://www.python.org/ftp/python/3.12.8/python-3.12.8
 set "REQUIREMENTS=scripts\requirements.txt"
 
 :: Single-window GUI entry point (no separate launcher.py for this project).
-set "MAIN_SCRIPT=scripts\Universal\app.py"
+set "MAIN_SCRIPT=scripts\app.py"
 
 :: This project does not use ffmpeg.
 set "USE_FFMPEG=0"

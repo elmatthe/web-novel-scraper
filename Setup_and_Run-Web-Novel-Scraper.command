@@ -19,7 +19,7 @@
 #       (scripts/requirements.txt) into it (never system-wide).
 #    4. Downloads the Playwright Chromium browser INTO the project
 #       (files/bin/ms-playwright) for the Cloudflare/browser fetch path.
-#    5. Launches the GUI (scripts/Universal/app.py).
+#    5. Launches the GUI (scripts/app.py).
 #
 #  SELF-HEALING: delete .venv and re-run -- it rebuilds from scratch.
 #  Goal: the MINIMUM installed on the Mac; everything else contained in the repo.
@@ -42,7 +42,7 @@ PYTHON_BREW_FORMULA="python@3.12"
 REQUIREMENTS="scripts/requirements.txt"
 
 # Single-window GUI entry point (no separate launcher.py for this project).
-MAIN_SCRIPT="scripts/Universal/app.py"
+MAIN_SCRIPT="scripts/app.py"
 
 # This project does not use ffmpeg.
 USE_FFMPEG=0

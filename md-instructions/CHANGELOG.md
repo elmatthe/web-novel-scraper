@@ -3,6 +3,22 @@
 All notable changes to this project are recorded here. Versions follow semantic
 versioning.
 
+## [Unreleased] — v0.3.0 (in progress on `feature/v0.3.0-modernization`)
+
+### Changed — flat `scripts/` layout (step 01.0, no behaviour change)
+- Program code moved from `scripts/Universal/` to `scripts/`. The entry point
+  is now `scripts/app.py` and the package is `scripts/webnovel_scraper/`; file
+  contents are unchanged. The empty `scripts/Windows/` and `scripts/MacOS/`
+  placeholders were removed.
+- Updated to match: both `Setup_and_Run` launchers (`MAIN_SCRIPT`), the test
+  bootstrap (`files/tests/conftest.py`), `files/bypass_eval.py`, and the
+  repo-root depth in `request_manager.py` / `browser_env.py`. The HTML cache
+  (`files/cache/`) and the contained Playwright browsers
+  (`files/bin/ms-playwright/`) stay inside the repository.
+- New `files/tests/test_flat_layout.py` (8 offline tests) guards the import
+  root, the in-repo cache/browser paths, the launcher entry points, and one
+  fixture chapter through parser → pipeline → PDF. Suite: 300 passed.
+
 ## [0.2.1] — Unreleased
 
 - Reusing an output folder for a different novel/site no longer silently mixes

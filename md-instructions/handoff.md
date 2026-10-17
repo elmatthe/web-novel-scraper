@@ -1,40 +1,71 @@
 # webnovel-scraper - Handoff
 
-## Current Snapshot — v0.3.0 Checkpoint 00 complete (planning/baseline only)
+## Current Snapshot — v0.3.0 step 01.0 complete (flat `scripts/` layout)
 **2026-10-17 · HOME-PC (Windows 11) · Claude Code (Opus 5.5) · branch
 `feature/v0.3.0-modernization`**
 
 - **Active plan:** `md-instructions/Web-Novel-Scraper-v0.3.0-Implementation-Plan.md`
-  (owner-approved; §1 "Verified baseline", step 01.0, §8 clarifications C1–C15).
-- **Base:** `577b5db` = `main` (`e7dc407`) plus the previously unpushed FWN
-  offset/duplicate-output fix commit (owner-approved base, 2026-10-17). The first
-  push of this branch publishes `577b5db`. `fix/freewebnovel-offset-and-output-collisions`
-  stays a local branch at the same commit.
-- **Release state (verified against Git/GitHub):** v0.2.0 is the latest release
-  and tag (2026-06-30). 0.2.1 was merged to `main` via PR #4 but never tagged.
-  v0.3.0 supersedes it (plan §8 C3).
-- **Last verification:** `scripts/verify.py` at `577b5db`, run in a clean
-  temporary worktree (since removed) with `.venv` Python 3.13.12. **PASS:
-  pytest 292 passed; deps PASS; docs PASS.** All pinned dependencies were already
-  installed. Nothing was installed or changed, and there was no live scraping.
-- **Pending manual test:** none for 00. Next manual gate: the Windows UI visual
-  gate at the end of 01.
-- **Next exact action:** Checkpoint 01, step **01.0**. Commit the local flat
-  `scripts/` layout. Repair `files/tests/conftest.py`, both launchers'
-  `MAIN_SCRIPT`, and `parents[3]` → `parents[2]` in `request_manager.py` and
-  `browser_env.py`. Add the in-repo-path regression test and run the gate in place
-  (expect ≥292 passed). Then start the 01 theme/shell work using plan §8 C5.
+  (owner-approved; §1 "Verified baseline", §4 checkpoint 01, §8 C1–C15).
+- **Base:** `577b5db` = `main` (`e7dc407`) plus the FWN offset/duplicate-output
+  fix (owner-approved base). Checkpoint 00 = `1ab1747`; step 01.0 is the commit
+  after it. `fix/freewebnovel-offset-and-output-collisions` stays local.
+- **Release state:** v0.2.0 is the latest release and tag (2026-06-30). 0.2.1 is
+  merged to `main` via PR #4 but untagged. v0.3.0 supersedes it (plan §8 C3).
+- **Step 01.0 (layout only, no behaviour change):** committed the move
+  `scripts/Universal/*` → `scripts/*` and the deletion of the empty
+  `scripts/Windows/` and `scripts/MacOS/` placeholders. Git records all 20 files
+  as renames: 17 are unchanged (R100), and `app.py`, `browser_env.py` and
+  `request_manager.py` carry only the path-line repairs below. Repaired the dependent paths:
+  - `files/tests/conftest.py` now puts `scripts/` on `sys.path`.
+  - `MAIN_SCRIPT` and header comments in both launchers now point at
+    `scripts\app.py` / `scripts/app.py`.
+  - `parents[3]` → `parents[2]` in `webnovel_scraper/request_manager.py`
+    (`DEFAULT_CACHE_ROOT`) and `webnovel_scraper/browser_env.py`
+    (`CONTAINED_BROWSERS_PATH`).
+  - Path comments in `scripts/app.py`; `files/bypass_eval.py` `sys.path`.
+  - Briefing architecture text. README had no script-path references.
 
-### Uncommitted local state (deliberately NOT in the Checkpoint 00 commit)
-- `scripts/Universal/*` is moved to `scripts/*` (byte-identical to `577b5db`), and
-  `scripts/Windows/.gitkeep` and `scripts/MacOS/.gitkeep` are deleted. The owner
-  approved adopting the flat layout; it lands in 01.0. **Until then, do not run
-  the app or scrape from this checkout:** in-place tests cannot import, the
-  launchers point at a missing `scripts/Universal/app.py`, and cache/browser paths
-  would resolve above the repository.
+  New `files/tests/test_flat_layout.py` (8 offline tests) covers:
+  - imports from `scripts/`, including a fresh isolated interpreter loading
+    `scripts/app.py` the launcher's way;
+  - the cache root and contained browsers resolving inside the repo;
+  - both launchers' `MAIN_SCRIPT` values;
+  - one real FWN fixture chapter running through the real parser and pipeline
+    into a PDF.
+
+  Also fixed a Checkpoint 00 regression: Briefing's status note said "v0.3.0"
+  before "0.2.0" in `## Current Version`, which failed two
+  `test_release_metadata.py` guards. Commit `1ab1747` carried that failure because
+  the 00 gate ran on a clean `577b5db` worktree before the doc edits.
+- **Last verification:** `scripts/verify.py` in place with `.venv` Python
+  3.13.12. **PASS: pytest 300 passed (292 baseline + 8 new); deps PASS; docs
+  PASS.** In one of the in-place runs a single GUI test skipped through its
+  existing "no Tk display" guard. It did not recur in two more full runs or five
+  GUI-file reruns.
+
+  Startup smoke test: the launcher's exact command, `.venv\Scripts\pythonw.exe
+  scripts\app.py` with the launcher's `PLAYWRIGHT_BROWSERS_PATH`, opened the "Web
+  Novel Scraper" window. It closed gracefully with exit 0, and nothing was created
+  outside the repository. The `.bat` itself was not run: it waits for Enter, and
+  its sentinel and requirements-lock checks already show it would skip every
+  install. Nothing was installed and there was no live scraping.
+- **Pending manual test:** double-click `Setup_and_Run-Web-Novel-Scraper.bat`
+  once to confirm Step 5 launches the GUI from `scripts\app.py`, and run the
+  `.command` on a Mac when available. Next planned manual gate: the Windows UI
+  visual gate at the end of 01.
+- **Next exact action:** Checkpoint 01 UI foundation (after owner review of
+  01.0):
+  - adapt PDF-Splitter `appearance.py` (Compact ttk styles, Light/Dark palettes,
+    Aqua variants, state-preserving toggle) into `scripts/`, per plan §8 C5;
+  - rebuild the `app.py` shell as three bordered left sections plus a right
+    Activity area, with `_fit_window` geometry;
+  - port the `test_phase4_gui`/`test_phase8_gui` guarantees (C10);
+  - change no scraper, data or pipeline behaviour.
+
+### Uncommitted local state (deliberately NOT committed)
 - `md-instructions/0.2.1_release_plan.md`, `0.2.1_bug-hunt.md` and
-  `Decisions-template.md` are deleted locally. They will be committed with 01.0
-  unless the owner objects.
+  `Decisions-template.md` are deleted locally. **The owner deferred these to a
+  separate documentation-cleanup decision**, so they were left unstaged in 01.0.
 - `scripts/scripts-to-use-from-my-other-repo's-GUIs/` holds owner-supplied
   ACT/PDF-Splitter reference copies. It is untracked: **never commit it**, and
   delete it after the 02 borrowing. The PDF-Splitter copies are newer than GitHub
@@ -53,6 +84,10 @@
   Briefing/handoff and handoff length are docs debt for 07 (C14).
 
 ### Log (newest first)
+- 2026-10-17 — Step 01.0: flat `scripts/` layout committed as renames, with
+  dependent paths repaired. 8 layout regression tests added. Checkpoint 00's
+  Briefing version-guard regression fixed. In-place verify PASS (300). Launcher
+  smoke test passed. No behaviour, dependency or environment changes.
 - 2026-10-17 — Checkpoint 00: branch created at `577b5db`; baseline verify PASS
   (292). Plan finalized (§1 verified baseline, step 01.0, §8 C1–C15). Briefing
   "Current Version" status and CHANGELOG `577b5db` entries reconciled. No
