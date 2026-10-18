@@ -28,9 +28,9 @@
 | 05 | `7ce33ff` | Canonical chapter text, TXT output, faithful PDFs (ADR 015) |
 | 04 | `c1b03af` | LOTM 1/2 on .com and .net, headless-first browser (ADR 016) |
 | 06 | `fb7dfe9` | Stop during builds, offline open-ended runs, memory |
-| 07 | see below | Windows setup and repair (ADR 017), review fixes, cache-hit pacing, `files/audit_run.py` |
+| 07 | `3fd7b99` | Windows setup and repair (ADR 017), review fixes, cache-hit pacing, `files/audit_run.py` |
 
-07 is the commit after `fb7dfe9`; its SHA is recorded in the commit that follows it.
+`3fd7b99` is the last code commit; the commit after it only records this SHA here.
 
 ## Novel × website (Windows)
 | Website | Novel | Enabled | Evidence so far |
@@ -57,7 +57,7 @@ Whole-novel runs: **none yet** (owner checklist item 11).
 - Older deferred minors #3–#6 from `files/test-logs/v0.1.0_pre-release.md` remain for owner review.
 
 ## Log (newest first; Git has the full record)
-- 2026-10-18 · 07: launcher rewrite (`setup_check.py`, `install_python.ps1`), start-up engine warning,
+- 2026-10-18 · 07 `3fd7b99`: launcher rewrite (`setup_check.py`, `install_python.ps1`), start-up engine warning,
   DPI awareness, version 0.3.0, README; independent review (5 findings) fixed with tests; cache hits no
   longer wait the inter-fetch delay; `files/audit_run.py`; ADR 017; plan §9.17.
 - 2026-10-18 · 06 `fb7dfe9`, 04 `c1b03af`, 05 `7ce33ff`, 03.3–03.4 `8926a30`, 03.2b `12e83be` (plan §9.12–9.16).
