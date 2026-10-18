@@ -201,7 +201,7 @@ class _RecordingAdapter:
 
     def build_chapter_index(self, spec):
         _RecordingAdapter.seen.append(("toc", spec.use_browser))
-        return [ChapterMeta(index=1, url="https://example/1", source_id="1")]
+        return [ChapterMeta(index=1, url="https://freewebnovel.com/novel/shadow-slave/chapter-1", source_id="1")]
 
     def fetch_chapter(self, meta, spec):
         _RecordingAdapter.seen.append(("fetch", spec.use_browser))

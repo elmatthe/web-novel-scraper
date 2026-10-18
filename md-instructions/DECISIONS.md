@@ -5,6 +5,62 @@ See AI-WORKSPACE.md for how this fits alongside Briefing, Changelog, and Handoff
 
 ---
 
+## 010 — The chapter manifest, not the output folder, decides the chapter list; coverage is claimed only for what was examined — 2026-10-18 — Claude (Sonnet 5.5)
+
+**Status:** Accepted (v0.3.0 Checkpoint 03.2a)
+
+**Context:** Until 03.1 the pipeline trusted an output-folder `chapter_index.json` (including a
+v2 dict with no identity block), clamped a finite range to whatever the list held and reported
+success, and wrote the index non-atomically per run. 03.1 built the validated, source-specific
+store but left the pipeline alone. Wiring it in has four hard questions: what a discovery may
+claim to have covered, what to do with a hole in the list, how two processes share one overlay,
+and how a user rebuilds a list they distrust.
+
+**Decision:**
+1. **One preflight.** `chapter_preflight.resolve_chapters` is the only place a run's chapters are
+   chosen; both pipeline paths call it through `_resolve_chapters` and differ only in the
+   `discover` callable they inject. Selection is by source page URL; the exact label text rides
+   in `ChapterMeta.extra["manifest_label"]` across the float bridge.
+2. **A discovery claims its asked window, no more.** Coverage is the unbroken whole-number runs
+   the returned chapters account for, clipped to the `[start_hint, end_hint]` window the adapter
+   was asked about; padding the adapter returns beyond it is kept as evidence but claims nothing.
+   An interrupted discovery's checkpoints stop at the last resolved slug. An open end always
+   re-checks a bounded tail (`TAIL_RECHECK_MARGIN = 64`) instead of trusting a stale last chapter.
+3. **Refuse, do not clamp.** A requested number with no entry and no recorded absence refuses the
+   run with the missing chapters named. Source-confirmed absence (manifest evidence) is a reasoned
+   skip. A hole *inside* a list the site just returned is a **TOC gap**: reported as before and
+   skipped, never recorded as absent and never counted as covered. A gap longer than 200, or one
+   the discovery did not bracket, is refused as unconfirmed.
+4. **Single writer.** A per-source advisory file lock (`file_lock.py`, stdlib) is held across load,
+   reconcile and publish; a second writer is refused visibly, and a reader without the lock never
+   moves a file. The OS releases it if the holder dies.
+5. **Refresh is explicit and non-destructive.** `ScrapeJob.refresh_chapter_list` backs the overlay
+   up as `.bak-<utc>[-N]` and rediscovers; the baseline is never touched; a refresh that fails or is
+   cancelled before saving anything puts the backup back. The GUI exposes a one-shot box.
+6. **The output folder's index is legacy input.** The pipeline no longer writes it and reads it only
+   through `import_legacy_index`; it is never modified.
+
+**Alternatives considered:**
+- *Treat every uncovered label inside the returned span as unresolved and refuse.* Strictly safest,
+  but it would make Supreme Magus unrunnable for a range that crosses any sparse-TOC gap, which the
+  577b5db acceptance run exercised; gaps stay reported, not hidden.
+- *Record the sparse-TOC gap as `absent` so it is not rediscovered.* Rejected: it invents evidence
+  of absence the source never gave.
+- *Add an "examined but unlisted" field to the schema.* Would stop the repeated re-ask, but it
+  changes the approved 03.1 schema; left as a follow-up.
+- *Hold the lock only while writing.* Leaves the read-modify-write window open between load and
+  publish, which is the lost-update the lock exists to close.
+- *`pid` lock files.* Stale after a crash and unsafe to probe on Windows; OS locks need no cleanup.
+
+**Consequences:** A finite end beyond the site's list is now refused (previously clamped), so the
+live `1-5000` Supreme Magus habit needs a blank End. Existing output folders' indexes are imported
+or ignored with a logged reason, never trusted blindly. Runs write a runtime overlay under
+`files/runtime-data/chapter-lists/`. A range spanning a persistent sparse-TOC gap re-asks the
+adapter on each run. Offline fixtures and a mutation check cover the behaviour; nothing was run
+against a live site.
+
+---
+
 ## 009 — Source identity is host-scoped, chapters are identified by page, labels are text — 2026-10-18 — Claude (Sonnet 5.5)
 
 **Status:** Accepted (v0.3.0 Checkpoint 03.0)

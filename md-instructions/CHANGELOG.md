@@ -5,6 +5,42 @@ versioning.
 
 ## [Unreleased] — v0.3.0 (in progress on `feature/v0.3.0-modernization`)
 
+### Changed — Manifest-first chapter lists in both pipeline paths (Checkpoint 03.2a)
+- **The chapter list now comes from the validated, source-specific manifest** (tracked baseline +
+  ignored runtime overlay under `files/runtime-data/chapter-lists/<host>/<novel>.json`) instead of
+  an output-folder `chapter_index.json`. Both the standard path and the FreeWebNovel
+  rescue path use one shared preflight (`chapter_preflight.py`). `.com` and `.net` keep separate
+  lists. No dependency, catalog, adapter, request-manager, cache, PDF or output-folder change.
+- **Fewer TOC requests:** a finite range the saved list already covers makes no TOC request. Only the
+  uncovered part is discovered (the offset binary search and the `count + 64` ceiling are
+  unchanged), seeded with everything already known, and saved after each reconciled window. An
+  interrupted discovery keeps what it resolved and claims only that. An open-ended range re-checks
+  a bounded tail every run so a stale last chapter is not trusted.
+- **No more silent clamping:** a finite range the list cannot provide (for example `1-5000` on a
+  4402-chapter novel) is refused with the missing chapters named, before anything is fetched.
+  Leave End blank for "through the last available chapter". A hole inside the site's own list is
+  still reported as a TOC gap and skipped, and is never recorded as a confirmed absence; a
+  confirmed absence is a reasoned skip.
+- **The old `chapter_index.json` is no longer written or trusted.** An existing one is checked by
+  the strict importer (matching identity, complete, every row valid); anything else is ignored with
+  a readable reason and the list is discovered from the site. The file is never changed. The
+  pipeline's own `_load_index` (which accepted an identity-less v2 file) is removed.
+- **Safe with two programs open:** a per-source cross-process writer lock (stdlib) covers load,
+  merge and save. A second writer is refused with a clear message instead of losing an update; a
+  covered list can still be read. The lock is released automatically if a program dies.
+- **Refresh chapter list:** a one-shot checkbox in Advanced Settings rebuilds the saved list on the
+  next run. The old list is kept as `<name>.json.bak-<utc>`, the tracked baseline is untouched, and
+  a refresh that fails or is cancelled before saving puts the old list back.
+- **Exact labels:** `627.1` and `627.10` stay two pages through the legacy bridge, and Supreme
+  Magus's two chapter-3664 pages stay distinct through the manifest.
+- **Tests:** 84 net new (81 in `test_chapter_preflight.py`, `test_chapter_store_writer.py` and
+  `test_ui_chapter_list.py`), including a real second process holding the lock, interrupted
+  discovery, corrupt/conflicting lists, cross-host separation and the real FreeWebNovel adapter on a
+  synthetic offset novel. Test fixtures use on-host chapter URLs; tests that asserted clamping or
+  the trusting index loader were replaced by refusal and strict-import regressions. A mutation check
+  of 12 key rules found no surviving mutant that applies on Windows. The suite also passes on
+  Python 3.12.10.
+
 ### Added — Chapter manifest store and legacy index import (Checkpoint 03.1, no behaviour change)
 - **Nothing in the app changes yet.** The new store is tested and unwired: the GUI, pipeline
   (including `pipeline._load_index`), catalog, adapters, `RequestManager`, PDF/TXT output, output

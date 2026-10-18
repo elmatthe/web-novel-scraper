@@ -77,7 +77,6 @@ PIPELINE_MESSAGE_RULES: tuple[tuple[str, str, str, bool], ...] = (
     ("prefix", "Building chapter index", INFO, True),
     ("prefix", "discovered ", INFO, True),
     ("prefix", "loaded ", INFO, True),
-    ("prefix", "Clamped requested range", INFO, True),
     ("prefix", "NOTE:", INFO, True),
 )
 

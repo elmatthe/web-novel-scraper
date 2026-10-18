@@ -158,7 +158,7 @@ class _RealRmAdapter:
         self.warnings: list[str] = []
 
     def build_chapter_index(self, spec):
-        return [ChapterMeta(index=1, url="https://example.com/ch1")]
+        return [ChapterMeta(index=1, url="https://freewebnovel.com/novel/shadow-slave/chapter-1")]
 
     def fetch_chapter(self, meta, spec):
         self._rm.fetch(meta.url)  # walks the full ladder; raises FetchError if all fail

@@ -65,12 +65,15 @@ def test_every_marker_still_occurs_in_the_pipeline_source() -> None:
 @pytest.mark.parametrize("line, severity, summary", [
     # Real pipeline/adapter lines (copied from the source), as the GUI receives them.
     ("Building chapter index (TOC) …", INFO, True),
-    ("  discovered 120 chapters; saved chapter_index.json.", INFO, True),
-    ("  loaded 120 chapters from chapter_index.json (resume).", INFO, True),
-    ("Clamped requested range 1-1000000000 to available 1-120 (TOC covers 1-120).", INFO, True),
-    ("NOTE: chapter_index.json uses the old pre-identity format; rebuilding the TOC under "
-     "the current schema.", INFO, True),
-    ("WARNING: chapter_index.json belongs to a different novel/site; rebuilding.", WARNING, True),
+    ("  discovered 120 chapters; saved the chapter list.", INFO, True),
+    ("  loaded 120 chapters from the saved chapter list for freewebnovel.com (no TOC request "
+     "needed).", INFO, True),
+    ("NOTE: chapter list refresh: the saved list was kept as shadow-slave.json.bak-20261018T"
+     "101500Z; the list is being rebuilt from the site (the tracked baseline is unchanged).",
+     INFO, True),
+    ("WARNING: the earlier chapter_index.json in the output folder was not used (The legacy "
+     "index has no identity block, so it cannot be tied to this source.) The chapter list is "
+     "checked against the site instead; the file itself was not changed.", WARNING, True),
     ("DUPLICATE CONTENT: chapter 7 has identical body to the previous chapter; skipping.",
      WARNING, True),
     ("  chapter 5 FAILED: HTTP 403", WARNING, True),

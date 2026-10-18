@@ -9,9 +9,11 @@ and the PDF builder (``create_pdf``), and owns only the run policy:
      before touching the adapter (defense in depth — the GUI greys disabled
      sites, this guard is the pipeline-layer refusal, and the stub adapter's
      ``NotImplementedError`` is the final backstop).
-  2. Build the chapter index once and persist it to ``chapter_index.json`` in the
-     output dir; on a re-run into the same dir it is loaded instead of refetched.
-  3. Clamp the requested ``[start, end]`` to the available TOC range (logged).
+  2. Resolve the chapter list from the validated, source-specific chapter manifest
+     (``chapter_preflight``): a fully covered finite range needs no TOC request, an
+     uncovered window is discovered through the adapter and persisted, and an open-ended
+     range re-checks the tail. A request the list cannot satisfy is refused, never clamped.
+  3. Select the requested chapters by source page URL (never displayed number alone).
   4. For each chapter: skip when its PDF already exists (resume), otherwise fetch
      and collect it. A single failed chapter is recorded and skipped — never
      fatal. The per-fetch ``delay`` and a ``cancel_event`` (Stop button) are
@@ -30,7 +32,6 @@ from __future__ import annotations
 
 import collections
 import inspect
-import json
 import logging
 import re
 import threading
@@ -40,9 +41,12 @@ from pathlib import Path
 from typing import Callable, Iterable, Optional
 
 from . import catalog
+from . import chapter_preflight
 from . import pdf_builder
 from . import rescue_pool as rp
 from .adapters.base import BaseAdapter
+from .chapter_preflight import ChapterListRefused
+from .chapter_store import ChapterManifestStore
 from .host_rate_limiter import HostRateLimiter
 from .models import (
     ChapterContent,
@@ -67,13 +71,10 @@ from .request_manager import (
 
 logger = logging.getLogger(__name__)
 
+# The pre-0.3.0 output-scoped chapter index. It is never written any more and never trusted
+# directly: ``ChapterManifestStore.import_legacy_index`` validates it strictly and, only when it
+# passes, copies its chapters into the runtime manifest. The file itself is left untouched.
 INDEX_FILENAME = "chapter_index.json"
-# v2 (fix-chapter-number-offset): rows carry the URL ``slug`` alongside ``index``,
-# and ``index`` means the site's DISPLAYED chapter number (fractional side-chapters
-# are floats). Older files (v1 dicts and pre-identity bare lists) hold slug-space
-# indexes with no slug column, so they are stale by meaning, not just by shape —
-# the loader rebuilds them rather than trusting them.
-INDEX_SCHEMA_VERSION = 2
 
 # ── 0.2.0 circuit-breaker thresholds (pipeline-owned, headless-only — §3.9) ───
 # The breaker watches PRIMARY network results and, when headless mode is broadly
@@ -191,7 +192,8 @@ class RunReport:
     failed: list[int] = field(default_factory=list)          # ch. still failed after sweep
     permanent_failed: list[int] = field(default_factory=list)  # 403/404 — not swept
     extraction_failed: list[int] = field(default_factory=list)  # fetched OK but no body — not swept, not a block
-    toc_gaps: list[int] = field(default_factory=list)          # missing integer numbers inside the TOC span
+    toc_gaps: list[int] = field(default_factory=list)          # whole numbers the site's list skips inside the range
+    absent_skipped: list[tuple[str, str]] = field(default_factory=list)  # (label, evidence): source-confirmed absent, skipped
     rescued: list[int] = field(default_factory=list)         # ch. saved by rescue (or 2nd-pass sweep)
     warnings: list[str] = field(default_factory=list)        # adapter + pipeline warnings
     cancelled: bool = False
@@ -247,8 +249,13 @@ class RunReport:
             preview = ", ".join(str(i) for i in self.toc_gaps[:20])
             more = " ..." if len(self.toc_gaps) > 20 else ""
             lines.append(
-                "  TOC gaps (chapter numbers absent from chapter_index.json): "
+                "  TOC gaps (chapter numbers the site's chapter list skips): "
                 f"{preview}{more}"
+            )
+        if self.absent_skipped:
+            lines.append(
+                "  Skipped (confirmed absent at the source): "
+                f"{', '.join(label for label, _ in self.absent_skipped[:20])}"
             )
         if self.auto_slowdowns:
             lines.append(
@@ -320,202 +327,32 @@ def resolve_output_dir(
     return root / f"{name}-{n}"
 
 
-def _index_identity(spec: SiteSpec) -> dict:
-    """Identity for an output-dir chapter index.
-
-    ``novel_slug`` is the catalog's canonical per-novel id; paired with the
-    adapter and source URLs it prevents a reused output folder from silently
-    driving a run from another novel/site's TOC.
-    """
-    return {
-        "novel_slug": spec.novel_slug,
-        "adapter_key": spec.adapter_key,
-        "source_url": spec.url,
-        "base_url": spec.base_url,
-    }
+def default_manifest_store() -> ChapterManifestStore:
+    """The chapter manifest store a run uses unless one is injected (tests patch this)."""
+    return ChapterManifestStore()
 
 
-def _identity_summary(identity: Optional[dict]) -> str:
-    if not identity:
-        return "(unknown legacy index)"
-    return (
-        f"novel_slug={identity.get('novel_slug')!r}, "
-        f"adapter_key={identity.get('adapter_key')!r}, "
-        f"source_url={identity.get('source_url')!r}, "
-        f"base_url={identity.get('base_url')!r}"
-    )
-
-
-def _chapter_rows(metas: list[ChapterMeta]) -> list[dict]:
-    return [
-        {
-            "index": m.index,
-            "url": m.url,
-            "title": m.title,
-            "source_id": m.source_id,
-            "slug": m.slug,
-        }
-        for m in metas
-    ]
-
-
-def _index_number(value: object) -> int | float:
-    """Normalize a persisted chapter index: ints stay ints, fractional
-    side-chapter numbers stay floats (627.2), and an integral float collapses
-    back to int so a round-trip can never turn "Chapter 627" into "627.0"."""
-    if isinstance(value, bool):
-        raise TypeError("chapter index cannot be a bool")
-    if isinstance(value, int):
-        return value
-    if isinstance(value, float):
-        return int(value) if value.is_integer() else value
-    raise TypeError(f"chapter index must be numeric, got {type(value).__name__}")
-
-
-def _metas_from_rows(rows: object) -> Optional[list[ChapterMeta]]:
-    if not isinstance(rows, list) or not rows:
-        return None
-    try:
-        return [
-            ChapterMeta(
-                index=_index_number(d["index"]),
-                url=str(d["url"]),
-                title=d.get("title"),
-                source_id=d.get("source_id"),
-                slug=None if d.get("slug") is None else int(d["slug"]),
-            )
-            for d in rows
-        ]
-    except Exception:
-        return None
-
-
-# ── Chapter-index persistence (pipeline-level, output-dir scoped) ─────────────
-def _save_index(
-    index_path: Path,
-    metas: list[ChapterMeta],
-    spec: SiteSpec,
-    *,
-    complete: bool = True,
+def _record_selection(
+    selection: "chapter_preflight.Selection", report: RunReport, log: LogFn
 ) -> None:
-    index_path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "schema_version": INDEX_SCHEMA_VERSION,
-        "identity": _index_identity(spec),
-        "complete": complete,
-        "chapters": _chapter_rows(metas),
-    }
-    temp_path = index_path.with_name(f"{index_path.name}.tmp")
-    temp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    temp_path.replace(index_path)
-
-
-def _load_index(
-    index_path: Path,
-    spec: SiteSpec,
-    *,
-    log: Optional[LogFn] = None,
-) -> Optional[list[ChapterMeta]]:
-    if not index_path.is_file():
-        return None
-    try:
-        raw = json.loads(index_path.read_text(encoding="utf-8"))
-    except Exception:
-        return None
-    if isinstance(raw, list):
-        # Pre-identity bare-list index (pre-0.2.1). Schema v2 changed what
-        # ``index`` MEANS (displayed number, not URL slug) and added the slug
-        # column, so these old rows can silently point at the wrong chapters on
-        # an offset novel — rebuild instead of trusting them. (Supersedes the
-        # 0.2.1 "legacy lists remain trusted" allowance; one TOC re-fetch, logged.)
-        if log is not None:
-            log(
-                "NOTE: chapter_index.json uses the old pre-identity format; "
-                "rebuilding the TOC under the current schema."
-            )
-        return None
-    if not isinstance(raw, dict):
-        return None
-
-    version = raw.get("schema_version")
-    if version != INDEX_SCHEMA_VERSION:
-        # Old-schema dict (v1): rows are slug-space with no slug column — same
-        # staleness-by-meaning as the bare list above. Rebuild, don't trust.
-        if log is not None:
-            log(
-                f"NOTE: chapter_index.json schema v{version!r} is older than the "
-                f"current v{INDEX_SCHEMA_VERSION}; rebuilding the TOC."
-            )
-        return None
-
-    found = raw.get("identity")
-    if isinstance(found, dict):
-        expected = _index_identity(spec)
-        if found != expected:
-            if log is not None:
-                log(
-                    "WARNING: chapter_index.json belongs to a different novel/site; "
-                    "rebuilding the TOC for the current run. "
-                    f"Expected {_identity_summary(expected)}; "
-                    f"found {_identity_summary(found)}."
-                )
-            return None
-
-    if raw.get("complete", True) is False:
-        if log is not None:
-            log(
-                "NOTE: chapter_index.json contains an incomplete TOC "
-                "reconciliation checkpoint; resuming its resolved rows."
-            )
-        return None
-
-    # Missing identity in a dict-shaped file is also unknown/trusted for upgrade
-    # compatibility; only an actual identity mismatch forces a rebuild.
-    return _metas_from_rows(raw.get("chapters"))
-
-
-def _load_partial_index(index_path: Path, spec: SiteSpec) -> list[ChapterMeta]:
-    """Load only a current-schema, identity-matching incomplete checkpoint."""
-    if not index_path.is_file():
-        return []
-    try:
-        raw = json.loads(index_path.read_text(encoding="utf-8"))
-    except Exception:
-        return []
-    if not isinstance(raw, dict) or raw.get("complete", True) is not False:
-        return []
-    if raw.get("schema_version") != INDEX_SCHEMA_VERSION:
-        return []
-    if raw.get("identity") != _index_identity(spec):
-        return []
-    return _metas_from_rows(raw.get("chapters")) or []
-
-
-def _missing_integer_chapters(metas: list[ChapterMeta]) -> list[int]:
-    integers = sorted(
-        {m.index for m in metas if isinstance(m.index, int) and not isinstance(m.index, bool)}
-    )
-    if len(integers) < 2:
-        return []
-    present = set(integers)
-    return [n for n in range(integers[0], integers[-1] + 1) if n not in present]
-
-
-def _record_toc_gaps(metas: list[ChapterMeta], report: RunReport, log: LogFn) -> None:
-    gaps = _missing_integer_chapters(metas)
-    if not gaps:
-        return
-    report.toc_gaps = gaps
-    preview = ", ".join(str(i) for i in gaps[:20])
-    more = " ..." if len(gaps) > 20 else ""
-    warning = (
-        "chapter_index.json has missing integer chapter number(s) inside its "
-        f"available range: {preview}{more}. These chapters will not be fetched "
-        "unless the TOC is rebuilt with corrected numbering."
-    )
-    if warning not in report.warnings:
-        report.warnings.append(warning)
-    log(f"WARNING: {warning}")
+    """Copy what the preflight learned onto the run report, with the existing TOC-gap wording."""
+    report.effective_range = selection.effective_range
+    report.absent_skipped = list(selection.absent)
+    for label, evidence in selection.absent:
+        log(f"NOTE: chapter {label} was skipped: confirmed absent at the source ({evidence}).")
+    if selection.toc_gaps:
+        gaps = selection.toc_gaps
+        report.toc_gaps = gaps
+        preview = ", ".join(str(i) for i in gaps[:20])
+        more = " ..." if len(gaps) > 20 else ""
+        warning = (
+            "The site's chapter list skips chapter number(s) inside the requested range: "
+            f"{preview}{more}. These chapters will not be fetched; they are not recorded as "
+            "absent, so a later run checks the site again."
+        )
+        if warning not in report.warnings:
+            report.warnings.append(warning)
+        log(f"WARNING: {warning}")
 
 
 # ── fix-chapter-number-offset: bounded-window TOC hints ──────────────────────
@@ -674,7 +511,7 @@ def _record_duplicate_output_numbers(
         if count < 2:
             continue
         warning = (
-            f"displayed chapter {index} occurs {count} times in chapter_index.json; "
+            f"displayed chapter {index} occurs {count} times in the chapter list; "
             "later source pages use slug-suffixed filenames so every PDF remains distinct."
         )
         if warning not in report.warnings:
@@ -1131,6 +968,7 @@ def run_scrape(
     primary_adapter_factory: Optional[Callable[[object], object]] = None,
     rescue_pool_factory: Optional[Callable[[], object]] = None,
     phase_cb: Optional[PhaseFn] = None,
+    manifest_store: Optional[ChapterManifestStore] = None,
 ) -> RunReport:
     """Run one scrape job and return a :class:`RunReport`.
 
@@ -1146,6 +984,8 @@ def run_scrape(
         progress_cb: ``(done, total) -> None`` for a determinate progress bar.
         phase_cb: optional ``(phase, total, already_present) -> None`` observer (see
             :data:`PhaseFn`); instrumentation only, it changes no behaviour.
+        manifest_store: the chapter manifest store (tests inject one); defaults to
+            :func:`default_manifest_store`.
         sleep_fn / monotonic_fn: the single injected timing source (the limiter and
             rescue worker both pace off these; tests pass a fake clock).
         host_limiter: the shared per-host limiter (§3.4); built from ``job.delay``
@@ -1159,10 +999,13 @@ def run_scrape(
     Raises:
         AdapterDisabledError: if the resolved catalog row is disabled — the
             pipeline refuses before the adapter is built or called.
+        ChapterListRefused: if the requested range cannot be provided from a verified
+            chapter list (or the list is being updated by another run).
         ChapterIndexUnavailable: on the FWN-rescue path, if the TOC cannot be built
             even after the visible-primary fallback (§3.11).
     """
     log = log if log is not None else logger.info
+    store = manifest_store if manifest_store is not None else default_manifest_store()
 
     # 1. Resolve the catalog row and refuse a disabled site BEFORE the adapter is
     #    built or touched (pipeline-layer defense in depth).
@@ -1190,6 +1033,7 @@ def run_scrape(
         return _run_with_rescue(
             job, spec, output_dir, report, log, cancel_event, progress_cb,
             phase_cb=phase_cb, sleep_fn=sleep_fn, monotonic_fn=monotonic_fn, host_limiter=host_limiter,
+            store=store,
             request_manager_factory=request_manager_factory,
             primary_adapter_factory=primary_adapter_factory,
             rescue_pool_factory=rescue_pool_factory,
@@ -1238,7 +1082,7 @@ def run_scrape(
     try:
         return _drive(
             job, drive_spec, adapter, output_dir, report, log, cancel_event,
-            progress_cb, pacer, phase_cb,
+            progress_cb, pacer, phase_cb, store=store,
         )
     except ScrapeCancelled as exc:
         log(f"Run cancelled: {exc}")
@@ -1260,6 +1104,7 @@ def _run_with_rescue(
     progress_cb: Optional[ProgressFn],
     *,
     phase_cb: Optional[PhaseFn] = None,
+    store: ChapterManifestStore,
     sleep_fn: Callable[[float], None],
     monotonic_fn: Callable[[], float],
     host_limiter: Optional[HostRateLimiter],
@@ -1330,56 +1175,22 @@ def _run_with_rescue(
 
     conductor: Optional[_RescueConductor] = None
     try:
-        # 3. TOC bootstrap (§3.11) — runs BEFORE the pool/breaker engage. A persisted
-        #    index (resume) is loaded instead of refetched.
-        index_path = output_dir / INDEX_FILENAME
-        metas = _load_index(index_path, runtime_spec, log=log)
-        if metas is None:
-            resume_metas = _load_partial_index(index_path, runtime_spec)
+        # 3. Chapter list (§3.11 + v0.3.0 03.2a): the validated manifest decides what is
+        #    discovered; the TOC bootstrap (with its headless -> visible fallback) is only
+        #    the discovery step for a window the manifest does not cover.
+        def discover(**window) -> list[ChapterMeta]:
+            return _bootstrap_toc(primary, spec, report, log, run_cancel, **window)
 
-            def checkpoint_index(
-                partial: list[ChapterMeta], _through: int, _total: int
-            ) -> None:
-                resume_metas[:] = partial
-                _save_index(index_path, partial, runtime_spec, complete=False)
-
-            metas = _bootstrap_toc(
-                primary,
-                spec,
-                report,
-                log,
-                run_cancel,
-                job,
-                resume_metas=resume_metas,
-                index_progress_cb=checkpoint_index,
+        try:
+            in_range = _resolve_chapters(
+                job, spec, store, output_dir, discover, report, log, run_cancel
             )
-            if not metas:
-                report.warnings.append("The chapter index came back empty; nothing to do.")
-                _collect_warnings(primary.adapter, report)
-                return report
-            _save_index(index_path, metas, runtime_spec)
-            log(f"  discovered {len(metas)} chapters; saved {INDEX_FILENAME}.")
-        else:
-            log(f"  loaded {len(metas)} chapters from {INDEX_FILENAME} (resume).")
-
-        metas.sort(key=lambda m: m.index)
-        _record_toc_gaps(metas, report, log)
-        avail_lo, avail_hi = metas[0].index, metas[-1].index
-        start = max(job.start, avail_lo)
-        end = min(job.end, avail_hi)
-        if (start, end) != (job.start, job.end):
-            log(
-                f"Clamped requested range {job.start}-{job.end} to available "
-                f"{start}-{end} (TOC covers {avail_lo}-{avail_hi})."
-            )
-        report.effective_range = (start, end)
-        in_range = [m for m in metas if start <= m.index <= end]
-        if not in_range:
-            report.warnings.append(
-                f"Requested range {job.start}-{job.end} is outside the available "
-                f"chapters {avail_lo}-{avail_hi}; nothing to scrape."
-            )
-            log(report.warnings[-1])
+        except ScrapeCancelled as exc:
+            log(f"Run cancelled: {exc}")
+            report.cancelled = True
+            _collect_warnings(primary.adapter, report)
+            return report
+        if in_range is None:
             _collect_warnings(primary.adapter, report)
             return report
 
@@ -1444,26 +1255,24 @@ def _bootstrap_toc(
     report: RunReport,
     log: LogFn,
     run_cancel: threading.Event,
-    job: ScrapeJob,
     *,
+    start_hint: Optional[int] = None,
+    end_hint: Optional[int] = None,
     resume_metas: Optional[list[ChapterMeta]] = None,
     index_progress_cb: Optional[
         Callable[[list[ChapterMeta], int, int], None]
     ] = None,
 ) -> list[ChapterMeta]:
-    """Build the TOC on the primary mode; on a headless Cloudflare block, switch the
-    primary visible and retry ONCE; if that still fails, abort cleanly (§3.11). A TOC
-    request is NEVER handed to chapter rescue (it has no ``ChapterMeta``).
+    """Discover one window of the TOC on the primary mode; on a headless Cloudflare block,
+    switch the primary visible and retry ONCE; if that still fails, abort cleanly (§3.11). A
+    TOC request is NEVER handed to chapter rescue (it has no ``ChapterMeta``).
 
-    The user's requested ``[start, end]`` is passed through as bounded-window
-    hints (fix-chapter-number-offset Phase 3) so a genuinely offset FreeWebNovel
-    novel's binary search + reconciliation walk jumps near the requested range
-    instead of scanning unbounded from slug 1 — a no-op for every identity novel
-    and for every non-FWN adapter (``_build_chapter_index`` only forwards the
-    hints when the adapter's own method declares them)."""
-    start_hint = job.start
-    end_hint = _end_hint_for(job)
-    log("Building chapter index (TOC) …")
+    The window's ``[start_hint, end_hint]`` is passed through as bounded-window hints
+    (fix-chapter-number-offset Phase 3) so a genuinely offset FreeWebNovel novel's binary
+    search + reconciliation walk jumps near the requested range instead of scanning unbounded
+    from slug 1 — a no-op for every identity novel and for every non-FWN adapter
+    (``_build_chapter_index`` only forwards the hints when the adapter's own method declares
+    them). Which windows are needed is decided by ``chapter_preflight``, not here."""
     try:
         return primary.build_toc(
             start_hint=start_hint,
@@ -1504,6 +1313,39 @@ def _bootstrap_toc(
         raise ChapterIndexUnavailable(
             f"could not build chapter index for {spec.novel_slug!r}: {exc}."
         ) from exc
+
+
+def _resolve_chapters(
+    job: ScrapeJob,
+    spec: SiteSpec,
+    store: ChapterManifestStore,
+    output_dir: Path,
+    discover: Callable[..., list],
+    report: RunReport,
+    log: LogFn,
+    cancel_event: Optional[threading.Event],
+) -> Optional[list[ChapterMeta]]:
+    """The one chapter-selection step both execution paths share (v0.3.0 03.2a).
+
+    Returns the selected chapters, or ``None`` when the site returned no chapter list at all
+    (the report then carries the warning, as before). Refuses with
+    :class:`ChapterListRefused` rather than clamping a range the list cannot satisfy."""
+    selection = chapter_preflight.resolve_chapters(
+        spec,
+        start=job.start,
+        end=_end_hint_for(job),
+        store=store,
+        discover=discover,
+        log=log,
+        legacy_index=output_dir / INDEX_FILENAME,
+        refresh=job.refresh_chapter_list,
+        cancel_event=cancel_event,
+    )
+    if selection.empty_index:
+        report.warnings.append("The chapter index came back empty; nothing to do.")
+        return None
+    _record_selection(selection, report, log)
+    return selection.chapters
 
 
 def _make_on_content(
@@ -1646,61 +1488,17 @@ def _drive(
     progress_cb: Optional[ProgressFn],
     pacer: _Pacer,
     phase_cb: Optional[PhaseFn] = None,
+    *,
+    store: ChapterManifestStore,
 ) -> RunReport:
-    # 3. TOC: load a persisted index (resume) or build + persist it.
-    index_path = output_dir / INDEX_FILENAME
-    metas = _load_index(index_path, spec, log=log)
-    if metas is None:
-        log("Building chapter index (TOC) …")
-        resume_metas = _load_partial_index(index_path, spec)
+    # 3. Chapter list: the validated manifest decides what (if anything) is discovered.
+    def discover(**window) -> list[ChapterMeta]:
+        return _build_chapter_index(adapter, spec, **window)
 
-        def checkpoint_index(
-            partial: list[ChapterMeta], _through: int, _total: int
-        ) -> None:
-            resume_metas[:] = partial
-            _save_index(index_path, partial, spec, complete=False)
-
-        # Bounded-window hints (fix-chapter-number-offset Phase 3): a no-op for
-        # every adapter except FreeWebNovelAdapter, which uses them to bound its
-        # offset-resolution walk to near the requested range.
-        metas = _build_chapter_index(
-            adapter,
-            spec,
-            start_hint=job.start,
-            end_hint=_end_hint_for(job),
-            resume_metas=resume_metas,
-            index_progress_cb=checkpoint_index,
-        )
-        if not metas:
-            report.warnings.append("The chapter index came back empty; nothing to do.")
-            _collect_warnings(adapter, report)
-            return report
-        _save_index(index_path, metas, spec)
-        log(f"  discovered {len(metas)} chapters; saved {INDEX_FILENAME}.")
-    else:
-        log(f"  loaded {len(metas)} chapters from {INDEX_FILENAME} (resume).")
-
-    metas.sort(key=lambda m: m.index)
-    _record_toc_gaps(metas, report, log)
-    avail_lo, avail_hi = metas[0].index, metas[-1].index
-
-    # 4. Clamp the requested range to the available TOC.
-    start = max(job.start, avail_lo)
-    end = min(job.end, avail_hi)
-    if (start, end) != (job.start, job.end):
-        log(
-            f"Clamped requested range {job.start}-{job.end} to available "
-            f"{start}-{end} (TOC covers {avail_lo}-{avail_hi})."
-        )
-    report.effective_range = (start, end)
-
-    in_range = [m for m in metas if start <= m.index <= end]
-    if not in_range:
-        report.warnings.append(
-            f"Requested range {job.start}-{job.end} is outside the available "
-            f"chapters {avail_lo}-{avail_hi}; nothing to scrape."
-        )
-        log(report.warnings[-1])
+    in_range = _resolve_chapters(
+        job, spec, store, output_dir, discover, report, log, cancel_event
+    )
+    if in_range is None:
         _collect_warnings(adapter, report)
         return report
 

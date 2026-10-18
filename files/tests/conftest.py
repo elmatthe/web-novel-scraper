@@ -37,3 +37,19 @@ def _isolated_gui_settings(tmp_path, monkeypatch):
         ui_settings, "SETTINGS_PATH", tmp_path / "runtime-data" / "settings.json"
     )
     monkeypatch.setattr(ui_settings, "LOGS_DIR", tmp_path / "runtime-data" / "logs")
+
+
+@pytest.fixture(autouse=True)
+def _isolated_chapter_lists(tmp_path, monkeypatch):
+    """Give every pipeline run its own empty chapter manifest store (v0.3.0 03.2a), so a test never
+    reads or writes the real ``files/runtime-data/chapter-lists/`` and never sees another test's
+    saved chapter list. Tests that exercise the store pass their own via ``manifest_store=``."""
+    from webnovel_scraper import pipeline
+    from webnovel_scraper.chapter_store import ChapterManifestStore
+
+    store = ChapterManifestStore(
+        baseline_root=tmp_path / "chapter-lists-baseline",
+        runtime_root=tmp_path / "chapter-lists-runtime",
+    )
+    monkeypatch.setattr(pipeline, "default_manifest_store", lambda: store)
+    return store

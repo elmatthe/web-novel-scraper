@@ -138,7 +138,7 @@ class _EmptyExtractionAdapter:
 
     def build_chapter_index(self, spec):
         return [
-            ChapterMeta(index=n, url=f"https://example/{n}")
+            ChapterMeta(index=n, url=f"https://freewebnovel.com/novel/shadow-slave/chapter-{n}")
             for n in range(1, self.count + 1)
         ]
 

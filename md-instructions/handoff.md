@@ -1,6 +1,6 @@
 # webnovel-scraper - Handoff
 
-## Current Snapshot — v0.3.0 Checkpoint 03.1 complete (chapter manifest store, legacy index import)
+## Current Snapshot — v0.3.0 Checkpoint 03.2a complete (manifest preflight, discovery, both pipeline paths)
 **2026-10-18 · HOME-PC (Windows 11) · Claude Code (Sonnet 5.5) · branch
 `feature/v0.3.0-modernization`**
 
@@ -10,9 +10,35 @@
 - **Base:** `577b5db` = `main` (`e7dc407`) plus the FWN offset/duplicate-output
   fix. Checkpoint 00 = `1ab1747`; 01.0 (flat `scripts/`) = `f169565`; 01.1
   (Light/Dark UI foundation, three-section shell) = `e93c21a`; 02.1 =
-  `d7116db`; 02.2 = `3269aa7`; 02.3 = `1da9eac`; 03.0 = `20db263`; 03.1 is the commit after it. `fix/freewebnovel-offset-and-output-collisions` stays local.
+  `d7116db`; 02.2 = `3269aa7`; 02.3 = `1da9eac`; 03.0 = `20db263`; 03.1 = `f5394ea`; 03.2a is the commit after it. `fix/freewebnovel-offset-and-output-collisions` stays local.
 - **Release state:** v0.2.0 is the latest release and tag (2026-06-30). 0.2.1 is
   merged to `main` via PR #4 but untagged. v0.3.0 supersedes it (plan §8 C3).
+- **03.2a recap (the manifest is now authoritative; nothing was run live).** No catalog,
+  adapter, `RequestManager`, HTML-cache, PDF, TXT, output-folder or dependency change; the Resume
+  button is still disabled. Detail: plan §9.11, ADR 010, CHANGELOG.
+  - `chapter_preflight.resolve_chapters` is the one chapter-selection step for `_drive` and
+    `_run_with_rescue` (each injects its own `discover`). Covered finite range = no TOC request;
+    uncovered window discovered, seeded and saved per reconciled window; open end re-checks a
+    64-label tail; an unsatisfiable finite range is refused (`ChapterListRefused`, "Run refused"),
+    never clamped; sparse-TOC gaps are reported and skipped, never recorded absent.
+  - `chapter_store.py`: per-source cross-process writer lock (`file_lock.py`), `record_discovery`
+    (merge, never a bare delta), `refresh_runtime` (`.bak-<utc>[-N]`), `restore_backup`,
+    `load_effective(quarantine=False)` for readers without the lock.
+  - Pipeline: `_load_index`/`_save_index`/`_load_partial_index` removed; `chapter_index.json` is
+    legacy input only (strict `import_legacy_index`, never modified) and is no longer written.
+    `run_scrape(manifest_store=)`, `pipeline.default_manifest_store()`, `ScrapeJob.refresh_chapter_list`.
+  - GUI: one-shot "Refresh chapter list on the next run" box in Advanced Settings.
+  - **Gate:** `scripts/verify.py` PASS, **1211 passed** (1127 + 84), 0 skipped; the full suite also
+    passes on Python 3.12.10. 12-rule mutation check: all caught (the `fcntl` branch cannot run
+    on Windows).
+  - **Behaviour change to tell the owner:** a finite End beyond the site's list is now refused
+    (was clamped); a blank End is the "through the last chapter" form.
+  - **Pending (owner):** review; a live check of one covered re-run (no TOC request), one extension
+    and one Refresh on a real source; macOS lock behaviour (`fcntl`, untested here).
+  - **Known limits:** a persistent sparse-TOC gap is re-asked each run; the HTML cache can still
+    serve a cached index page to the tail re-check (03.2b); no real baselines shipped yet.
+  - **Next:** 03.2b HTML cache provenance/integrity (plan §9.6), only after owner approval.
+    Then 03.3 (run journal, allocator, Resume, retire Folder name) and 03.4.
 - **03.1 recap (chapter manifest store and legacy import; nothing is wired in).** No
   pipeline (`pipeline._load_index` included), GUI, catalog, adapter, `RequestManager`, PDF,
   output-folder or dependency change; the Resume button is still disabled.

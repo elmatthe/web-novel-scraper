@@ -249,7 +249,7 @@ class _LaunchFailAdapter:
         self.warnings: list[str] = []
 
     def build_chapter_index(self, spec):
-        return [ChapterMeta(index=n, url=f"https://example/{n}") for n in range(1, self.count + 1)]
+        return [ChapterMeta(index=n, url=f"https://freewebnovel.com/novel/shadow-slave/chapter-{n}") for n in range(1, self.count + 1)]
 
     def fetch_chapter(self, meta, spec):
         if meta.index == 2:

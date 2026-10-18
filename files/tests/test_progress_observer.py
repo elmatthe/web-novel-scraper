@@ -37,7 +37,7 @@ class _Adapter:
     def build_chapter_index(self, spec):
         if self.toc_raises is not None:
             raise self.toc_raises
-        return [ChapterMeta(index=n, url=f"https://example/{n}", source_id=str(n))
+        return [ChapterMeta(index=n, url=f"https://freewebnovel.com/novel/shadow-slave/chapter-{n}", source_id=str(n))
                 for n in range(1, self.count + 1)]
 
     def fetch_chapter(self, meta, spec):
@@ -55,7 +55,7 @@ class _DuplicateNumbers(_Adapter):
     """Two distinct source pages that both display chapter 3664."""
 
     def build_chapter_index(self, spec):
-        return [ChapterMeta(index=3664, url=f"https://example/{slug}", source_id=str(slug),
+        return [ChapterMeta(index=3664, url=f"https://freewebnovel.com/novel/shadow-slave/chapter-{slug}", source_id=str(slug),
                             slug=slug) for slug in (3678, 3679)]
 
     def fetch_chapter(self, meta, spec):
@@ -63,8 +63,8 @@ class _DuplicateNumbers(_Adapter):
                               paragraphs=[f"Distinct body from source slug {meta.slug}."])
 
 
-def _job(tmp_path, mode=OutputMode.SEPARATE, *, end=5, chunk_size=2) -> ScrapeJob:
-    return ScrapeJob(novel_slug=NOVEL, adapter_key=KEY, start=1, end=end, delay=0.0,
+def _job(tmp_path, mode=OutputMode.SEPARATE, *, start=1, end=5, chunk_size=2) -> ScrapeJob:
+    return ScrapeJob(novel_slug=NOVEL, adapter_key=KEY, start=start, end=end, delay=0.0,
                      output_mode=mode, use_cache=False, output_dir=tmp_path, chunk_size=chunk_size)
 
 
@@ -186,7 +186,7 @@ def test_a_failing_observer_cannot_affect_the_run(tmp_path) -> None:
 
 def test_existing_callers_without_the_observer_still_work(tmp_path) -> None:
     ticks: list[tuple[int, int]] = []
-    report = pipeline.run_scrape(_job(tmp_path), adapter=_Adapter(3), log=lambda _m: None,
+    report = pipeline.run_scrape(_job(tmp_path, end=3), adapter=_Adapter(3), log=lambda _m: None,
                                  progress_cb=lambda d, t: ticks.append((d, t)))
     assert ticks == [(1, 3), (2, 3), (3, 3)] and len(report.written) == 3
 
@@ -234,7 +234,7 @@ def test_chapters_already_present_are_counted_and_reported_as_skipped(tmp_path) 
 
 
 def test_a_whole_run_already_present_reports_no_new_pdfs(tmp_path) -> None:
-    pipeline.run_scrape(_job(tmp_path, OutputMode.SINGLE), adapter=_Adapter(4),
+    pipeline.run_scrape(_job(tmp_path, OutputMode.SINGLE, end=4), adapter=_Adapter(4),
                         log=lambda _m: None)
     run = _Run().run(_job(tmp_path, OutputMode.SINGLE, end=4), adapter=_Adapter(4))
     assert run.phases[0] == ("phase", "scraping", 4, 0) and run.phases[-1][3] == 4
@@ -245,7 +245,7 @@ def test_a_whole_run_already_present_reports_no_new_pdfs(tmp_path) -> None:
 
 
 def test_distinct_source_pages_with_one_displayed_number_are_separate_chapters(tmp_path) -> None:
-    run = _Run().run(_job(tmp_path, end=4000), adapter=_DuplicateNumbers())
+    run = _Run().run(_job(tmp_path, start=3664, end=3664), adapter=_DuplicateNumbers())
     assert run.phases[0] == ("phase", "scraping", 2, 0)
     assert run.progress_calls[-1] == ("progress", 2, 2)
     assert len(run.report.written) == 2

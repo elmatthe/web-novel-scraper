@@ -315,7 +315,7 @@ class _FakeAdapter:
         self.warnings: list[str] = []
 
     def build_chapter_index(self, spec):
-        return [ChapterMeta(index=i, url=f"https://example.invalid/{i}", source_id=str(i))
+        return [ChapterMeta(index=i, url=f"https://freewebnovel.com/novel/shadow-slave/chapter-{i}", source_id=str(i))
                 for i in (1, 2)]
 
     def fetch_chapter(self, meta, spec):

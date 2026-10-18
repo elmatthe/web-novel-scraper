@@ -2,7 +2,7 @@
 
 The pipeline is driven with a **fake adapter** (no network, no real site) that
 returns fixture-shaped ``ChapterMeta`` / ``ChapterContent``, so these tests
-exercise the real run policy — TOC persistence, range clamping, the three output
+exercise the real run policy — manifest-backed chapter lists, range refusal, the three output
 modes, resume (skip existing PDFs), the pipeline-layer disabled-adapter refusal,
 and cancellation — while still building real PDFs through the real PDF builder.
 """
@@ -14,6 +14,8 @@ import threading
 import pytest
 
 from webnovel_scraper import catalog, pipeline
+from webnovel_scraper.chapter_preflight import ChapterListRefused
+from webnovel_scraper.source_identity import SourceIdentity
 from webnovel_scraper.models import (
     ChapterContent,
     ChapterMeta,
@@ -41,7 +43,7 @@ class FakeAdapter:
     def build_chapter_index(self, spec) -> list[ChapterMeta]:
         self.built += 1
         return [
-            ChapterMeta(index=n, url=f"https://example/{n}", source_id=str(n))
+            ChapterMeta(index=n, url=f"https://freewebnovel.com/novel/shadow-slave/chapter-{n}", source_id=str(n))
             for n in range(1, self.count + 1)
         ]
 
@@ -91,7 +93,10 @@ class CheckpointAdapter(FakeAdapter):
         self.built += 1
         self.resume_seen = list(resume_metas or [])
         metas = [
-            ChapterMeta(index=n, url=f"https://example/{n}", source_id=str(n))
+            ChapterMeta(
+                index=n, url=f"https://freewebnovel.com/novel/shadow-slave/chapter-{n}",
+                source_id=str(n), slug=n,
+            )
             for n in range(1, 3)
         ]
         if self.fail_after_checkpoint:
@@ -113,7 +118,7 @@ class DuplicateDisplayedNumberAdapter(FakeAdapter):
         return [
             ChapterMeta(
                 index=3664,
-                url=f"https://example/{slug}",
+                url=f"https://freewebnovel.com/novel/shadow-slave/chapter-{slug}",
                 source_id=str(slug),
                 slug=slug,
             )
@@ -147,8 +152,15 @@ def _pdfs(tmp_path) -> list[str]:
     return sorted(p.name for p in tmp_path.glob("*.pdf"))
 
 
+def _runtime_manifest(store):
+    return store.runtime_path(
+        SourceIdentity.from_site_spec(catalog.get_spec(ENABLED_NOVEL, ENABLED_KEY))
+    )
+
+
 # ── Output modes ─────────────────────────────────────────────────────────────
-def test_separate_mode_writes_one_pdf_per_chapter(tmp_path) -> None:
+def test_separate_mode_writes_one_pdf_per_chapter(tmp_path, _isolated_chapter_lists) -> None:
+    store = _isolated_chapter_lists
     adapter = FakeAdapter(count=5)
     report = pipeline.run_scrape(
         _job(tmp_path, OutputMode.SEPARATE), adapter=adapter, log=lambda m: None
@@ -159,8 +171,9 @@ def test_separate_mode_writes_one_pdf_per_chapter(tmp_path) -> None:
     assert len(_pdfs(tmp_path)) == 5
     assert all(name.startswith("Chapter ") for name in _pdfs(tmp_path))
     assert report.failed == []
-    # The TOC was persisted for resume.
-    assert (tmp_path / pipeline.INDEX_FILENAME).is_file()
+    # The chapter list was persisted in the runtime manifest, not as an output-folder index.
+    assert _runtime_manifest(store).is_file()
+    assert not (tmp_path / pipeline.INDEX_FILENAME).exists()
 
 
 def test_chunked_mode_groups_chapters(tmp_path) -> None:
@@ -201,13 +214,13 @@ def test_resume_skips_existing_separate_pdfs(tmp_path) -> None:
     assert len(_pdfs(tmp_path)) == 5
 
     # Second run into the SAME dir: nothing should be fetched, the index should
-    # be loaded from disk (build not called again), and every chapter is skipped.
+    # be loaded from the saved manifest (build not called again), and every chapter is skipped.
     second = FakeAdapter(count=5)
     report = pipeline.run_scrape(
         _job(tmp_path, OutputMode.SEPARATE), adapter=second, log=lambda m: None
     )
 
-    assert second.built == 0  # TOC loaded from chapter_index.json, not rebuilt
+    assert second.built == 0  # covered by the saved chapter list: no TOC request
     assert second.fetched == []  # no chapter re-fetched
     assert sorted(report.skipped_existing) == [1, 2, 3, 4, 5]
     assert report.written == []
@@ -249,30 +262,51 @@ def test_duplicate_displayed_numbers_write_and_resume_as_distinct_pdfs(tmp_path)
 
 def test_resume_skips_existing_single_pdf(tmp_path) -> None:
     pipeline.run_scrape(
-        _job(tmp_path, OutputMode.SINGLE), adapter=FakeAdapter(count=3),
+        _job(tmp_path, OutputMode.SINGLE, end=3), adapter=FakeAdapter(count=3),
         log=lambda m: None,
     )
     second = FakeAdapter(count=3)
     report = pipeline.run_scrape(
-        _job(tmp_path, OutputMode.SINGLE), adapter=second, log=lambda m: None
+        _job(tmp_path, OutputMode.SINGLE, end=3), adapter=second, log=lambda m: None
     )
     assert second.fetched == []
     assert report.written == []
     assert sorted(report.skipped_existing) == [1, 2, 3]
 
 
-# ── Range clamping ───────────────────────────────────────────────────────────
-def test_range_clamped_to_available_toc(tmp_path) -> None:
+# ── Finite ranges the list cannot satisfy are refused, never clamped ─────────
+def test_finite_range_beyond_the_site_list_is_refused_not_clamped(tmp_path) -> None:
     adapter = FakeAdapter(count=5)
+    with pytest.raises(ChapterListRefused) as refused:
+        pipeline.run_scrape(
+            _job(tmp_path, OutputMode.SEPARATE, start=3, end=99),
+            adapter=adapter,
+            log=lambda m: None,
+        )
+
+    assert "ends at chapter 5" in str(refused.value)
+    assert "6-99" in str(refused.value)
+    assert adapter.fetched == []           # nothing was fetched ...
+    assert _pdfs(tmp_path) == []           # ... and nothing was written
+
+
+def test_an_explicit_range_inside_the_list_runs_and_an_open_end_reaches_the_tail(tmp_path) -> None:
+    inside = FakeAdapter(count=5)
     report = pipeline.run_scrape(
-        _job(tmp_path, OutputMode.SEPARATE, start=3, end=99),
-        adapter=adapter,
+        _job(tmp_path, OutputMode.SEPARATE, start=3, end=4), adapter=inside, log=lambda m: None
+    )
+    assert report.effective_range == (3, 4)
+    assert inside.fetched == [3, 4]
+
+    open_ended = FakeAdapter(count=5)
+    report = pipeline.run_scrape(
+        _job(tmp_path, OutputMode.SEPARATE, start=3, end=10**9),
+        adapter=open_ended,
         log=lambda m: None,
     )
-
     assert report.effective_range == (3, 5)
-    assert adapter.fetched == [3, 4, 5]
-    assert len(_pdfs(tmp_path)) == 3
+    assert open_ended.built == 1           # the open end always re-checks the tail
+    assert open_ended.fetched == [5]       # 3 and 4 were already written by the first run
 
 
 def test_exhausted_chapter_failure_recorded_and_run_continues(tmp_path) -> None:
@@ -306,7 +340,7 @@ def test_toc_gaps_are_reported_even_when_indexed_chapters_write(tmp_path) -> Non
         def build_chapter_index(self, spec) -> list[ChapterMeta]:
             self.built += 1
             return [
-                ChapterMeta(index=n, url=f"https://example/{n}", source_id=str(n))
+                ChapterMeta(index=n, url=f"https://freewebnovel.com/novel/shadow-slave/chapter-{n}", source_id=str(n))
                 for n in (1, 2, 4, 5)
             ]
 
@@ -322,33 +356,35 @@ def test_toc_gaps_are_reported_even_when_indexed_chapters_write(tmp_path) -> Non
     assert report.failed == []
     assert report.toc_gaps == [3]
     assert len(report.written) == 4
-    assert any("missing integer chapter number" in line for line in log_lines)
+    assert any("chapter list skips chapter number" in line for line in log_lines)
     assert "TOC gaps" in report.summary()
     assert "3" in report.summary()
 
 
-def test_incomplete_toc_checkpoint_is_persisted_and_resumed(tmp_path) -> None:
+def test_incomplete_toc_checkpoint_is_persisted_and_resumed(tmp_path, _isolated_chapter_lists) -> None:
+    store = _isolated_chapter_lists
     job = _job(tmp_path, OutputMode.SEPARATE, start=1, end=2)
     first = CheckpointAdapter(fail_after_checkpoint=True)
 
     with pytest.raises(RuntimeError, match="synthetic interruption"):
         pipeline.run_scrape(job, adapter=first, log=lambda _m: None)
 
-    spec = catalog.get_spec(ENABLED_NOVEL, ENABLED_KEY)
-    index_path = tmp_path / pipeline.INDEX_FILENAME
-    assert index_path.is_file()
-    assert pipeline._load_index(index_path, spec) is None
-    partial = pipeline._load_partial_index(index_path, spec)
-    assert [meta.index for meta in partial] == [1]
+    # The interrupted discovery kept what it had resolved, and only claims what it examined.
+    source = SourceIdentity.from_site_spec(catalog.get_spec(ENABLED_NOVEL, ENABLED_KEY))
+    partial = store.load_effective(source).effective
+    assert [c.label.text for c in partial.chapters] == ["1"]
+    assert partial.spans == ((1, 1),)
+    assert not partial.covers(1, 2)
+    assert not (tmp_path / pipeline.INDEX_FILENAME).exists()
 
     second = CheckpointAdapter(fail_after_checkpoint=False)
     report = pipeline.run_scrape(job, adapter=second, log=lambda _m: None)
 
     assert [meta.index for meta in second.resume_seen] == [1]
     assert len(report.written) == 2
-    completed = pipeline._load_index(index_path, spec)
-    assert completed is not None
-    assert [meta.index for meta in completed] == [1, 2]
+    completed = store.load_effective(source).effective
+    assert [c.label.text for c in completed.chapters] == ["1", "2"]
+    assert completed.covers(1, 2)
 
 
 # ── Disabled-adapter refusal (defense in depth) ──────────────────────────────

@@ -159,6 +159,11 @@ class ScrapeJob:
     #                                    internal ceiling, not this field.
     rescue_workers: int = 1            # 0.2.0 is single-lane — validated == 1 below
     #                                    (the 1–5 toggle is DEFERRED to 0.2.1, §9).
+    # ── 0.3.0 03.2a ──────────────────────────────────────────────────────────
+    # One-shot, explicit: back up the saved runtime chapter list (never the tracked
+    # baseline) and rediscover it for this run. Never set silently; the GUI clears it
+    # after every run.
+    refresh_chapter_list: bool = False
 
     def __post_init__(self) -> None:
         # 0.2.0 invariant #1: strictly single-lane rescue. Reject any other count

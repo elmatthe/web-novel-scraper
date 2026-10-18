@@ -84,7 +84,7 @@ class ScriptedAdapter:
 
     def build_chapter_index(self, spec):
         return [
-            ChapterMeta(index=n, url=f"https://example/{n}", source_id=str(n))
+            ChapterMeta(index=n, url=f"https://freewebnovel.com/novel/shadow-slave/chapter-{n}", source_id=str(n))
             for n in range(1, self.count + 1)
         ]
 
@@ -247,7 +247,7 @@ def test_permanent_404_short_circuits_and_is_not_swept(tmp_path) -> None:
 def test_sweep_rescues_in_single_mode_before_pdf_written(tmp_path) -> None:
     adapter = ScriptedAdapter(count=4, fail_until={2: 1})
     report = pipeline.run_scrape(
-        _job(tmp_path, OutputMode.SINGLE), adapter=adapter, log=_noop, sleep_fn=_noop,
+        _job(tmp_path, OutputMode.SINGLE, end=4), adapter=adapter, log=_noop, sleep_fn=_noop,
     )
     assert report.rescued == [2]
     assert report.failed == []

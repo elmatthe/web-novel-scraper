@@ -17,8 +17,11 @@ Both are filed under ``<site_key>/<novel_slug>.json`` where ``site_key`` is the 
 page URL. Contradictions are reported, never resolved by picking a winner, and the coverage they
 touch becomes unverified until rediscovered.
 
-Nothing here is wired into the pipeline yet (03.2 integrates it). The legacy output-scoped
-``chapter_index.json`` import is a separate, explicit store operation.
+The pipeline reaches this store through ``chapter_preflight`` (03.2a). Writing is a
+read-modify-write on one runtime file, so every writer first takes :meth:`ChapterManifestStore.writer_lock`,
+a per-source cross-process lock: a second writer is refused visibly (:class:`ManifestLockBusy`)
+rather than allowed to lose an update. The legacy output-scoped ``chapter_index.json`` import is a
+separate, explicit store operation.
 """
 
 from __future__ import annotations
@@ -27,6 +30,8 @@ import hashlib
 import json
 import os
 import stat
+import threading
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -34,6 +39,7 @@ from typing import Callable, Optional
 from urllib.parse import urlsplit
 
 from .atomic_io import write_json_atomic
+from .file_lock import FileLock, LockBusy
 from .chapter_manifest import (
     LAYER_BASELINE,
     LAYER_RUNTIME,
@@ -77,6 +83,10 @@ _LEGACY_ROW_KEYS = {"index", "url", "title", "source_id", "slug"}
 
 class ManifestStoreError(RuntimeError):
     """A store operation was refused or could not be completed safely (user-actionable)."""
+
+
+class ManifestLockBusy(ManifestStoreError):
+    """Another writer (another run or program instance) is updating this source's chapter list."""
 
 
 # ── effective manifest (baseline + overlay) ──────────────────────────────────
@@ -473,6 +483,23 @@ class EffectiveLoad:
     notices: tuple = ()
 
 
+@dataclass(frozen=True)
+class DiscoveryRecord:
+    """Outcome of :meth:`ChapterManifestStore.record_discovery`.
+
+    ``status`` is ``recorded`` (the overlay was published), ``unchanged`` (everything was already
+    known and covered; nothing written), ``conflict`` (the evidence contradicts verified data;
+    nothing written, ``effective`` is the unchanged projection), ``rejected`` (the evidence itself
+    was not a valid manifest; nothing written) or ``error`` (publishing failed; ``effective`` is
+    the projection the write would have produced, usable for this run only).
+    """
+
+    status: str
+    effective: EffectiveManifest
+    reason: str = ""
+    path: Optional[Path] = None
+
+
 def _quarantine_move(source_path: Path, target_path: Path) -> None:
     """Move an invalid overlay aside (a seam so tests can simulate a locked file)."""
     os.replace(source_path, target_path)
@@ -497,6 +524,9 @@ class ChapterManifestStore:
         self._runtime_root = Path(runtime_root)
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self.app_version = app_version
+        # Writer locks this store instance holds: lock path -> [owner thread, depth, FileLock].
+        self._held: dict[str, list] = {}
+        self._held_guard = threading.Lock()
 
     # -- locations ----------------------------------------------------------
     def baseline_path(self, source: SourceIdentity) -> Path:
@@ -513,6 +543,55 @@ class ChapterManifestStore:
     def now_utc(self) -> str:
         return _utc_text(self._clock())
 
+    # -- single-writer lock -------------------------------------------------
+    def lock_path(self, source: SourceIdentity) -> Path:
+        path = self.runtime_path(source)
+        return path.with_name(f"{path.name}.lock")
+
+    @contextmanager
+    def writer_lock(self, source: SourceIdentity):
+        """Hold the cross-process single-writer lock for ``source`` (non-blocking).
+
+        Cover the whole load -> reconcile -> publish sequence with it. Re-entrant for the
+        thread that holds it, so :meth:`save_runtime` and the operations below may be called
+        inside. Raises :class:`ManifestLockBusy` (and writes nothing) when another run or program
+        instance holds it; the operating system frees it if that holder dies.
+        """
+        key = str(self.lock_path(source))
+        me = threading.get_ident()
+        with self._held_guard:
+            entry = self._held.get(key)
+            if entry is not None and entry[0] == me:
+                entry[1] += 1
+            else:
+                entry = None
+        if entry is None:
+            lock = FileLock(key)
+            try:
+                lock.acquire()
+            except LockBusy as exc:
+                raise ManifestLockBusy(
+                    f"Another run or program instance is updating the saved chapter list for "
+                    f"{source.novel_slug} on {source.site_key}. Wait for it to finish (or close it) "
+                    "and try again; nothing was changed."
+                ) from exc
+            except OSError as exc:
+                raise ManifestStoreError(
+                    f"The chapter list lock for {source.novel_slug} on {source.site_key} could not "
+                    f"be taken ({exc}); nothing was changed."
+                ) from exc
+            with self._held_guard:
+                self._held[key] = [me, 1, lock]
+        try:
+            yield
+        finally:
+            with self._held_guard:
+                held = self._held[key]
+                held[1] -= 1
+                if held[1] == 0:
+                    del self._held[key]
+                    held[2].release()
+
     # -- reading ------------------------------------------------------------
     @staticmethod
     def _read_bytes(path: Path) -> bytes:
@@ -526,9 +605,12 @@ class ChapterManifestStore:
         with open(path, "rb") as handle:
             return handle.read(MAX_MANIFEST_BYTES + 1)
 
-    def load_layer(self, source: SourceIdentity, layer: str) -> LayerLoad:
+    def load_layer(
+        self, source: SourceIdentity, layer: str, *, quarantine: bool = True
+    ) -> LayerLoad:
         """Load and validate one layer. A bad baseline is only reported; a bad overlay is
-        quarantined (see the module docstring)."""
+        quarantined (see the module docstring) unless ``quarantine`` is false, which a reader
+        that does not hold the writer lock uses so that it never moves a file."""
         path = self._path(source, layer)
         if not os.path.lexists(path):
             return LayerLoad(layer, path, "missing")
@@ -544,10 +626,18 @@ class ChapterManifestStore:
                 raise ManifestError(f"{path.name} is a folder, not a manifest file.")
             manifest = parse_manifest_bytes(data, expected_source=source, expected_layer=layer)
         except ManifestError as exc:
-            return self._reject(layer, path, str(exc))
+            return self._reject(layer, path, str(exc), quarantine)
         return LayerLoad(layer, path, "loaded", manifest=manifest)
 
-    def _reject(self, layer: str, path: Path, reason: str) -> LayerLoad:
+    def _reject(self, layer: str, path: Path, reason: str, quarantine: bool = True) -> LayerLoad:
+        if layer != LAYER_BASELINE and not quarantine:
+            return LayerLoad(
+                layer, path, "invalid",
+                error=(
+                    f"The runtime chapter list {path.name} was rejected ({reason}) and left in place "
+                    "because another run is updating the chapter lists."
+                ),
+            )
         if layer == LAYER_BASELINE:
             return LayerLoad(
                 layer, path, "invalid",
@@ -575,12 +665,16 @@ class ChapterManifestStore:
         )
 
     def _quarantine(self, path: Path) -> Path:
-        """Rename ``path`` to a never-used ``<name>.corrupt-<utc>[-N]`` beside it. The target
-        name is claimed exclusively first, so an existing file is never overwritten."""
+        return self._set_aside(path, "corrupt")
+
+    def _set_aside(self, path: Path, tag: str) -> Path:
+        """Rename ``path`` to a never-used ``<name>.<tag>-<utc>[-N]`` beside it (``corrupt`` for
+        an invalid overlay, ``bak`` for an explicit refresh). The target name is claimed
+        exclusively first, so an existing file is never overwritten."""
         stamp = self._clock().astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         for attempt in range(_MAX_QUARANTINE_TRIES):
             suffix = f"-{attempt}" if attempt else ""
-            target = path.with_name(f"{path.name}.corrupt-{stamp}{suffix}")
+            target = path.with_name(f"{path.name}.{tag}-{stamp}{suffix}")
             try:
                 fd = os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
             except FileExistsError:
@@ -595,12 +689,12 @@ class ChapterManifestStore:
                     pass
                 raise
             return target
-        raise OSError(f"no free quarantine name beside {path.name}")
+        raise OSError(f"no free {tag} name beside {path.name}")
 
-    def load_effective(self, source: SourceIdentity) -> EffectiveLoad:
+    def load_effective(self, source: SourceIdentity, *, quarantine: bool = True) -> EffectiveLoad:
         """Load both layers and merge whatever is valid."""
         baseline = self.load_layer(source, LAYER_BASELINE)
-        runtime = self.load_layer(source, LAYER_RUNTIME)
+        runtime = self.load_layer(source, LAYER_RUNTIME, quarantine=quarantine)
         effective = merge_manifests(source, baseline.manifest, runtime.manifest)
         notices = [layer.error for layer in (baseline, runtime) if layer.error]
         notices.extend(effective.notices())
@@ -626,14 +720,15 @@ class ChapterManifestStore:
                 f"The chapter list is larger than the {MAX_MANIFEST_BYTES // (1024 * 1024)} MB limit."
             )
         path = self.runtime_path(source)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        if os.path.lexists(path):
-            existing = self.load_layer(source, LAYER_RUNTIME)
-            if existing.status in ("quarantine-failed", "unreadable"):
-                raise ManifestStoreError(
-                    f"{existing.error} Nothing was written, so that file's contents are preserved."
-                )
-        write_json_atomic(path, payload)
+        with self.writer_lock(source):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if os.path.lexists(path):
+                existing = self.load_layer(source, LAYER_RUNTIME)
+                if existing.status in ("quarantine-failed", "unreadable"):
+                    raise ManifestStoreError(
+                        f"{existing.error} Nothing was written, so that file's contents are preserved."
+                    )
+            write_json_atomic(path, payload)
         return path
 
     # -- legacy migration (explicit, read-only on the old file) -------------
@@ -667,6 +762,16 @@ class ChapterManifestStore:
         except ManifestError as exc:
             return LegacyImportResult("rejected", str(exc), legacy_sha256=digest)
 
+        try:
+            with self.writer_lock(source):
+                return self._import_candidate(source, candidate, digest)
+        except ManifestLockBusy as exc:
+            return LegacyImportResult("error", str(exc), legacy_sha256=digest)
+
+    def _import_candidate(
+        self, source: SourceIdentity, candidate: ChapterManifest, digest: str
+    ) -> LegacyImportResult:
+        """The locked read-modify-write half of :meth:`import_legacy_index`."""
         loaded = self.load_effective(source)
         existing = [("baseline", loaded.baseline.manifest), ("runtime overlay", loaded.runtime.manifest)]
         for name, manifest in existing:
@@ -713,3 +818,112 @@ class ChapterManifestStore:
                 "error", f"The imported chapter list could not be saved: {exc}", legacy_sha256=digest
             )
         return LegacyImportResult("imported", chapters=len(candidate.chapters), legacy_sha256=digest)
+
+    # -- discovery evidence + explicit refresh ------------------------------
+    def record_discovery(
+        self,
+        source: SourceIdentity,
+        chapters: "list[ChapterIdentity]",
+        spans: "tuple[tuple[int, int], ...]",
+        *,
+        method: str = "walk",
+        notes: str = "",
+    ) -> DiscoveryRecord:
+        """Merge freshly discovered chapters and the spans they actually examined into the overlay.
+
+        Everything already in the overlay is kept (a discovery delta is never saved on its own),
+        the baseline is never touched, and evidence that contradicts either layer is refused
+        rather than resolved. Load, merge and publish happen under :meth:`writer_lock`, so two
+        processes cannot lose each other's update; a busy lock raises :class:`ManifestLockBusy`.
+        """
+        with self.writer_lock(source):
+            loaded = self.load_effective(source)
+            now = self.now_utc()
+            try:
+                candidate = ChapterManifest.create(
+                    layer=LAYER_RUNTIME,
+                    source=source,
+                    provenance=Provenance(
+                        generated_utc=now, validated_utc=now, app_version=self.app_version,
+                        method=method, notes=notes[:_MAX_NOTES],
+                    ),
+                    spans=spans,
+                    chapters=chapters,
+                )
+            except ManifestError as exc:
+                return DiscoveryRecord("rejected", loaded.effective, str(exc))
+            for name, manifest in (
+                ("baseline", loaded.baseline.manifest), ("runtime overlay", loaded.runtime.manifest)
+            ):
+                if manifest is None:
+                    continue
+                clashes = _merge(source, [(name, manifest), ("discovery", candidate)]).conflicts
+                if clashes:
+                    return DiscoveryRecord(
+                        "conflict", loaded.effective,
+                        "The discovered chapters contradict verified data: "
+                        + " ".join(c.message for c in clashes),
+                    )
+            known = {c.page_url for c in loaded.effective.chapters}
+            if all(c.page_url in known for c in candidate.chapters) and all(
+                loaded.effective.covers(a, b) for a, b in candidate.spans
+            ):
+                return DiscoveryRecord("unchanged", loaded.effective)
+
+            overlay = loaded.runtime.manifest
+            merged = _merge(source, [("runtime overlay", overlay), ("discovery", candidate)])
+            result = merged.as_manifest(
+                LAYER_RUNTIME,
+                Provenance(
+                    generated_utc=overlay.provenance.generated_utc if overlay else now,
+                    validated_utc=now,
+                    app_version=self.app_version,
+                    method=overlay.provenance.method if overlay else method,
+                    legacy_index_sha256=overlay.provenance.legacy_index_sha256 if overlay else None,
+                    notes=(overlay.provenance.notes if overlay else notes)[:_MAX_NOTES],
+                ),
+            )
+            projected = merge_manifests(source, loaded.baseline.manifest, result)
+            try:
+                path = self.save_runtime(result)
+            except (OSError, ManifestError, ManifestStoreError) as exc:
+                return DiscoveryRecord("error", projected, f"The chapter list could not be saved: {exc}")
+            return DiscoveryRecord("recorded", projected, path=path)
+
+    def refresh_runtime(self, source: SourceIdentity) -> Optional[Path]:
+        """Set the current runtime overlay aside as ``<name>.bak-<utc>[-N]`` so it is rediscovered.
+
+        The baseline is never touched. Returns the backup path, or ``None`` when there was no
+        overlay. The backup name is claimed exclusively, so an earlier backup is never replaced;
+        if the overlay cannot be moved it stays exactly where it was and
+        :class:`ManifestStoreError` is raised.
+        """
+        with self.writer_lock(source):
+            path = self.runtime_path(source)
+            if not os.path.lexists(path):
+                return None
+            try:
+                return self._set_aside(path, "bak")
+            except OSError as exc:
+                raise ManifestStoreError(
+                    f"The saved chapter list {path.name} could not be backed up ({exc}); it was left "
+                    "unchanged and nothing was refreshed."
+                ) from exc
+
+    def restore_backup(self, source: SourceIdentity, backup: str | os.PathLike[str]) -> bool:
+        """Put a :meth:`refresh_runtime` backup back, but only if no overlay exists again yet.
+
+        Used when a refresh fails before it recorded anything, so a failed refresh does not leave
+        the user without the list they had. Returns whether the backup was restored; a backup is
+        never moved over a newer overlay.
+        """
+        with self.writer_lock(source):
+            path = self.runtime_path(source)
+            backup_path = Path(backup)
+            if os.path.lexists(path) or not backup_path.is_file():
+                return False
+            try:
+                os.replace(backup_path, path)
+            except OSError:
+                return False
+            return True

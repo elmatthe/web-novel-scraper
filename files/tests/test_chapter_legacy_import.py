@@ -490,8 +490,10 @@ def test_parse_legacy_index_raises_a_specific_rejection():
         parse_legacy_index(src(), b"[]", now_utc="2026-10-18T12:00:00Z", app_version="0.3.0")
 
 
-def test_legacy_loader_in_the_pipeline_is_unchanged_by_this_checkpoint():
-    """03.1 adds a safer migration API but leaves pipeline._load_index alone (03.2 swaps it)."""
+def test_the_pipeline_no_longer_has_its_own_trusting_index_loader():
+    """03.2a replaced pipeline._load_index (which accepted an identity-less v2 dict) with this
+    module's strict import, reached through the preflight."""
     from webnovel_scraper import pipeline
-    assert pipeline.INDEX_SCHEMA_VERSION == 2
-    assert not hasattr(pipeline, "chapter_store") and not hasattr(pipeline, "ChapterManifestStore")
+    for name in ("_load_index", "_save_index", "_load_partial_index", "INDEX_SCHEMA_VERSION"):
+        assert not hasattr(pipeline, name), name
+    assert pipeline.INDEX_FILENAME == "chapter_index.json"  # still the name import_legacy_index reads

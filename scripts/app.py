@@ -80,6 +80,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from webnovel_scraper import catalog, pipeline  # noqa: E402
 from webnovel_scraper.models import OutputMode, ScrapeJob  # noqa: E402
+from webnovel_scraper.chapter_preflight import ChapterListRefused  # noqa: E402
 from webnovel_scraper.registry import AdapterDisabledError  # noqa: E402
 from webnovel_scraper.ui import appearance, run_activity, run_progress, selection  # noqa: E402
 from webnovel_scraper.ui import settings as ui_settings  # noqa: E402
@@ -152,6 +153,15 @@ HEADLESS_HINT = (
     "If Cloudflare broadly blocks headless mode, the app may automatically open and "
     "keep a visible browser for the rest of the run; hard chapters may also open a "
     "visible rescue browser."
+)
+# Chapter list (v0.3.0 03.2a): chapter lists are saved per website and novel and reused, so a
+# run needs no table-of-contents request for chapters it already knows. This one-shot box asks the
+# next run to rebuild the saved list from the site; the old list is kept as a backup file and the
+# box clears itself after every run, so a refresh is never silent or repeated.
+REFRESH_LABEL = "Refresh chapter list on the next run"
+REFRESH_HINT = (
+    "Rebuilds the saved chapter list from the site. The current saved list is kept as a "
+    ".bak backup file. Applies to the next run only."
 )
 ADVANCED_NOTE = (
     "These settings are read when you press Start and are locked while a run is "
@@ -360,6 +370,7 @@ class ScraperApp(tk.Tk):
             (rb_chunk, "normal"),
             (rb_single, "normal"),
             (self._cache_check, "normal"),
+            (self._refresh_check, "normal"),
         ]
 
         self._on_mode_change()
@@ -790,14 +801,22 @@ class ScraperApp(tk.Tk):
         )
         self._cache_check.grid(row=0, column=0, columnspan=2, sticky="w")
 
+        chapters = group("Chapter list", 3)
+        self._refresh_var = tk.BooleanVar(value=False)
+        self._refresh_check = ttk.Checkbutton(
+            chapters, text=REFRESH_LABEL, variable=self._refresh_var, style=s["checkbutton"],
+        )
+        self._refresh_check.grid(row=0, column=0, columnspan=2, sticky="w")
+        hint(chapters, REFRESH_HINT, 1, indent)
+
         ttk.Label(
             outer, text=ADVANCED_NOTE, style=s["status_label"], wraplength=wrap,
             justify="left",
-        ).grid(row=3, column=0, sticky="w", pady=(m["gap_md"], 0))
+        ).grid(row=4, column=0, sticky="w", pady=(m["gap_md"], 0))
         self._advanced_close = ttk.Button(
             outer, text="Close", command=self.close_advanced_settings, style=s["button"]
         )
-        self._advanced_close.grid(row=4, column=0, sticky="e", pady=(m["gap_md"], 0))
+        self._advanced_close.grid(row=5, column=0, sticky="e", pady=(m["gap_md"], 0))
         return e_delay, e_timeout
 
     # ── Appearance + window fit ──────────────────────────────────────────────
@@ -1243,7 +1262,11 @@ class ScraperApp(tk.Tk):
             use_browser=use_browser,
             headless=bool(self._headless_var.get()),
             request_timeout=timeout,
+            refresh_chapter_list=bool(self._refresh_var.get()),
         )
+        # One-shot: the request now travels on the job, so clear the box. A refresh is never
+        # repeated on a later run unless the user asks for it again.
+        self._refresh_var.set(False)
 
         # The GUI no longer pre-builds a RequestManager (§3.15): the pipeline OWNS
         # and may REPLACE the active primary manager (TOC fallback / breaker switch),
@@ -1264,7 +1287,8 @@ class ScraperApp(tk.Tk):
             settings=(
                 f"delay {delay:g} s, timeout {timeout} s, browser mode {browser}, "
                 f"HTTP first {'on' if http_first else 'off'}, "
-                f"HTML cache {'on' if job.use_cache else 'off'}."
+                f"HTML cache {'on' if job.use_cache else 'off'}"
+                f"{', chapter list refresh requested' if job.refresh_chapter_list else ''}."
             ),
         ))
 
@@ -1366,7 +1390,7 @@ class ScraperApp(tk.Tk):
                 progress_cb=progress,
                 phase_cb=self._thread_phase,
             )
-        except AdapterDisabledError as exc:
+        except (AdapterDisabledError, ChapterListRefused) as exc:
             refused = exc
         except Exception as exc:  # never let the worker thread die silently
             error = exc

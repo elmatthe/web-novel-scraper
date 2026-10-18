@@ -166,29 +166,22 @@ def test_fractional_index_renders_naturally_in_heading_and_filename() -> None:
     assert sorted([628, 627.2, 627]) == [627, 627.2, 628]
 
 
-# ── Pins: chapter_index.json schema v2 ───────────────────────────────────────
-def test_index_roundtrip_preserves_slug_and_fractional_index(tmp_path) -> None:
+# ── Pins: the manifest bridge keeps slug and fractional labels intact ─────────
+def test_manifest_bridge_preserves_slug_and_fractional_index() -> None:
+    from webnovel_scraper import chapter_preflight as pre
+    from webnovel_scraper.source_identity import SourceIdentity
+
+    source = SourceIdentity.from_site_spec(SM_SPEC)
     metas = [
         ChapterMeta(index=627, url=fwn.chapter_url_for(SM_SPEC, 629), slug=629),
         ChapterMeta(index=627.2, url=fwn.chapter_url_for(SM_SPEC, 630), slug=630),
         ChapterMeta(index=628, url=fwn.chapter_url_for(SM_SPEC, 635), slug=635),
     ]
-    path = tmp_path / pipeline.INDEX_FILENAME
-    pipeline._save_index(path, metas, SM_SPEC)
-    loaded = pipeline._load_index(path, SM_SPEC)
-    assert loaded == metas
-    assert [type(m.index) for m in loaded] == [int, float, int]
-    assert [m.slug for m in loaded] == [629, 630, 635]
-
-
-def test_index_number_normalization() -> None:
-    assert pipeline._index_number(627) == 627
-    assert type(pipeline._index_number(627.0)) is int  # never "Chapter 627.0"
-    assert pipeline._index_number(627.2) == 627.2
-    with pytest.raises(TypeError):
-        pipeline._index_number("627")
-    with pytest.raises(TypeError):
-        pipeline._index_number(True)
+    back = [pre.meta_from_identity(pre.identity_from_meta(source, m)) for m in metas]
+    assert [m.index for m in back] == [627, 627.2, 628]
+    assert [type(m.index) for m in back] == [int, float, int]  # never "Chapter 627.0"
+    assert [m.slug for m in back] == [629, 630, 635]
+    assert [m.url for m in back] == [m.url for m in metas]
 
 
 # ── Phase 2: displayed-number addressing (formerly xfail targets) ───────────
