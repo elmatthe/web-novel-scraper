@@ -29,7 +29,7 @@
 | 04 | `c1b03af` | LOTM 1/2 on .com and .net, headless-first browser (ADR 016) |
 | 06 | `fb7dfe9` | Stop during builds, offline open-ended runs, memory |
 | 07 | `3fd7b99` | Windows setup and repair (ADR 017), review fixes, cache-hit pacing, `files/audit_run.py` |
-| Acceptance round 1 | (pending) | .net irregular chapter addresses (LOTM 1303), smooth preparing bar, ETA ignores cached chapters |
+| Acceptance round 1 | `89ce3da` | .net irregular chapter addresses (LOTM 1303), smooth preparing bar, ETA ignores cached chapters |
 
 The round-1 commit is the last code commit; the commit after it only records its SHA here.
 
@@ -59,7 +59,7 @@ Whole-novel runs: **none yet** (owner checklist item 11).
 - Older deferred minors #3–#6 from `files/test-logs/v0.1.0_pre-release.md` remain for owner review.
 
 ## Log (newest first; Git has the full record)
-- 2026-10-18 · acceptance round 1: .net list reader accepts a misspelt chapter address only when it is a
+- 2026-10-18 · acceptance round 1 `89ce3da`: .net list reader accepts a misspelt chapter address only when it is a
   single page of the novel whose number matches (LOTM 1303); indeterminate bar on a fixed scale;
   `phase_cb` carries `from_cache` so cached chapters stay out of the ETA (plan §9.18).
 - 2026-10-18 · 07 `3fd7b99`: launcher rewrite (`setup_check.py`, `install_python.ps1`), start-up engine warning,
