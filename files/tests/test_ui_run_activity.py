@@ -119,7 +119,9 @@ def test_raw_pipeline_text_is_kept_in_detailed() -> None:
 def test_progress_and_finish_are_job_events() -> None:
     progress = ra.progress_event(3, 10)
     assert progress.kind == "job" and progress.coalesce_key == ra.PROGRESS_KEY
-    assert progress.payload == ra.ProgressUpdate(3, 10)
+    assert (progress.payload.done, progress.payload.total) == (3, 10)
+    assert progress.payload.at > 0  # stamped when the worker made the call
+    assert ra.progress_event(3, 10, at=12.5).payload == ra.ProgressUpdate(3, 10, 12.5)
     finish = ra.finished_event("completed")
     assert finish.kind == "job" and finish.coalesce_key is None and finish.important
     assert finish.payload == ra.RunFinished("completed")
@@ -242,3 +244,124 @@ def test_every_outcome_ends_with_the_run_ended_line(tmp_path) -> None:
         outcome, events = ra.outcome_events(case.pop("report"), **case)
         assert outcome in ra.OUTCOMES
         assert events[-1].message == ra.RUN_ENDED_LINE and not events[-1].summary
+
+
+# ── v0.3.0 Checkpoint 02.2: coverage, unaccounted chapters, result totals ─────────
+def _covered(tmp_path, requested, effective, **fields) -> RunReport:
+    return RunReport(output_dir=tmp_path, requested_range=requested, effective_range=effective,
+                     written=[tmp_path / "c.pdf"], **fields)
+
+
+def test_an_open_ended_request_is_never_called_cut_short(tmp_path) -> None:
+    """"Through the last available chapter" is the 10**9 sentinel: the list ending at 2950
+    is not a shortfall."""
+    report = _covered(tmp_path, (1, 10**9), (1, 2950))
+    outcome, events = ra.outcome_events(report, processed=(1, 1))
+    assert outcome == "completed"
+    assert not any("chapter list ends" in line for line in _summary(events))
+    assert ra.UNBOUNDED_END <= 10**9
+
+
+def test_unbounded_threshold_matches_the_pipeline() -> None:
+    from webnovel_scraper import pipeline
+    assert ra.UNBOUNDED_END == pipeline._UNBOUNDED_END_THRESHOLD
+
+
+def test_an_explicit_end_beyond_the_site_list_is_reported(tmp_path) -> None:
+    report = _covered(tmp_path, (1, 5000), (1, 4000))
+    outcome, events = ra.outcome_events(report, processed=(1, 1))
+    assert outcome == "completed"                        # everything the site listed was saved
+    assert ("Warning: The site's chapter list ends at chapter 4000, so chapters 4001 to 5000 "
+            "are not available.") in _summary(events)
+
+
+def test_an_end_that_the_list_reaches_exactly_is_not_a_shortfall(tmp_path) -> None:
+    _, events = ra.outcome_events(_covered(tmp_path, (1, 4000), (1, 4000)), processed=(1, 1))
+    assert not any("chapter list" in line for line in _summary(events))
+
+
+def test_a_start_before_the_list_begins_is_reported(tmp_path) -> None:
+    _, events = ra.outcome_events(_covered(tmp_path, (1, 50), (3, 50)), processed=(1, 1))
+    assert ("Warning: The site's chapter list starts at chapter 3, so chapters 1 to 2 "
+            "are not available.") in _summary(events)
+
+
+def test_gaps_in_the_site_list_count_only_inside_the_selected_range(tmp_path) -> None:
+    report = _covered(tmp_path, (10, 20), (10, 20), toc_gaps=[3, 12, 15, 40])
+    _, events = ra.outcome_events(report, processed=(1, 1))
+    assert "Warning: Not on the site's chapter list, so not saved: 12, 15." in _summary(events)
+    assert ra.final_counts(report).not_listed == 2
+
+
+def test_a_range_outside_the_list_reports_the_pipelines_own_reason(tmp_path) -> None:
+    report = RunReport(output_dir=tmp_path, requested_range=(5000, 6000),
+                       effective_range=(5000, 4000),
+                       warnings=["Requested range 5000-6000 is outside the available chapters "
+                                 "1-4000; nothing to scrape."])
+    outcome, events = ra.outcome_events(report)
+    summary = _summary(events)
+    assert outcome == "nothing_written"
+    assert "Warning: Requested range 5000-6000 is outside the available chapters 1-4000; " \
+           "nothing to scrape." in summary
+    assert not any("chapter list ends" in line for line in summary)   # an inverted span is skipped
+
+
+def test_other_warnings_point_to_detailed(tmp_path) -> None:
+    report = _covered(tmp_path, (1, 3), (1, 3), warnings=["a", "b"])
+    _, events = ra.outcome_events(report, processed=(1, 1))
+    assert "Warning: 2 warnings recorded; Detailed lists them." in _summary(events)
+
+
+def test_chapters_the_pipeline_did_not_account_for_are_not_a_success(tmp_path) -> None:
+    """A run that ended normally but whose own count stops short must not read 'Completed'."""
+    outcome, events = ra.outcome_events(_report(tmp_path, written=[tmp_path / "c.pdf"]),
+                                        processed=(38, 40))
+    assert outcome == "completed_with_problems"
+    assert _summary(events)[0] == "Warning: Finished, but 2 selected chapters could not be accounted for."
+    outcome, _ = ra.outcome_events(_report(tmp_path, written=[tmp_path / "c.pdf"], cancelled=True),
+                                   processed=(38, 40))
+    assert outcome == "stopped"                          # an early stop is expected to stop short
+
+
+def test_a_resumed_run_with_nothing_new_to_write_says_why(tmp_path) -> None:
+    _, events = ra.outcome_events(_report(tmp_path, skipped_existing=[1, 2, 3]), processed=(3, 3))
+    assert _summary(events)[0] == ("Completed: every selected chapter was already in the output "
+                                   "folder, so no new PDFs were written.")
+
+
+def test_final_counts_come_from_the_report_not_the_progress(tmp_path) -> None:
+    report = _report(tmp_path, written=[tmp_path / "a.pdf", tmp_path / "b.pdf"],
+                     skipped_existing=[1, 2], failed=[3, 4], permanent_failed=[4],
+                     extraction_failed=[5], rescued=[6, 3])
+    counts = ra.final_counts(report)
+    assert counts.pdfs == 2 and counts.already_present == 2
+    assert counts.failed == 3                            # 3, 4 and 5 once each
+    assert counts.recovered == 1                         # 3 was rescued but is still listed failed
+    assert ra.final_counts(None) is None and ra.final_counts(object()) is None
+
+
+def test_the_status_word_and_the_summary_agree_for_every_kind_of_report(tmp_path) -> None:
+    from webnovel_scraper.ui import run_progress as rpg
+    written = [tmp_path / "c.pdf"]
+    cases = {
+        "completed": (_report(tmp_path, written=written), None, None, (3, 3)),
+        "completed_with_problems": (_report(tmp_path, written=written, failed=[2]), None, None, (3, 3)),
+        "nothing_written": (_report(tmp_path), None, None, (0, 0)),
+        "stopped": (_report(tmp_path, written=written, cancelled=True), None, None, (1, 3)),
+        "failed": (None, RuntimeError("x"), None, (1, 3)),
+        "refused": (None, None, ValueError("x"), None),
+        "unconfirmed": (None, None, None, (3, 3)),
+    }
+    assert set(cases) == set(ra.OUTCOMES)
+    for expected, (report, error, refused, processed) in cases.items():
+        outcome, events = ra.outcome_events(report, processed=processed, error=error, refused=refused)
+        assert outcome == expected
+        tracker = rpg.RunTracker()
+        tracker.start()
+        tracker.finish(outcome, processed=processed, counts=ra.final_counts(report))
+        view = tracker.view()
+        first = _summary(events)[0]
+        # The Run section's severity matches the first Summary line's label.
+        label = {"warning": "Warning:", "error": "Error:"}.get(view.severity)
+        assert (label is None and not first.startswith(("Warning:", "Error:"))) or \
+               (label is not None and first.startswith(label)), (outcome, first, view.severity)

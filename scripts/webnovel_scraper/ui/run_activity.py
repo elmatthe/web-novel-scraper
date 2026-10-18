@@ -1,9 +1,11 @@
 """What a scrape run tells the Activity panel: start lines, pipeline messages, the outcome.
 
 The window owns the run's structured events (start, stop, outcome); the pipeline still speaks
-through its existing ``log(str)`` and ``progress_cb(done, total)`` callbacks, which this module
-turns into :class:`~webnovel_scraper.ui.activity.ActivityEvent` objects without changing the
-pipeline. Pure functions, no Tk: the worker thread may call any of them.
+through its existing ``log(str)`` and ``progress_cb(done, total)`` callbacks plus, since
+Checkpoint 02.2, the optional observability-only ``phase_cb(phase, total, already_present)``.
+This module turns them into :class:`~webnovel_scraper.ui.activity.ActivityEvent` objects
+without changing the pipeline. Pure functions, no Tk: the worker thread may call any of them.
+The Run section's state lives in :mod:`webnovel_scraper.ui.run_progress`.
 
 The pipeline-message bridge
 ---------------------------
@@ -23,22 +25,28 @@ a run that processed 100% of its chapters with failures is reported as finished 
 
 from __future__ import annotations
 
+import time
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
 
 from webnovel_scraper.ui.activity import ERROR, INFO, WARNING, ActivityEvent
+from webnovel_scraper.ui.run_progress import FinalCounts
 
 __all__ = [
-    "ORIGIN_RUN", "ORIGIN_PIPELINE", "PROGRESS_KEY", "SEPARATOR", "RUN_ENDED_LINE",
-    "PIPELINE_MESSAGE_RULES", "ProgressUpdate", "RunFinished", "OUTCOMES",
-    "classify_pipeline_message", "pipeline_event", "progress_event", "finished_event",
-    "run_started_events", "outcome_events",
+    "ORIGIN_RUN", "ORIGIN_PIPELINE", "PROGRESS_KEY", "PHASE_KEY", "SEPARATOR", "RUN_ENDED_LINE",
+    "UNBOUNDED_END", "PIPELINE_MESSAGE_RULES", "ProgressUpdate", "PhaseUpdate", "RunFinished",
+    "OUTCOMES", "classify_pipeline_message", "pipeline_event", "progress_event", "phase_event",
+    "finished_event", "final_counts", "run_started_events", "outcome_events",
 ]
 
 ORIGIN_RUN = "run"
 ORIGIN_PIPELINE = "pipeline"
 PROGRESS_KEY = "run-progress"
+PHASE_KEY = "run-phase"
+# An end chapter at or above this means "through the last available chapter" (the window's
+# ALL_CHAPTERS sentinel is 10**9; this is the pipeline's own _UNBOUNDED_END_THRESHOLD).
+UNBOUNDED_END = 10**6
 SEPARATOR = "─" * 36
 RUN_ENDED_LINE = "— run ended —"
 _LIST_PREVIEW = 20
@@ -79,17 +87,35 @@ OUTCOMES = ("completed", "completed_with_problems", "nothing_written", "stopped"
 
 @dataclass(frozen=True)
 class ProgressUpdate:
-    """``progress_cb(done, total)``: chapters processed out of the selected range."""
+    """``progress_cb(done, total)``: chapters processed out of the selected range. ``at`` is
+    when the worker made the call (``time.monotonic``), so the ETA measures the work, not
+    how long the update waited to be drawn."""
 
     done: int
     total: int
+    at: float | None = None
+
+
+@dataclass(frozen=True)
+class PhaseUpdate:
+    """``phase_cb(phase, total, already_present)``: where the pipeline is (see
+    ``pipeline.PhaseFn``). ``phase`` is ``"scraping"`` or ``"building"``."""
+
+    phase: str
+    total: int
+    already_present: int
+    at: float | None = None
 
 
 @dataclass(frozen=True)
 class RunFinished:
-    """The worker has returned; one of :data:`OUTCOMES`."""
+    """The worker has returned; one of :data:`OUTCOMES`. ``processed`` is the last
+    ``(done, total)`` the pipeline reported and ``counts`` the result totals from its
+    ``RunReport`` (``None`` when there was no report)."""
 
     outcome: str
+    processed: tuple[int, int] | None = None
+    counts: FinalCounts | None = None
 
 
 # ----------------------------------------------------------------------- pipeline bridge
@@ -108,14 +134,46 @@ def pipeline_event(text: str) -> ActivityEvent:
     return ActivityEvent(ORIGIN_PIPELINE, text, severity, summary)
 
 
-def progress_event(done: int, total: int) -> ActivityEvent:
+def progress_event(done: int, total: int, at: float | None = None) -> ActivityEvent:
     """Routine progress: a pending update is replaced by a newer one, never queued twice."""
-    return ActivityEvent(ORIGIN_RUN, kind="job", payload=ProgressUpdate(int(done), int(total)),
+    stamp = time.monotonic() if at is None else at
+    return ActivityEvent(ORIGIN_RUN, kind="job",
+                         payload=ProgressUpdate(int(done), int(total), stamp),
                          coalesce_key=PROGRESS_KEY)
 
 
-def finished_event(outcome: str) -> ActivityEvent:
-    return ActivityEvent(ORIGIN_RUN, kind="job", payload=RunFinished(outcome))
+def phase_event(phase: str, total: int, already_present: int,
+                at: float | None = None) -> ActivityEvent:
+    """A phase change is never coalesced away. The updates that only raise the
+    already-present count while scraping are routine (one per skipped chapter, possibly
+    thousands) and replace each other like progress does."""
+    stamp = time.monotonic() if at is None else at
+    routine = phase == "scraping" and already_present > 0
+    return ActivityEvent(ORIGIN_RUN, kind="job",
+                         payload=PhaseUpdate(phase, int(total), int(already_present), stamp),
+                         coalesce_key=PHASE_KEY if routine else None)
+
+
+def finished_event(outcome: str, processed: tuple[int, int] | None = None,
+                   counts: FinalCounts | None = None) -> ActivityEvent:
+    return ActivityEvent(ORIGIN_RUN, kind="job", payload=RunFinished(outcome, processed, counts))
+
+
+def final_counts(report: object | None) -> FinalCounts | None:
+    """Result totals from the pipeline's ``RunReport`` (``None`` without a usable report).
+    Chapter numbers are the report's own; a chapter listed under several failure reasons is
+    counted once, and PDFs are counted separately from chapters."""
+    if report is None or not hasattr(report, "written"):
+        return None
+    problems = (set(getattr(report, "failed", ()) or ()) | set(getattr(report, "permanent_failed", ()) or ())
+                | set(getattr(report, "extraction_failed", ()) or ()))
+    return FinalCounts(
+        pdfs=len(getattr(report, "written", ()) or ()),
+        already_present=len(getattr(report, "skipped_existing", ()) or ()),
+        failed=len(problems),
+        recovered=len(set(getattr(report, "rescued", ()) or ()) - problems),
+        not_listed=len(_gaps_in_range(report)),
+    )
 
 
 # ----------------------------------------------------------------------------- run start
@@ -150,6 +208,52 @@ def _plural(count: int, word: str) -> str:
     return f"{count} {word}{'' if count == 1 else 's'}"
 
 
+def _line(message: str, severity: str = INFO, *, summary: bool = True) -> ActivityEvent:
+    return ActivityEvent(ORIGIN_RUN, message, severity, summary)
+
+
+def _span(value) -> tuple[int, int] | None:
+    try:
+        low, high = value
+        return int(low), int(high)
+    except (TypeError, ValueError):
+        return None
+
+
+def _gaps_in_range(report: object) -> list[int]:
+    """Chapter numbers the site's list lacks *inside the range that was scraped*. The
+    pipeline records gaps across the whole list; the ones outside the selection do not
+    matter to this run."""
+    effective = _span(getattr(report, "effective_range", None))
+    if effective is None or effective[0] > effective[1]:
+        return []
+    gaps = getattr(report, "toc_gaps", ()) or ()
+    return sorted({n for n in gaps if effective[0] <= n <= effective[1]})
+
+
+def _coverage_events(report: object) -> list[ActivityEvent]:
+    """Where the site could not give what was asked for. An end left open ("through the last
+    available chapter", the 10**9 sentinel) is never reported as cut short, however far the
+    list actually goes; only an end the user typed is compared with the list."""
+    events: list[ActivityEvent] = []
+    requested = _span(getattr(report, "requested_range", None))
+    effective = _span(getattr(report, "effective_range", None))
+    if requested and effective and effective[0] <= effective[1]:
+        if requested[1] < UNBOUNDED_END and effective[1] < requested[1]:
+            events.append(_line(
+                f"The site's chapter list ends at chapter {effective[1]}, so chapters "
+                f"{effective[1] + 1} to {requested[1]} are not available.", WARNING))
+        if effective[0] > requested[0]:
+            events.append(_line(
+                f"The site's chapter list starts at chapter {effective[0]}, so chapters "
+                f"{requested[0]} to {effective[0] - 1} are not available.", WARNING))
+    gaps = _gaps_in_range(report)
+    if gaps:
+        events.append(_line(f"Not on the site's chapter list, so not saved: {_chapter_list(gaps)}.",
+                            WARNING))
+    return events
+
+
 def _processed_line(processed: tuple[int, int] | None, *, before: str = "") -> ActivityEvent | None:
     if processed is None:
         return None
@@ -166,9 +270,7 @@ def outcome_events(report: object | None, *, processed: tuple[int, int] | None =
     the pipeline); *processed* is the last ``(done, total)`` progress, shown as a count only;
     *error* / *refused* are what the worker caught instead of a report.
     """
-    def run(message: str, severity: str = INFO, *, summary: bool = True) -> ActivityEvent:
-        return ActivityEvent(ORIGIN_RUN, message, severity, summary)
-
+    run = _line
     events: list[ActivityEvent] = []
     if refused is not None:
         outcome = "refused"
@@ -192,6 +294,7 @@ def outcome_events(report: object | None, *, processed: tuple[int, int] | None =
         missing = list(getattr(report, "permanent_failed", ()) or ())
         empty = list(getattr(report, "extraction_failed", ()) or ())
         problems = len(set(failed) | set(missing) | set(empty))
+        unaccounted = (processed[1] - processed[0]) if processed else 0
         if getattr(report, "cancelled", False):
             outcome = "stopped"
             events.append(run("Stopped before the end of the selected range, as requested."))
@@ -199,9 +302,19 @@ def outcome_events(report: object | None, *, processed: tuple[int, int] | None =
             outcome = "completed_with_problems"
             events.append(run(f"Finished with problems: {_plural(problems, 'chapter')} could "
                               "not be saved.", WARNING))
+        elif unaccounted > 0:
+            # A run that ended normally accounts for every selected chapter; if the
+            # pipeline's own count disagrees, say so rather than call it complete.
+            outcome = "completed_with_problems"
+            events.append(run(f"Finished, but {_plural(unaccounted, 'selected chapter')} "
+                              "could not be accounted for.", WARNING))
         elif written == 0 and skipped == 0:
             outcome = "nothing_written"
             events.append(run("Finished, but no PDFs were written.", WARNING))
+        elif written == 0:
+            outcome = "completed"
+            events.append(run("Completed: every selected chapter was already in the output "
+                              "folder, so no new PDFs were written."))
         else:
             outcome = "completed"
             events.append(run(f"Completed: {_plural(written, 'PDF')} written and no chapter "
@@ -219,6 +332,17 @@ def outcome_events(report: object | None, *, processed: tuple[int, int] | None =
         if rescued:
             events.append(run(f"Recovered by the rescue browser or the second pass: "
                               f"{_plural(len(rescued), 'chapter')}."))
+        events.extend(_coverage_events(report))
+        warnings = [str(w) for w in (getattr(report, "warnings", ()) or ())]
+        if warnings and outcome == "nothing_written":
+            # Nothing was saved: the pipeline's own reasons are the answer to "why".
+            for warning in warnings[:3]:
+                events.append(run(warning, WARNING))
+            if len(warnings) > 3:
+                events.append(run(f"… and {len(warnings) - 3} more; see Detailed.", WARNING))
+        elif warnings:
+            events.append(run(f"{_plural(len(warnings), 'warning')} recorded; Detailed lists "
+                              "them.", WARNING))
         output_dir = getattr(report, "output_dir", None)
         if output_dir:
             events.append(run(f"Saved in: {output_dir}"))

@@ -5,6 +5,47 @@ versioning.
 
 ## [Unreleased] — v0.3.0 (in progress on `feature/v0.3.0-modernization`)
 
+### Added / Changed — Run progress, ETA, counters and accurate run state (Checkpoint 02.2)
+- **Section 3 (Run) now tells the truth about the run** (`scripts/app.py`, new
+  `scripts/webnovel_scraper/ui/run_progress.py`).
+  - **Phase:** Idle, Preparing chapter list, Scraping chapters, Building output,
+    Stopping, then Complete, Finished with problems, Finished with no PDFs,
+    Stopped, Run failed or Run refused. Warnings and errors recolour the status
+    in Light and Dark.
+  - **Progress:** while the chapter list is prepared there is no number and the
+    bar is indeterminate. Once the total is known it reads `done / total · %`
+    (rounded down, so 100% means every selected chapter). It counts selected
+    source pages, never PDFs, so two pages that share a displayed number count
+    separately.
+  - **Counters:** "already present" while running; after the end PDFs written,
+    failed, recovered, already present and numbers missing from the site's list,
+    all read from the run report.
+  - **ETA:** measured on the monotonic clock from the chapters actually
+    fetched. It starts after the chapter list is built, leaves out chapters
+    resume skipped, waits for 3 chapters and 5 s, follows the slower of the whole
+    run and the recent chapters, and turns back into `—` during a long silence,
+    while stopping or building, and after the end. Formatting adapted from
+    PDF-Splitter `jobs.py`.
+  - **Never success by percentage:** 100% processed with failures ends as
+    "Finished with problems"; a normal end whose own count stops short is not
+    "Completed"; late routine updates cannot overwrite the final state.
+  - **Outcome text:** an all-already-present run says no new PDFs were written;
+    an explicit end beyond the site's list and gaps in the list are reported; an
+    open-ended "through the last chapter" request is never called cut short.
+- **Pipeline instrumentation (observability only, DECISIONS.md #007):** an
+  optional `run_scrape(..., phase_cb=None)` reports `"scraping"` (with the
+  selected total and the already-present count) and `"building"`. Existing
+  callers, ticks, retries, rescue, cancellation and the run report are unchanged
+  (a test runs with and without it); a raising observer is ignored.
+- **Layout:** one extra compact row in Section 3. The minimum window is
+  635×590 (was 635×571); the width is unchanged and Activity still takes all
+  growth.
+- **Tests:** 117 added. The 02.1 fakes gained `phase_cb=None`, and its status and
+  count assertions follow the new texts. Gate: 554 passed, 0 skipped.
+- **Not in this change (deferred):** a live current-chapter name and live
+  failed/recovered counters (the callbacks cannot give them reliably), Resume
+  Existing Run, website-first selection, and structured pipeline events.
+
 ### Added / Changed — Activity Summary/Detailed logging and thread-safe event bridge (Checkpoint 02.1, UI/controller only)
 - **Summary and Detailed Activity tabs with Clear Log** (`scripts/app.py`,
   PDF-Splitter's Activity design).

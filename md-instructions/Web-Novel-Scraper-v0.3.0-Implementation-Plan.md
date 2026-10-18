@@ -1,6 +1,6 @@
 # Web Novel Scraper — v0.3.0 Implementation Plan
 
-**Status:** Approved product requirements. Checkpoint 00 (planning/baseline) complete 2026-10-17 on `feature/v0.3.0-modernization`; Checkpoint 01 step 01.0 (flat `scripts/` layout) complete 2026-10-17; step 01.1 (Light/Dark UI foundation and three-section window shell) complete 2026-10-18; step 02.1 (Activity Summary/Detailed logging and thread-safe event bridge) complete 2026-10-18 and awaits owner review before 02.2. Technical clarifications from Checkpoint 00 are in §8 and do not change owner decisions.  
+**Status:** Approved product requirements. Checkpoint 00 (planning/baseline) complete 2026-10-17 on `feature/v0.3.0-modernization`; Checkpoint 01 step 01.0 (flat `scripts/` layout) complete 2026-10-17; step 01.1 (Light/Dark UI foundation and three-section window shell) complete 2026-10-18; step 02.1 (Activity Summary/Detailed logging and thread-safe event bridge) complete 2026-10-18 (`d7116db`); step 02.2 (progress, ETA, counters and run-state accuracy) complete 2026-10-18 and awaits owner review before 02.3. Technical clarifications from Checkpoint 00 are in §8 and do not change owner decisions.  
 **Created:** 2026-10-14  
 **Planning / review:** ChatGPT; **execution:** Claude Code in the local repository.  
 **Target repository:** `https://github.com/elmatthe/web-novel-scraper`  
@@ -118,7 +118,16 @@ Supersedes the read-only GitHub snapshot above wherever they differ.
   - **Tests:** 90 added; C10 guarantees unchanged and passing; the shell's worker check is stricter.
   - **Gate:** 437 passed, 0 skipped (three runs); 149 GUI/UI tests pass on 3.12.10; 11/11 mutations caught; startup smoke test passed (session log created and closed).
   - **Pending:** the Activity visual check and one live run (owner).
-  - **Next (02.2):** phase-aware progress, counts, ETA (`—` when unknown) and run states that tell "100% processed with failures" from "100% successful".
+  - **Next (02.2):** phase-aware progress, counts, ETA (`—` when unknown) and run states that tell "100% processed with failures" from "100% successful". Done, below.
+
+- **02.2 Result (2026-10-18): COMPLETE, awaiting owner review.** UI/controller plus one observability-only pipeline hook (DECISIONS.md #007). No scraping-algorithm, adapter, PDF, cache, catalog, output-folder, dependency or default changes.
+  - **Run section:** phase (Preparing chapter list / Scraping chapters / Building output / Stopping, then Complete, Finished with problems, no PDFs, Stopped, Failed, Refused), an honest indeterminate bar until the total is known, `done / total · %`, counters (already present live; PDFs, failed, recovered after the end from `RunReport`) and an ETA (`—` when unknown). New `ui/run_progress.py`; `format_eta` adapted from PDF-Splitter.
+  - **Accuracy:** counts are selected source pages, never PDFs, and never double-count retries, rescue or distinct pages sharing a displayed number. 100% processed is not success; a late routine update cannot overwrite the final state; an open-ended end is never reported as truncated; explicit-end shortfalls and site-list gaps are reported.
+  - **Instrumentation:** optional `run_scrape(..., phase_cb=None)`; behaviour-neutral (tested with and without it).
+  - **Layout:** one extra row; minimum window 635×590 (was 635×571), width unchanged.
+  - **Gate:** 554 passed, 0 skipped; 305 UI/pipeline tests pass on 3.12.10; 12/12 mutations caught; startup smoke test passed.
+  - **Deferred:** a live current-chapter name and live failed/recovered counters; Resume Existing Run; website-first selection.
+  - **Pending:** the Run-section visual check (Light/Dark, minimum size, 125%/150%) and one live run (owner).
 
 ### 03 — Manifest-first cache and resume architecture
 - Implement per-site tracked baseline manifests in `scripts/` and untracked mutable runtime overlays/cache, provenance, schema and migration, preflight coverage/extend/refresh, chapter identity/offset guards, and safe output allocation/resume journal. Existing site adapters and output behavior remain functional.

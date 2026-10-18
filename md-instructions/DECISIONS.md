@@ -5,6 +5,55 @@ See AI-WORKSPACE.md for how this fits alongside Briefing, Changelog, and Handoff
 
 ---
 
+## 007 — Run progress: a tracker over existing callbacks plus one observability-only pipeline observer — 2026-10-18 — Claude (Sonnet 5.5)
+
+**Status:** Accepted (v0.3.0 Checkpoint 02.2)
+
+**Context:** the Run section needs the real phase, honest counts and an ETA.
+- The pipeline's only signals are `log(str)` and `progress_cb(done, total)`.
+- `progress_cb` fires after the chapters are known, once per chapter at its end
+  state (saved, failed or already present). It cannot tell the phase, how many
+  chapters resume skipped, or whether a chapter failed for good or is about to be
+  rescued.
+- The checkpoint forbids wider pipeline refactoring and forbids guessing from
+  message text.
+
+**Decision:**
+1. Add one optional `phase_cb(phase, total, already_present)` to `run_scrape`,
+   carried by the existing `_Progress` tracker. It is called with `"scraping"`
+   when the selected chapters are known and when resume skips more, and with
+   `"building"` before CHUNKED/SINGLE output is assembled. A raising observer is
+   swallowed. Nothing else in the pipeline changes.
+2. `ui/run_progress.py` (pure) holds all the logic: `RunTracker`, `EtaEstimator`,
+   `FinalCounts`. Counts that cannot be known live (failed, recovered, PDFs) come
+   only from the final `RunReport`.
+3. The ETA uses the worker's monotonic timestamp on each event, the share of
+   `done` that was actually fetched, and the slower of the whole-run and
+   recent-chapter pace. It is read when the window redraws; there is no timer.
+4. Phase events are never coalesced, except the per-skip updates, which coalesce
+   like progress.
+
+**Alternatives considered:**
+- (a) Infer the phase from log text. Rejected: guessed patterns drift.
+- (b) Infer "already present" from jumps in `done`. Rejected: a burst of skipped
+  chapters would make the ETA wildly optimistic.
+- (c) A current-chapter callback. Deferred: it needs hooks in several fetch paths
+  and the current chapter's identity is not unique (duplicate displayed numbers).
+- (d) A timer thread or `after` polling for the ETA. Rejected: the checkpoint asks
+  for no polling.
+- (e) Structured pipeline events. Deferred to a later checkpoint.
+
+**Consequences:**
+- `run_scrape` gained an optional keyword, so existing callers and test fakes
+  that use `**kwargs` keep working. Fakes with a fixed signature need
+  `phase_cb=None`.
+- `RunReport` lists failures by displayed number, so two failed pages with one
+  number count once in the failed total (processed counts are exact).
+- The legacy single/chunked path reports "building" only just before its PDFs.
+- A later checkpoint can add a current-chapter hook beside this one.
+
+---
+
 ## 006 — Activity: log at emit, Tk only on the UI thread, and a literal-marker bridge for pipeline text — 2026-10-18 — Claude (Opus 5.5)
 
 **Status:** Accepted (v0.3.0 Checkpoint 02.1)

@@ -20,6 +20,13 @@ run-finished handler. Once the window is destroyed the channel refuses events, s
 late worker line is a harmless no-op. Each application session writes one technical
 log under the ignored ``files/runtime-data/logs/``; Clear Log never touches it.
 
+Run section (v0.3.0 Checkpoint 02.2; :mod:`webnovel_scraper.ui.run_progress`): a
+``RunTracker`` on the Tk thread turns the pipeline's ``progress_cb`` and optional
+``phase_cb`` (delivered through the same Activity events) into the phase, the
+"done / total · %" count, the already-present and result counters and an ETA measured on
+the monotonic clock; the final state comes from the returned ``RunReport``, never from the
+percentage, and nothing that arrives after the run's end can change it.
+
 Defense in depth on disabled sites: the catalog greys them in the Website menu and
 Start cannot dispatch one (this file), the pipeline refuses a disabled row
 before building an adapter, and the stub adapter raises as a final backstop.
@@ -63,7 +70,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from webnovel_scraper import catalog, pipeline  # noqa: E402
 from webnovel_scraper.models import OutputMode, ScrapeJob  # noqa: E402
 from webnovel_scraper.registry import AdapterDisabledError  # noqa: E402
-from webnovel_scraper.ui import appearance, run_activity  # noqa: E402
+from webnovel_scraper.ui import appearance, run_activity, run_progress  # noqa: E402
 from webnovel_scraper.ui import settings as ui_settings  # noqa: E402
 from webnovel_scraper.ui.activity import (  # noqa: E402
     ERROR, INFO, WARNING, Activity, ActivityEvent, ActivityPump, RenderUpdate, SessionLog,
@@ -202,6 +209,8 @@ class ScraperApp(tk.Tk):
         # Set once the window is being destroyed: the pump is stopped and the Activity
         # channel refuses events, so nothing can touch the window afterwards.
         self._shut_down = False
+        # The Run section's phase, counts and ETA for the current run (Tk thread only).
+        self._tracker = run_progress.RunTracker()
 
         # Activity and the session log. Workers talk to them only through Activity.emit
         # (a locked queue); the Tk thread drains it with the pump. The pump keeps the
@@ -533,14 +542,26 @@ class ScraperApp(tk.Tk):
         info = ttk.Frame(frame, style=s["surface"])
         info.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(m["gap_xs"], 0))
         info.columnconfigure(0, weight=1)
+        # Two compact rows (PDF-Splitter's status / counts / ETA, split so each fits the
+        # fixed control column): the phase and "done / total · %", then the secondary
+        # counters and the ETA. Width-1 labels clip rather than widen the window.
         self._run_status_var = tk.StringVar(value="Idle")
-        ttk.Label(
+        self._run_status_label = ttk.Label(
             info, textvariable=self._run_status_var, style=s["secondary_label"], width=1
-        ).grid(row=0, column=0, sticky="ew")
-        self._counts_var = tk.StringVar(value="—")
-        ttk.Label(info, textvariable=self._counts_var, style=s["secondary_label"]).grid(
-            row=0, column=1, sticky="e", padx=(m["gap_md"], 0)
         )
+        self._run_status_label.grid(row=0, column=0, sticky="ew")
+        self._counts_var = tk.StringVar(value="—")
+        self._counts_label = ttk.Label(info, textvariable=self._counts_var,
+                                       style=s["secondary_label"])
+        self._counts_label.grid(row=0, column=1, sticky="e", padx=(m["gap_md"], 0))
+        self._detail_var = tk.StringVar(value="")
+        self._detail_label = ttk.Label(
+            info, textvariable=self._detail_var, style=s["secondary_label"], width=1
+        )
+        self._detail_label.grid(row=1, column=0, sticky="ew")
+        self._eta_var = tk.StringVar(value=run_progress.format_eta(None))
+        self._eta_label = ttk.Label(info, textvariable=self._eta_var, style=s["secondary_label"])
+        self._eta_label.grid(row=1, column=1, sticky="e", padx=(m["gap_md"], 0))
         return e_folder
 
     def _build_activity(self) -> None:
@@ -1044,9 +1065,8 @@ class ScraperApp(tk.Tk):
         self._cancel_event = threading.Event()
 
         self._set_running(True)
-        self._progress.configure(value=0, maximum=1)
-        self._run_status_var.set("Running…")
-        self._counts_var.set("—")
+        self._tracker.start()
+        self._render_run()
         browser = "off"
         if use_browser:
             browser = f"on ({'headless' if job.headless else 'visible'} primary)"
@@ -1150,12 +1170,14 @@ class ScraperApp(tk.Tk):
             self._thread_progress(done, total)
 
         report = error = refused = None
+        counts = None
         try:
             report = pipeline.run_scrape(
                 job,
                 log=self._thread_log,
                 cancel_event=self._cancel_event,
                 progress_cb=progress,
+                phase_cb=self._thread_phase,
             )
         except AdapterDisabledError as exc:
             refused = exc
@@ -1168,6 +1190,7 @@ class ScraperApp(tk.Tk):
                     report, processed=processed[0] if processed else None,
                     error=error, refused=refused,
                 )
+                counts = run_activity.final_counts(report)
             except Exception as exc:  # noqa: BLE001 - the end of the run must still show
                 events = [ActivityEvent(
                     run_activity.ORIGIN_RUN,
@@ -1176,7 +1199,8 @@ class ScraperApp(tk.Tk):
                 )]
             for event in events:
                 self._events.emit(event)
-            self._events.emit(run_activity.finished_event(outcome))
+            self._events.emit(run_activity.finished_event(
+                outcome, processed[0] if processed else None, counts))
 
     def _on_stop(self) -> None:
         # Show what the run has already said first; it may have just finished.
@@ -1191,7 +1215,8 @@ class ScraperApp(tk.Tk):
         ))
         if self._cancel_event is not None:
             self._cancel_event.set()
-        self._run_status_var.set("Stopping after the current chapter…")
+        self._tracker.stop_requested()
+        self._render_run()
         self._stop_btn.configure(state="disabled")
 
     def _on_run_finished(self) -> None:
@@ -1201,7 +1226,6 @@ class ScraperApp(tk.Tk):
             self._running = False
             return
         self._set_running(False)
-        self._run_status_var.set("Run ended.")
         # The run created its {name}-N folder; refresh the preview so the next run
         # shows the next free -N (still a sibling under the same parent).
         self._refresh_output_preview()
@@ -1222,13 +1246,30 @@ class ScraperApp(tk.Tk):
         except Exception:  # noqa: BLE001
             pass
 
+    def _thread_phase(self, phase: str, total: int, already_present: int) -> None:
+        """The pipeline's optional ``phase_cb``: where the run is. Enqueue only."""
+        try:
+            self._events.emit(run_activity.phase_event(phase, total, already_present))
+        except Exception:  # noqa: BLE001
+            pass
+
     # ── Activity (Tk thread) ─────────────────────────────────────────────────
     def _on_job_event(self, event: ActivityEvent) -> None:
-        """Progress and run-finished events, in order with the log lines around them."""
+        """Progress, phase and run-finished events, in order with the log lines around
+        them. The tracker ignores anything that arrives after the run's end, so a
+        late routine update can never overwrite the final outcome."""
         payload = event.payload
         if isinstance(payload, run_activity.ProgressUpdate):
-            self._set_progress(payload.done, payload.total)
+            self._tracker.progress(payload.done, payload.total, payload.at)
+            self._render_run()
+        elif isinstance(payload, run_activity.PhaseUpdate):
+            self._tracker.phase(payload.phase, payload.total, payload.already_present,
+                                payload.at)
+            self._render_run()
         elif isinstance(payload, run_activity.RunFinished):
+            self._tracker.finish(payload.outcome, processed=payload.processed,
+                                 counts=payload.counts)
+            self._render_run()
             self._on_run_finished()
 
     def _render_activity(self, update: RenderUpdate) -> None:
@@ -1238,6 +1279,7 @@ class ScraperApp(tk.Tk):
         hidden tab keeps what it was doing when last shown."""
         if self._shut_down:
             return
+        self._refresh_eta()
         for view, lines in ((SUMMARY_TAB, update.summary), (DETAILED_TAB, update.detailed)):
             if not (lines or update.cleared):
                 continue
@@ -1287,9 +1329,38 @@ class ScraperApp(tk.Tk):
         self._events.clear_display()
         self._set_status("Activity display cleared. The session log on disk is unchanged.")
 
-    def _set_progress(self, done: int, total: int) -> None:
-        self._progress.configure(maximum=max(total, 1), value=done)
-        self._counts_var.set(f"{done} / {total} chapters")
+    def _render_run(self) -> None:
+        """Draw the tracker's view into the Run section (Tk thread)."""
+        if self._shut_down:
+            return
+        view = self._tracker.view()
+        if not self._closing:  # "Closing…" stays until the window goes
+            self._run_status_var.set(view.status)
+        style_key = {"warning": "warning_label", "error": "danger_label"}.get(
+            view.severity, "secondary_label")
+        self._run_status_label.configure(style=self._bundle["styles"][style_key])
+        self._counts_var.set(view.counts)
+        self._detail_var.set(view.detail)
+        self._eta_var.set(view.eta)
+        bar = self._progress
+        if view.indeterminate:
+            # No chapter total yet (the chapter list is being prepared): no fake percentage.
+            if str(bar.cget("mode")) != "indeterminate":
+                bar.configure(mode="indeterminate")
+                bar.start()
+            return
+        if str(bar.cget("mode")) == "indeterminate":
+            bar.stop()
+            bar.configure(mode="determinate")
+        bar.configure(maximum=max(view.total or 1, 1), value=view.done or 0)
+
+    def _refresh_eta(self) -> None:
+        """Re-read the ETA when the window redraws anything (no timer): a long silent
+        stretch turns a stale estimate back into "—"."""
+        if self._tracker.active:
+            text = run_progress.format_eta(self._tracker.eta_seconds())
+            if text != self._eta_var.get():
+                self._eta_var.set(text)
 
     # ── Enable/disable while running ─────────────────────────────────────────
     def _set_running(self, running: bool) -> None:
@@ -1334,6 +1405,8 @@ class ScraperApp(tk.Tk):
         ))
         if self._cancel_event is not None:
             self._cancel_event.set()
+        self._tracker.stop_requested()
+        self._render_run()
         self._run_status_var.set("Closing after the current chapter…")
         # Lock the buttons; the window stays up (responsive) while we wait.
         for btn in (self._stop_btn, self._start_btn):
@@ -1361,6 +1434,10 @@ class ScraperApp(tk.Tk):
             return
         self._shut_down = True
         self._pump.stop()
+        try:
+            self._progress.stop()  # an indeterminate bar owns a Tk timer
+        except tk.TclError:
+            pass
         self._events.close()  # refuses later events and closes the session log
 
     def destroy(self) -> None:

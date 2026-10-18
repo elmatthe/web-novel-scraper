@@ -285,9 +285,9 @@ def _self_attributes(function) -> set[str]:
 def test_worker_side_code_only_reaches_the_event_queue() -> None:
     """Structural guard: the code that runs on the worker thread reads nothing of the
     window but the Activity queue, the cancel flag and the two enqueue-only callbacks."""
-    allowed = {"_events", "_cancel_event", "_thread_log", "_thread_progress"}
+    allowed = {"_events", "_cancel_event", "_thread_log", "_thread_progress", "_thread_phase"}
     for method in (app.ScraperApp._run_worker, app.ScraperApp._thread_log,
-                   app.ScraperApp._thread_progress):
+                   app.ScraperApp._thread_progress, app.ScraperApp._thread_phase):
         used = _self_attributes(method)
         assert used <= allowed, (method.__name__, used - allowed)
         assert "after" not in inspect.getsource(method).replace("_after", "")
@@ -344,14 +344,14 @@ def test_a_real_offline_run_reports_the_outcome_from_the_run_report(monkeypatch,
         assert "Building chapter index (TOC) …" in summary
         assert "Warning: chapter 2 FAILED (extraction, not a block)" in summary
         # Both chapters were processed, yet the run is not called a success.
-        assert win._counts_var.get() == "2 / 2 chapters"
+        assert win._counts_var.get() == "2 / 2 · 100%"
         assert "Warning: Finished with problems: 1 chapter could not be saved." in summary
         assert "Completed" not in summary
         assert "Warning: Failed chapters: 2." in summary
         assert "Warning: Fetched but no chapter text found: 2." in summary
         assert "PDFs written: 1. Already present (skipped): 0." in summary
         assert "Run complete." in detailed and "Run complete." not in summary
-        assert win._running is False and win._run_status_var.get() == "Run ended."
+        assert win._running is False and win._run_status_var.get() == "Finished with problems"
         written = list(tmp_path.rglob("*.pdf"))
         assert len(written) == 1
 
@@ -378,7 +378,7 @@ def test_stop_request_precedes_everything_the_stop_causes(monkeypatch, tmp_path)
             stop_seen.set()
             assert reacted.wait(5), "the worker never finished reacting to the stop"
 
-    def fake_run_scrape(job, *, log, cancel_event, progress_cb):
+    def fake_run_scrape(job, *, log, cancel_event, progress_cb, phase_cb=None):
         reached.set()
         assert stop_seen.wait(5)
         log("Run cancelled: stop requested")
@@ -411,7 +411,7 @@ def test_stop_request_precedes_everything_the_stop_causes(monkeypatch, tmp_path)
         log = _session_lines(win)
         positions = [next(i for i, line in enumerate(log) if n in line) for n in order]
         assert positions == sorted(positions)
-        assert win._running is False and win._run_status_var.get() == "Run ended."
+        assert win._running is False and win._run_status_var.get() == "Stopped"
     finally:
         win.destroy()
 
@@ -422,7 +422,7 @@ def test_graceful_close_keeps_the_runs_final_events_in_the_session_log(monkeypat
     path = Path(win._session_log.path)
     reached, release = threading.Event(), threading.Event()
 
-    def fake_run_scrape(job, *, log, cancel_event, progress_cb):
+    def fake_run_scrape(job, *, log, cancel_event, progress_cb, phase_cb=None):
         progress_cb(1, 4)
         reached.set()
         cancel_event.wait(5)
@@ -482,7 +482,7 @@ def test_an_unwritable_logs_folder_is_announced_and_the_window_still_works(monke
     blocker = tmp_path / "logs-blocker"
     blocker.write_text("a file where the logs folder should be", encoding="utf-8")
 
-    def fake_run_scrape(job, *, log, cancel_event, progress_cb):
+    def fake_run_scrape(job, *, log, cancel_event, progress_cb, phase_cb=None):
         log("WARNING: something worth seeing")
         return pipeline.RunReport(output_dir=job.output_dir, skipped_existing=[1])
 
@@ -499,7 +499,8 @@ def test_an_unwritable_logs_folder_is_announced_and_the_window_still_works(monke
         win.flush_activity()
         summary = _text(win, "Summary")
         assert "WARNING: something worth seeing" in summary
-        assert "Completed: 0 PDFs written and no chapter failures recorded." in summary
+        assert ("Completed: every selected chapter was already in the output folder, so no "
+                "new PDFs were written.") in summary
         assert summary.count("session log could not be") == 1
     finally:
         win.destroy()

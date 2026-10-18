@@ -100,6 +100,18 @@ class ChapterIndexUnavailable(RuntimeError):
 LogFn = Callable[[str], None]
 ProgressFn = Callable[[int, int], None]
 
+# Observability only (v0.3.0 Checkpoint 02.2): ``phase_cb(phase, total, already_present)``.
+# It tells a front end where the run is, which ``progress_cb(done, total)`` cannot, and
+# changes nothing the pipeline does. ``total`` is the number of selected chapters (source
+# pages, however many PDFs they make), ``already_present`` how many of them resume has
+# skipped so far. Calls: PHASE_SCRAPING once the selected chapters are known (before the
+# first fetch) and again whenever resume skips more of them; PHASE_BUILDING just before
+# CHUNKED/SINGLE output is assembled (SEPARATE writes each PDF as its chapter lands, so it
+# has no build step). A raising observer is ignored: it can never fail or alter a run.
+PhaseFn = Callable[[str, int, int], None]
+PHASE_SCRAPING = "scraping"
+PHASE_BUILDING = "building"
+
 # ── Adaptive auto-slowdown (Phase 9B) ────────────────────────────────────────
 # When chapter fetches start hitting blocks/challenges, the pipeline raises the
 # *inter-fetch* delay for the rest of the run so the whole crawl backs off and
@@ -1118,6 +1130,7 @@ def run_scrape(
     request_manager_factory: Optional[Callable[..., object]] = None,
     primary_adapter_factory: Optional[Callable[[object], object]] = None,
     rescue_pool_factory: Optional[Callable[[], object]] = None,
+    phase_cb: Optional[PhaseFn] = None,
 ) -> RunReport:
     """Run one scrape job and return a :class:`RunReport`.
 
@@ -1131,6 +1144,8 @@ def run_scrape(
         log: ``(str) -> None`` sink for progress lines (defaults to the logger).
         cancel_event: the Stop-button event; checked between chapters/groups.
         progress_cb: ``(done, total) -> None`` for a determinate progress bar.
+        phase_cb: optional ``(phase, total, already_present) -> None`` observer (see
+            :data:`PhaseFn`); instrumentation only, it changes no behaviour.
         sleep_fn / monotonic_fn: the single injected timing source (the limiter and
             rescue worker both pace off these; tests pass a fake clock).
         host_limiter: the shared per-host limiter (§3.4); built from ``job.delay``
@@ -1174,7 +1189,7 @@ def run_scrape(
     if _rescue_enabled(job) and adapter is None:
         return _run_with_rescue(
             job, spec, output_dir, report, log, cancel_event, progress_cb,
-            sleep_fn=sleep_fn, monotonic_fn=monotonic_fn, host_limiter=host_limiter,
+            phase_cb=phase_cb, sleep_fn=sleep_fn, monotonic_fn=monotonic_fn, host_limiter=host_limiter,
             request_manager_factory=request_manager_factory,
             primary_adapter_factory=primary_adapter_factory,
             rescue_pool_factory=rescue_pool_factory,
@@ -1223,7 +1238,7 @@ def run_scrape(
     try:
         return _drive(
             job, drive_spec, adapter, output_dir, report, log, cancel_event,
-            progress_cb, pacer,
+            progress_cb, pacer, phase_cb,
         )
     except ScrapeCancelled as exc:
         log(f"Run cancelled: {exc}")
@@ -1244,6 +1259,7 @@ def _run_with_rescue(
     cancel_event: Optional[threading.Event],
     progress_cb: Optional[ProgressFn],
     *,
+    phase_cb: Optional[PhaseFn] = None,
     sleep_fn: Callable[[float], None],
     monotonic_fn: Callable[[], float],
     host_limiter: Optional[HostRateLimiter],
@@ -1369,7 +1385,8 @@ def _run_with_rescue(
 
         # 4. Drive the fast primary pass + rescue lane, then assemble output.
         contents: dict[int, ChapterContent] = {}
-        state = _Progress(total=len(in_range), cb=progress_cb)
+        state = _Progress(total=len(in_range), cb=progress_cb, phase_cb=phase_cb)
+        state.phase(PHASE_SCRAPING)
         on_content = _make_on_content(
             job, spec, output_dir, in_range, report, log, contents
         )
@@ -1400,6 +1417,8 @@ def _run_with_rescue(
         #    SEPARATE PDFs were written promptly by ``on_content``. No partial
         #    chunked/single PDF is written on cancel (re-fetched cleanly on resume).
         if not report.cancelled:
+            if job.output_mode is not OutputMode.SEPARATE:
+                state.phase(PHASE_BUILDING)
             _assemble_output(job, spec, output_dir, in_range, contents, report, log)
 
         report.auto_slowdowns = pacer.slowdowns
@@ -1537,7 +1556,7 @@ def _plan_fetch_list(
             occurrence = occurrences[_chapter_identity(meta)]
             if _existing_separate_pdf(output_dir, meta, occurrence) is not None:
                 report.skipped_existing.append(meta.index)
-                state.tick()
+                state.tick(skipped=True)
             else:
                 out.append(meta)
         return out
@@ -1546,7 +1565,7 @@ def _plan_fetch_list(
     if job.output_mode is OutputMode.SINGLE:
         if (output_dir / f"{stem}_All_Chapters.pdf").exists():
             report.skipped_existing.extend(m.index for m in in_range)
-            state.tick(len(in_range))
+            state.tick(len(in_range), skipped=True)
             return []
         return list(in_range)
 
@@ -1556,7 +1575,7 @@ def _plan_fetch_list(
         a, b = group[0].index, group[-1].index
         if (output_dir / f"{stem}_Chapters_{a}-{b}.pdf").exists():
             report.skipped_existing.extend(m.index for m in group)
-            state.tick(len(group))
+            state.tick(len(group), skipped=True)
         else:
             out.extend(group)
     return out
@@ -1626,6 +1645,7 @@ def _drive(
     cancel_event: Optional[threading.Event],
     progress_cb: Optional[ProgressFn],
     pacer: _Pacer,
+    phase_cb: Optional[PhaseFn] = None,
 ) -> RunReport:
     # 3. TOC: load a persisted index (resume) or build + persist it.
     index_path = output_dir / INDEX_FILENAME
@@ -1686,7 +1706,8 @@ def _drive(
 
     # 5. Emit per the output mode.
     stem = _stem_for(spec)
-    state = _Progress(total=len(in_range), cb=progress_cb)
+    state = _Progress(total=len(in_range), cb=progress_cb, phase_cb=phase_cb)
+    state.phase(PHASE_SCRAPING)
 
     if job.output_mode is OutputMode.SEPARATE:
         _run_separate(job, spec, adapter, output_dir, in_range, report, log,
@@ -1706,17 +1727,36 @@ def _drive(
 
 
 class _Progress:
-    """Tiny done/total tracker that forwards to the GUI progress callback."""
+    """Tiny done/total tracker that forwards to the GUI progress callback.
 
-    def __init__(self, total: int, cb: Optional[ProgressFn]) -> None:
+    ``done`` counts selected chapters that reached an end state (saved, failed or already
+    present), each exactly once. ``skipped`` is the already-present share of ``done``."""
+
+    def __init__(
+        self, total: int, cb: Optional[ProgressFn], phase_cb: Optional[PhaseFn] = None
+    ) -> None:
         self.total = total
         self.done = 0
+        self.skipped = 0
         self._cb = cb
+        self._phase_cb = phase_cb
 
-    def tick(self, n: int = 1) -> None:
+    def tick(self, n: int = 1, *, skipped: bool = False) -> None:
         self.done += n
+        if skipped:
+            self.skipped += n
+            self.phase(PHASE_SCRAPING)
         if self._cb is not None:
             self._cb(self.done, self.total)
+
+    def phase(self, phase: str) -> None:
+        """Tell the observer (if any) the run entered ``phase``. Never raises."""
+        if self._phase_cb is None:
+            return
+        try:
+            self._phase_cb(phase, self.total, self.skipped)
+        except Exception:  # noqa: BLE001 - an observer must never affect the run
+            pass
 
 
 def _is_permanent_failure(exc: Exception) -> bool:
@@ -1822,7 +1862,7 @@ def _run_separate(job, spec, adapter, output_dir, in_range, report, log,
         existing = _existing_separate_pdf(output_dir, meta, occurrence)
         if existing is not None:
             report.skipped_existing.append(meta.index)
-            state.tick()
+            state.tick(skipped=True)
             continue
         content = _fetch_one(
             adapter, meta, spec, report, log, job, cancel_event, pacer,
@@ -1924,7 +1964,7 @@ def _run_chunked(job, spec, adapter, output_dir, in_range, stem, report, log,
         path = output_dir / f"{stem}_Chapters_{a}-{b}.pdf"
         if path.exists():
             report.skipped_existing.extend(m.index for m in group)
-            state.tick(len(group))
+            state.tick(len(group), skipped=True)
             continue
         contents: dict[int, ChapterContent] = {}
         entry = {"path": path, "contents": contents}
@@ -1974,6 +2014,8 @@ def _run_chunked(job, spec, adapter, output_dir, in_range, stem, report, log,
     if report.cancelled:
         return
 
+    if any(entry["contents"] for entry in pending):
+        state.phase(PHASE_BUILDING)
     for entry in pending:
         contents = entry["contents"]
         if contents:
@@ -1988,7 +2030,7 @@ def _run_single(job, spec, adapter, output_dir, in_range, stem, report, log,
     path = output_dir / f"{stem}_All_Chapters.pdf"
     if path.exists():
         report.skipped_existing.extend(m.index for m in in_range)
-        state.tick(len(in_range))
+        state.tick(len(in_range), skipped=True)
         log(f"  {path.name} already present; skipping (resume).")
         return
     contents = _fetch_block_with_sweep(
@@ -1997,6 +2039,7 @@ def _run_single(job, spec, adapter, output_dir, in_range, stem, report, log,
     if report.cancelled:
         return  # no partial single PDF
     if contents:
+        state.phase(PHASE_BUILDING)
         pdf_builder.create_pdf(contents, path, title=spec.novel_title)
         report.written.append(path)
         log(f"  wrote {path.name} ({len(contents)} chapters)")

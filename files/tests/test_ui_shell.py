@@ -502,7 +502,7 @@ def test_start_and_stop_drive_the_unchanged_run_lifecycle(monkeypatch, tmp_path)
     win = _make_app()
     started = threading.Event()
 
-    def fake_run_scrape(job, *, log, cancel_event, progress_cb):
+    def fake_run_scrape(job, *, log, cancel_event, progress_cb, phase_cb=None):
         log("fetching chapter 1")
         progress_cb(1, 5)
         started.set()
@@ -518,7 +518,9 @@ def test_start_and_stop_drive_the_unchanged_run_lifecycle(monkeypatch, tmp_path)
         assert win._running is True
         assert str(win._start_btn.cget("state")) == "disabled"
         assert str(win._stop_btn.cget("state")) == "normal"
-        assert win._run_status_var.get() == "Running…"
+        # Nothing has said what phase the run is in yet: an honest "preparing", no percentage.
+        assert win._run_status_var.get() == "Preparing chapter list…"
+        assert win._counts_var.get() == "—" and str(win._progress.cget("mode")) == "indeterminate"
         assert all(str(w.cget("state")) == "disabled" for w, _ in win._locked_inputs)
 
         win.flush_activity()  # what the Tk-thread pump does on its timer
@@ -526,7 +528,9 @@ def test_start_and_stop_drive_the_unchanged_run_lifecycle(monkeypatch, tmp_path)
         assert "Run started: Shadow Slave from Free Web Novel." in summary
         assert "fetching chapter 1" in detailed
         assert "fetching chapter 1" not in summary  # a routine line is Detailed only
-        assert win._counts_var.get() == "1 / 5 chapters"
+        assert win._counts_var.get() == "1 / 5 · 20%"
+        assert win._run_status_var.get() == "Scraping chapters"
+        assert str(win._progress.cget("mode")) == "determinate"
         assert float(str(win._progress.cget("value"))) == 1.0
         assert float(str(win._progress.cget("maximum"))) == 5.0
 
@@ -541,7 +545,7 @@ def test_start_and_stop_drive_the_unchanged_run_lifecycle(monkeypatch, tmp_path)
         assert win._running is False
         assert str(win._start_btn.cget("state")) == "normal"
         assert all(str(w.cget("state")) == normal for w, normal in win._locked_inputs)
-        assert win._run_status_var.get() == "Run ended."
+        assert win._run_status_var.get() == "Stopped"
         summary, detailed = _views(win)
         assert "Stop requested" in summary
         assert "Stopped before the end of the selected range, as requested." in summary
@@ -574,13 +578,14 @@ def test_worker_thread_never_touches_tk(monkeypatch, tmp_path) -> None:
     targets = [(win, "after"), (win, "after_idle"), (win, "event_generate"),
                (win._progress, "configure"), (win._start_btn, "configure"),
                (win._stop_btn, "configure"), (win._counts_var, "set"),
-               (win._run_status_var, "set")]
+               (win._run_status_var, "set"), (win._detail_var, "set"),
+               (win._eta_var, "set"), (win._progress, "start"), (win._progress, "stop")]
     targets += [(text, method) for text in win._log_texts.values()
                 for method in ("insert", "configure", "delete", "see")]
     for obj, name in targets:
         spy(obj, name)
 
-    def fake_run_scrape(job, *, log, cancel_event, progress_cb):
+    def fake_run_scrape(job, *, log, cancel_event, progress_cb, phase_cb=None):
         for i in range(1, 4):
             log(f"chapter {i}")
             progress_cb(i, 3)
@@ -602,7 +607,7 @@ def test_worker_thread_never_touches_tk(monkeypatch, tmp_path) -> None:
         assert ("Error: The run stopped because of an unexpected error: RuntimeError: boom"
                 in summary)
         assert "Traceback (most recent call last)" in detailed
-        assert win._counts_var.get() == "3 / 3 chapters"
+        assert win._counts_var.get() == "3 / 3 · 100%"
         assert win._running is False
     finally:
         win.destroy()

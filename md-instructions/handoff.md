@@ -1,6 +1,6 @@
 # webnovel-scraper - Handoff
 
-## Current Snapshot — v0.3.0 Checkpoint 02.1 complete (Activity logging + event bridge)
+## Current Snapshot — v0.3.0 Checkpoint 02.2 complete (progress, ETA and run-state accuracy)
 **2026-10-18 · HOME-PC (Windows 11) · Claude Code (Opus 5.5) · branch
 `feature/v0.3.0-modernization`**
 
@@ -9,8 +9,8 @@
   checkpoint 02, §8 C5/C10).
 - **Base:** `577b5db` = `main` (`e7dc407`) plus the FWN offset/duplicate-output
   fix. Checkpoint 00 = `1ab1747`; 01.0 (flat `scripts/`) = `f169565`; 01.1
-  (Light/Dark UI foundation, three-section shell) = `e93c21a`; 02.1 is the commit
-  after it. `fix/freewebnovel-offset-and-output-collisions` stays local.
+  (Light/Dark UI foundation, three-section shell) = `e93c21a`; 02.1 =
+  `d7116db`; 02.2 is the commit after it. `fix/freewebnovel-offset-and-output-collisions` stays local.
 - **Release state:** v0.2.0 is the latest release and tag (2026-06-30). 0.2.1 is
   merged to `main` via PR #4 but untagged. v0.3.0 supersedes it (plan §8 C3).
 - **01.1 recap:**
@@ -136,6 +136,79 @@
   preference persistence remain for later 02 steps. Delete the reference folder
   only after the 02 borrowing is complete.
 
+- **Checkpoint 02.2 (UI/controller plus one observability-only pipeline hook).**
+  Progress, ETA, counters and run-state accuracy in Section 3 (Run). No scraping
+  algorithm, adapter, PDF, cache, catalog, output-folder, dependency or default
+  change; `DEFAULT_HEADLESS` is still `False`.
+  - **Pipeline instrumentation (the only pipeline edit, ADR 007):** an optional
+    `run_scrape(..., phase_cb=None)`; `phase_cb(phase, total, already_present)`.
+    - Calls: `"scraping"` once the selected chapters are known (before the first
+      fetch) and again when resume skips more of them; `"building"` just before
+      CHUNKED/SINGLE output is assembled (SEPARATE writes as it goes, so it has no
+      build step).
+    - It rides on `_Progress` (`tick(..., skipped=True)` at the six resume-skip
+      sites). A raising observer is ignored. Nothing else changed: tick counts,
+      retries, rescue, cancellation and `RunReport` are identical (a test compares
+      runs with and without it).
+    - `progress_cb(done, total)` is unchanged: `total` is the selected source
+      pages, `done` those at an end state (saved, failed or already present), each
+      once, so duplicate displayed numbers on distinct pages count separately.
+  - **New `ui/run_progress.py` (no Tk, no threads):**
+    - `RunTracker` turns progress, phase, stop and finish events into a `RunView`
+      (status, severity, `done / total · %`, detail, ETA, indeterminate flag).
+    - States: idle, preparing, scraping, building, stopping, then complete,
+      cancelled, failed or refused. The seven `run_activity.OUTCOMES` map onto
+      them, and a test pins the table to the outcomes.
+    - Preparing has no total and no percentage (an indeterminate bar). Counts
+      never go backwards. After the run's end nothing but `start()` changes it, so
+      a late routine update cannot overwrite the outcome.
+    - The worker's last `(done, total)` and the `RunReport` totals
+      (`FinalCounts`: PDFs, already present, failed, recovered, not on the site's
+      list) travel in `RunFinished`.
+    - `format_eta` is adapted from PDF-Splitter `jobs.py`.
+  - **ETA:** `EtaEstimator`, no timer.
+    - Time runs on the monotonic clock from the worker's own timestamp on each
+      event, starting when scraping starts (the chapter list is never counted).
+    - Chapters resume skipped are left out of the rate.
+    - Nothing is shown before 3 measured chapters and 5 s. The per-chapter time is
+      the slower of the whole run and the last 10 chapters.
+    - A silence longer than max(4 × the chapter time, 30 s) makes it `—` again at
+      the next redraw. It is `—` while stopping or building, and blank after the
+      end.
+  - **Run section:** the same three sections, two compact rows under the bar:
+    phase | `done / total · %`, then counters | `ETA: …`. A warning or error
+    outcome recolours the status in both themes. **The minimum window grew
+    635×571 → 635×590** (one extra row; the width is unchanged).
+  - **Outcome text (`run_activity.py`):**
+    - a normal end whose own count stops short is "finished with problems";
+    - an all-skipped run says nothing new was written;
+    - coverage is reported from `requested_range`/`effective_range` and `toc_gaps`
+      inside the scraped range;
+    - an explicit end past the site's list is reported, but the open-ended
+      sentinel (`≥ 10**6`, matching the pipeline's `_UNBOUNDED_END_THRESHOLD`) never is;
+    - in a nothing-written run the pipeline's own warnings are shown.
+  - **Known limits (deliberate):**
+    - there is no live "current chapter", failed or recovered counter (the
+      callbacks cannot tell them reliably; they come from the final `RunReport`);
+    - `RunReport.failed` and friends are lists of displayed numbers, so two failed
+      pages that share a number count once in the failed total (the processed
+      count is exact);
+    - the legacy chunked/single path announces "building" only just before it
+      writes its PDFs, after its second-pass sweep;
+    - a final line with four counters is clipped at the minimum width (Summary
+      lists them all).
+  - **Tests:** 117 added (`test_ui_run_progress`, `test_progress_observer`,
+    `test_ui_run_section`, and additions to `test_ui_run_activity`). The 02.1 fakes
+    gained `phase_cb=None`, and the old status/count assertions were updated for
+    the new texts ("Preparing chapter list…", "1 / 5 · 20%", "Stopped"). 12/12
+    mutations were caught.
+  - **Gate:** `scripts/verify.py` PASS, 554 passed, 0 skipped. 305 UI/pipeline
+    tests also pass on Python 3.12.10. Safe startup smoke test passed.
+  - **Pending (owner):** the Run-section visual check in Light/Dark at the minimum
+    size and 125%/150% scaling, and one live run to see the phases and ETA on real
+    timing.
+  - **Next:** 02.3, the remaining Checkpoint 02 controls, only after review.
+
 ### Uncommitted local state (deliberately NOT committed)
 - `md-instructions/0.2.1_release_plan.md`, `0.2.1_bug-hunt.md` and
   `Decisions-template.md` are deleted locally. **The owner deferred these to a
@@ -159,6 +232,11 @@
   Briefing/handoff and handoff length are docs debt for 07 (C14).
 
 ### Log (newest first)
+- 2026-10-18 — Checkpoint 02.2: Run section shows the real phase, `done / total · %`,
+  counters and an ETA (`—` when unknown); final state from `RunReport`; one optional
+  `phase_cb` observer in the pipeline (ADR 007, instrumentation only). 117 tests
+  added. Verify PASS (554, 0 skipped). No scraping, adapter, PDF, dependency or
+  default changes.
 - 2026-10-18 — Checkpoint 02.1: Activity Summary/Detailed tabs, Clear Log and
   per-session logs in ignored `files/runtime-data/logs/`; PDF-Splitter's
   Activity channel/pump adapted (log written at emit; ADR 006); the worker no

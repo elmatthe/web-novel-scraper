@@ -110,7 +110,7 @@ v0.3.0) `files/runtime-data/` for GUI preferences (`settings.json`, Checkpoint
   travels on an immutable `ScrapeJob` (`use_browser` / `headless` / `request_timeout` /
   `rescue_workers == 1`) + a per-run `runtime_site_spec` copy; the pipeline owns/replaces
   the active manager (no GUI-prebuilt manager, no mutated catalog row).
-- `ui/` — GUI support only, no scraping. All four modules are adapted from
+- `ui/` — GUI support only, no scraping. The modules are adapted from
   PDF-Splitter where noted.
   - `appearance.py` (Checkpoint 01.1, PDF-Splitter): compact `Compact.*` ttk
     styles, Light/Dark palettes, the native Aqua branch and the in-place switch.
@@ -124,6 +124,9 @@ v0.3.0) `files/runtime-data/` for GUI preferences (`settings.json`, Checkpoint
   - `run_activity.py` (02.1, no Tk): the run-start lines; a 19-marker table that
     lifts existing pipeline messages into Summary; and the run outcome built from
     the pipeline's `RunReport`.
+  - `run_progress.py` (02.2, no Tk): `RunTracker` (phase, `done / total · %`,
+    counters, final state) and the monotonic-clock `EtaEstimator`, fed by
+    `progress_cb` and the optional `phase_cb` (DECISIONS.md #007).
 - `app.py` — the tkinter GUI entry point.
   - **Layout (since Checkpoint 01.1):** three bordered sections on the left
     (1. Web Novel Selection, 2. Output Options, 3. Run), the Activity panel on the
@@ -150,7 +153,9 @@ validated `.net`/`.com` sources, and TXT/PDF output. See `handoff.md` and
 `Web-Novel-Scraper-v0.3.0-Implementation-Plan.md` for current state. Checkpoint
 01.1 (Light/Dark UI foundation and the three-section window shell) is complete,
 and so is step 02.1 (Activity Summary/Detailed logging and the thread-safe event
-bridge), which awaits owner review before 02.2. The rest of this section
+bridge) and step 02.2 (Run progress, ETA, counters and run-state accuracy,
+with one optional observability-only `phase_cb` in the pipeline), which awaits
+owner review before 02.3. The rest of this section
 describes 0.2.0/0.2.1 as built.
 
 **0.2.0 (Unreleased — implemented, pending the user's manual live test).**
