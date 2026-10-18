@@ -464,7 +464,9 @@ def test_real_size_full_range_offset_reconciliation_stays_observably_bounded() -
     duplicate_index = int(full_size_label(3679))
     assert [m.slug for m in metas if m.index == duplicate_index] == [3678, 3679]
     chapter_fetches = [u for u in rm.fetched if "/chapter-" in u]
-    assert len(chapter_fetches) == 131
+    # One page in sixteen is read to prove a span between two equal gaps really is constant (the site can
+    # skip numbers for a stretch and return to the earlier gap), plus the inserts and their bisection.
+    assert 250 < len(chapter_fetches) < 450
     assert any("slug 1472 is missing" in line for line in logs)
     assert any("locating next chapter-number offset change" in line for line in logs)
     assert any("reconciled through slug 4417 of 4417" in line for line in logs)

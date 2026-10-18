@@ -45,7 +45,11 @@ _SPACES = re.compile("[   -   　]")
 _WS = re.compile(r"\s+")
 
 _SEP = r"[:\-‐-―|.]"     # colon, hyphen, the dash family, pipe, period
-_HEADING = re.compile(rf"^\s*chapter\s+(\d+(?:\.\d+)?)\b(?:\s*{_SEP}+\s*|\s+)?(.*)$", re.IGNORECASE)
+# The word "Chapter" as a heading writes it, including misspellings seen on the sites ("Chpater 1953:
+# Nineteen" on Supreme Magus). The list is closed on purpose: only slips that are not words themselves,
+# so prose such as "Chapel 12" or "Charter 5" is never taken for a chapter heading.
+CHAPTER_WORD = r"(?:chapter|chpater|chaper|chatper|chapetr|chaptre|cahpter|chpter|chapte|capter)"
+_HEADING = re.compile(rf"^\s*{CHAPTER_WORD}\s+(\d+(?:\.\d+)?)\b(?:\s*{_SEP}+\s*|\s+)?(.*)$", re.IGNORECASE)
 _SITE_SUFFIXES = (
     re.compile(r"\s*[|\-–—]\s*Empire\s*Novel.*$", re.IGNORECASE),
     re.compile(r"\s*[|\-–—]\s*Read\s*Online.*$", re.IGNORECASE),
@@ -141,7 +145,7 @@ def is_repeated_heading(paragraph: str, label: object, title: str) -> bool:
     """Whether *paragraph* is the page repeating the chapter heading (number first, then title)."""
     text = _comparable(paragraph)
     number = re.escape(label_text(label))
-    match = re.match(rf"^chapter\s*{number}(?![\d.])", text) or re.match(rf"^{number}(?![\d.])", text)
+    match = re.match(rf"^{CHAPTER_WORD}\s*{number}(?![\d.])", text) or re.match(rf"^{number}(?![\d.])", text)
     if not match:
         return False
     rest = text[match.end():].strip(" :-|.")

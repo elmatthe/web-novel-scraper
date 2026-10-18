@@ -24,6 +24,7 @@ from urllib.parse import urldefrag, urljoin, urlparse
 from bs4 import BeautifulSoup
 
 from ..content import (
+    CHAPTER_WORD,
     clean_paragraphs,
     clean_title,
     is_site_chrome,
@@ -49,13 +50,15 @@ logger = logging.getLogger(__name__)
 # fractional ("Chapter 627.2" — FreeWebNovel's side-chapter inserts); a bare
 # trailing dot ("Chapter 100. The End") is NOT a fraction and stays title junk.
 CHAPTER_TITLE_RE = re.compile(
-    r"\bChapter\s+(\d+(?:\.\d+)?)(?:\s*[:\-]\s*|\s+)?(.*)$", re.IGNORECASE
+    rf"\b{CHAPTER_WORD}\s+(\d+(?:\.\d+)?)(?:\s*[:\-]\s*|\s+)?(.*)$", re.IGNORECASE
 )
 # Looser "Chapter N" finder for index-page link text.
 CHAPTER_LIST_TEXT_RE = re.compile(r"\bChapter\s+(-?\d+)\b", re.IGNORECASE)
 # Anchor-text number for (slug ↔ displayed) pair harvesting: also fractional and
 # negative ("Chapter -1 Volume 2 Glossary" marks a non-chapter insert page).
-_ANCHOR_NUM_RE = re.compile(r"\bChapter\s+(-?\d+(?:\.\d+)?)\b", re.IGNORECASE)
+_ANCHOR_NUM_RE = re.compile(rf"\b{CHAPTER_WORD}\s+(-?\d+(?:\.\d+)?)\b", re.IGNORECASE)
+# A "title" that is only the website's name (what the document title leaves after the chapter number).
+_SITE_NAME_ONLY_RE = re.compile(r"free\s*web\s*novel(?:\s*\.\s*(?:com|net))?", re.IGNORECASE)
 
 
 # How many opening lines of a page's body are checked against its heading.
@@ -64,7 +67,7 @@ _HEADING_LINES = 2
 # Composite heading some pages show: "Chapter 1129.1 - 1130 Initiative" (the story itself begins
 # "Chapter 1130 Initiative"). The first number is the page before it, the second the real chapter.
 _COMPOSITE_RE = re.compile(
-    r"\bChapter\s+(\d+(?:\.\d+)?)\s*[-–—]\s*(\d+)(?![\d.])\s*(.*)$", re.IGNORECASE
+    rf"\b{CHAPTER_WORD}\s+(\d+(?:\.\d+)?)\s*[-–—]\s*(\d+)(?![\d.])\s*(.*)$", re.IGNORECASE
 )
 
 
@@ -120,6 +123,10 @@ _MISSING_PAGE_MARKER = ""
 _WALK_PADDING = 8
 _RECONCILIATION_FETCH_CEILING_PADDING = 64
 _RECONCILIATION_SEARCH_LOG_EVERY = 8
+# Longest run of slugs whose number is inferred from two probed pages with the same slug-to-number
+# gap (see ``_reconcile_window``): a change of gap shorter than this between two such pages is not seen
+# here, and the per-chapter identity check refuses the page instead.
+_VERIFY_STRIDE = 16
 
 
 def _meta_label(meta: ChapterMeta) -> str:
@@ -263,6 +270,8 @@ def _normalize_heading_line(
     title = re.sub(r"\s*-\s*Free\s*Web\s*Novel.*$", "", title, flags=re.IGNORECASE)
     title = re.sub(r"\s*\|\s*Free\s*Web\s*Novel.*$", "", title, flags=re.IGNORECASE)
     title = title.strip(" -|:;.")
+    if _SITE_NAME_ONLY_RE.fullmatch(title):
+        title = ""      # "Supreme Magus - Chapter 1921 - Free Web Novel": the site, not a chapter title
     return number, title
 
 
@@ -718,8 +727,8 @@ class FreeWebNovelAdapter(BaseAdapter):
         Large offset novels are mostly constant-offset spans interrupted by a
         small number of inserts/extras. Fetching every page during TOC build
         makes a full-range run look hung for hours. This walk uses the documented
-        monotone offset to binary-search each transition, fetches only the actual
-        insert cluster, and infers the constant spans between transitions."""
+        slug-to-number gap, fetches the pages that are not ordinary numbered chapters,
+        and infers only short spans between probed pages with the same gap."""
         if walk_lo > walk_hi:
             return []
         metas_by_slug: dict[int, ChapterMeta] = {
@@ -727,7 +736,6 @@ class FreeWebNovelAdapter(BaseAdapter):
             for meta in (resume_metas or [])
             if meta.slug is not None and walk_lo <= meta.slug <= walk_hi
         }
-        transition_ranges: list[tuple[int, int]] = []
         last_search_log_count = 0
 
         def add_meta(meta: ChapterMeta) -> None:
@@ -827,67 +835,45 @@ class FreeWebNovelAdapter(BaseAdapter):
                 add_exact(slug)
             emit_progress(walk_hi)
             return sorted_metas()
-        if final_offset < current_offset:
-            raise RuntimeError(
-                "FreeWebNovel displayed chapter offset decreased across the "
-                f"reconciliation window ({current_offset} -> {final_offset}); "
-                "cannot safely infer chapter mappings."
-            )
 
+        # The gap between slug and displayed number is NOT monotone: the site can skip numbers for a
+        # stretch and then come back to the earlier gap (Supreme Magus slugs 1653-1932 show two numbers
+        # more than the pages before and after them). Two equal gaps therefore prove nothing about the
+        # pages between; a span is inferred only when it is short enough to sit between two probed
+        # pages that agree. Longer spans are halved (fetching the middle page) until they are, so a
+        # change in the gap is found to the exact slug. Pages with no ordinary number (fractional
+        # inserts, extras, missing pages) are fetched one by one, never inferred.
+        add_exact(right_integer_slug)
         emit_progress(cursor - 1)
-        while cursor <= right_integer_slug and current_offset < final_offset:
-            # Find the first page that is no longer in the current constant
-            # offset span. Fractional/unnumbered insert pages are deliberately
-            # treated as the start of the transition.
-            search_lo, search_hi = cursor, right_integer_slug
-            while search_lo < search_hi:
-                mid = (search_lo + search_hi) // 2
-                num = self._fetch_and_read(
-                    rm, spec, mid, known, fetch_budget=fetch_budget
-                )
-                offset = self._displayed_offset(mid, num)
-                if offset is not None and offset == current_offset:
-                    search_lo = mid + 1
-                else:
-                    search_hi = mid
-                maybe_log_search(search_lo, search_hi)
-
-            boundary = search_lo
-            add_inferred(cursor, boundary - 1, current_offset)
-            transition_start = boundary
-            next_offset: Optional[int] = None
-            while boundary <= right_integer_slug and next_offset is None:
-                next_offset = add_exact(boundary)
-                boundary += 1
-            if next_offset is None or next_offset <= current_offset:
-                raise RuntimeError(
-                    "FreeWebNovel chapter-index reconciliation could not advance "
-                    f"past offset {current_offset} near slug {transition_start}."
-                )
-            transition_ranges.append((transition_start, boundary - 1))
-            current_offset = next_offset
-            cursor = boundary
-            emit_progress(cursor - 1)
-
-        if current_offset != final_offset:
-            raise RuntimeError(
-                "FreeWebNovel chapter-index reconciliation did not converge on "
-                f"the final offset ({current_offset} != {final_offset})."
-            )
-        add_inferred(cursor, right_integer_slug, current_offset)
+        pending = [(cursor - 1, right_integer_slug, current_offset, final_offset)]
+        while pending:
+            lo, hi, off_lo, off_hi = pending.pop()
+            if hi - lo <= 1:
+                continue
+            if off_lo is None:
+                pending.append((lo + 1, hi, add_exact(lo + 1), off_hi))
+            elif off_hi is None:
+                pending.append((lo, hi - 1, off_lo, add_exact(hi - 1)))
+            elif off_lo == off_hi and hi - lo <= _VERIFY_STRIDE:
+                add_inferred(lo + 1, hi - 1, off_lo)
+                emit_progress(hi)
+            else:
+                # Equal gaps: step along at the probe spacing. Different gaps: halve, to find where.
+                mid = lo + _VERIFY_STRIDE if off_lo == off_hi else (lo + hi) // 2
+                off_mid = add_exact(mid)
+                maybe_log_search(lo, hi)
+                pending.append((mid, hi, off_mid, off_hi))
+                pending.append((lo, mid, off_lo, off_mid))
         for slug in range(right_integer_slug + 1, walk_hi + 1):
             add_exact(slug)
         emit_progress(walk_hi)
 
         metas = sorted_metas()
-        if transition_ranges:
-            ranges = ", ".join(f"{lo}-{hi}" for lo, hi in transition_ranges[:6])
-            more = " ..." if len(transition_ranges) > 6 else ""
-            self._log(
-                f"{spec.novel_slug!r}: compressed chapter-index reconciliation "
-                f"inferred constant-offset spans and walked "
-                f"{len(transition_ranges)} transition range(s): {ranges}{more}."
-            )
+        self._log(
+            f"{spec.novel_slug!r}: chapter-index reconciliation read "
+            f"{fetch_budget['count'] if fetch_budget is not None else len(known)} chapter pages and "
+            f"inferred the rest only between pages at most {_VERIFY_STRIDE} slugs apart that agree."
+        )
         return metas
 
     def _walk_and_reconcile(
@@ -945,11 +931,20 @@ class FreeWebNovelAdapter(BaseAdapter):
         self, meta: ChapterMeta, spec: SiteSpec, *, fast_path: bool = False
     ) -> ChapterContent:
         prefetched = meta.extra.get(_PREFETCHED_HTML_KEY) if meta.extra else None
+        rm = self._manager(spec)
         if prefetched is not None:
             # Reconciliation during build_chapter_index already fetched this
-            # exact page (offset novels) — reuse it instead of fetching twice.
-            return self._extract_chapter(prefetched, meta)
-        rm = self._manager(spec)
+            # exact page (offset novels) — reuse it instead of fetching twice. It gets the same
+            # checks as any page: one that is not this chapter is set aside and the page is fetched
+            # again, exactly as for a saved page (``extract_validated``).
+            try:
+                return self._extract_chapter(prefetched, meta)
+            except EmptyExtractionError as exc:
+                invalidate = getattr(rm, "invalidate_cache", None)
+                if callable(invalidate):
+                    invalidate(meta.url, str(exc))
+                meta.extra.pop(_PREFETCHED_HTML_KEY, None)
+                self._log(f"  chapter {meta.index}: the page read while listing chapters could not be used ({exc}); fetching it again.")
 
         def fetch() -> str:
             # ``fast_path`` (0.2.0 §3.2): the conductor runs the primary under a bounded
@@ -974,6 +969,14 @@ class FreeWebNovelAdapter(BaseAdapter):
             # the expected number, so the guard below refuses it under 1129.1 or 1131 alike; the
             # heading keeps the number pair the site shows.
             shown, number, title = f"{composite[0]}-{composite[1]}", composite[1], composite[2]
+        if number is None:
+            # No heading says which chapter this is (a misspelling nobody listed, say). The story's own
+            # opening lines may: a heading there for another chapter is that chapter's page.
+            for line in _extract_paragraphs(soup)[:_HEADING_LINES]:
+                story_number, _story_title = parse_heading(line)
+                if story_number is not None:
+                    number = _parse_chapter_number(story_number)
+                    break
         if number is not None and float(number) != float(meta.index):
             # The offset guard (plan §9.6): a page showing another chapter is never published
             # as this one, however it reached us (cache, network or reconciliation).
