@@ -5,6 +5,50 @@ See AI-WORKSPACE.md for how this fits alongside Briefing, Changelog, and Handoff
 
 ---
 
+## 015 — One canonical chapter text; cleanup only where measured evidence makes it confident — 2026-10-18 — Claude (Opus 5.5)
+
+**Status:** Accepted (v0.3.0 Checkpoint 05)
+
+**Context:** Each adapter cleaned text its own way. Measured on the owner's pre-0.3.0 cache, the
+FreeWebNovel filters (substring `NOISE_SNIPPETS`, a 12-character short-line rule, consecutive
+de-duplication) deleted 2,274 real paragraphs from 1,398 pages ("Painful!", "Boom!", "He sighed.",
+"***", "’Crap...’", repeated battle cries), and WebNovel's keyword filter deleted 381 real paragraphs
+from 890 pages ("He reported...", "her husband's comment"). Headings carried a forced period, were
+detected in the PDF by regex (so fractional `Chapter 627.2:` headings were styled as body text), and
+characters outside the Times-Roman encoding (CJK, Greek, arrows, stars) printed as wrong glyphs.
+
+**Decision:**
+1. `content.py` is the single cleanup: character normalisation (invisible/control removed, Unicode
+   spaces to spaces, everything else kept), title cleanup (site suffixes, a repeated chapter number,
+   surrounding separators, double-escaped entities), exactly one heading `Chapter N: Title`
+   (`Chapter N: Untitled` with a warning), and body cleanup limited to: credit lines among the first
+   or last three paragraphs (306 of 306 sampled were in the first three), a repeated heading among the
+   first two paragraphs that starts with the chapter number, whole-paragraph reader-interface lines
+   (a short exact list; one hit in 709,458 cached paragraphs), and the website's own promotional
+   sentences when they are the whole paragraph or its last sentence (author's notes are exempt).
+2. Adapters only find structure: FreeWebNovel reads the first body container present (`#article`,
+   `#chapter-content`, ...) instead of the largest one; inline markup is joined as read (no spaces
+   inserted before punctuation).
+3. The PDF is built from chapter structure (heading flowable with `keepWithNext`, body paragraphs),
+   in the established style; nothing is guessed from text patterns. Runs of characters the standard
+   font cannot encode are drawn from an installed Windows font that has them (Times New Roman, Segoe
+   UI, Segoe UI Symbol, Microsoft YaHei, ...), so ordinary text looks exactly as before.
+4. TXT is UTF-8 without BOM, `\n` line endings, heading + blank line + paragraphs, chapters separated
+   by two blank lines, published atomically; TXT and PDF render the same `ChapterContent` list, so
+   their words are identical (tested by extracting the PDF text).
+
+**Alternatives considered:**
+- *Keep the filters and add exceptions.* Rejected: every exception was another guess about prose.
+- *Embed a bundled Unicode font for all text.* Rejected: a style and licensing change outside scope.
+- *Drop a lone digit paragraph (Reverend Insanity's inline comment counts).* Rejected: a countdown is
+  legitimate prose; it is a documented limitation.
+
+**Consequences:** Output text is longer where the old filters deleted prose, and headings lose the
+forced period. Translator notes inside chapters are kept. A page with none of the known body
+containers fails extraction visibly instead of scraping the whole page.
+
+---
+
 ## 014 — A run is a folder with a fixed selection and a checksummed journal; Resume trusts only that — 2026-10-18 — Claude (Opus 5.5)
 
 **Status:** Accepted (v0.3.0 Checkpoints 03.3-03.4; implements plan §9.5/§9.7)

@@ -474,7 +474,7 @@ def test_chapters_to_text_contains_heading_and_body() -> None:
         ChapterContent(index=1, title="The Gate", paragraphs=["Body one.", "Body two."])
     ]
     text = chapters_to_text(chapters)
-    assert "Chapter 1: The Gate." in text
+    assert "Chapter 1: The Gate" in text
     assert "Body one." in text
     assert "Body two." in text
 

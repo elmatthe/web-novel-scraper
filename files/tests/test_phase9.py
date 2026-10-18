@@ -285,7 +285,7 @@ def test_wnd_adapter_extracts_post_redirect_g_data() -> None:
     adapter = WebNovelDynamicAdapter(request_manager=FakeRM(default_html=html))
     content = adapter.fetch_chapter(meta, NQ_SPEC)
     assert content.title == "Glory to the Victor"
-    assert content.heading == "Chapter 1: Glory to the Victor."
+    assert content.heading == "Chapter 1: Glory to the Victor"
     assert len(content.paragraphs) == 3
 
 

@@ -483,7 +483,7 @@ def test_a_failed_save_never_stops_the_window_from_working(tmp_path, monkeypatch
         win._worker.join(5)
         win.flush_activity()
         assert len(jobs) == 1 and jobs[0].novel_slug == "shadow-slave"
-        assert win._run_status_var.get() in ("Complete", "Finished — no PDFs written")
+        assert win._run_status_var.get() in ("Complete", "Finished — nothing written")
     finally:
         win.destroy()
 

@@ -22,6 +22,14 @@ from urllib.parse import urldefrag, urljoin, urlparse
 
 from bs4 import BeautifulSoup
 
+from ..content import (
+    clean_paragraphs,
+    clean_title,
+    is_site_chrome,
+    label_text,
+    normalize_text,
+    strip_promotions,
+)
 from ..models import (
     ChapterContent,
     ChapterMeta,
@@ -61,52 +69,25 @@ def _parse_chapter_number(raw: str) -> int | float:
 _INVISIBLE_CHARS = "​‌‍‬ ­﻿"
 _INVISIBLE_RE = re.compile(f"[{_INVISIBLE_CHARS}]+")
 
-# Translator/editor credit lines are navigation/credit noise, not body prose.
-# This is an extraction-level noise filter (kept per plan §5), NOT the dropped
-# RI/RNI prose-editing credit regex.
-_CREDIT_LINE_RE = re.compile(
-    r"^(translator|tl|editor|ed|proofreader|pr)\s*[:\-]\s*\S+",
-    re.IGNORECASE,
-)
-
-# Navigation / chrome / comment snippets to drop during body extraction. The
-# novel/brand-name entries from the legacy list (e.g. "shadow slave",
-# "freewebnovel") are deliberately omitted — they can legitimately appear in
-# body prose, and matching them as noise risks dropping real paragraphs.
-NOISE_SNIPPETS = (
-    "contact",
-    "dmca",
-    "privacy policy",
-    "reader mode",
-    "report chapter",
-    "table of contents",
-    "bookmark",
-    "login",
-    "register",
-    "comment",
-    "discussion",
-    "next chapter",
-    "previous chapter",
-    "want to read more chapters",
-    "text to speech",
-    "add to library",
-    "load more comments",
-    "use arrow keys",
-)
-
-# Body-container selectors, best-score wins.
+# Body containers, in priority order: the FIRST one present that holds paragraphs is the chapter
+# body (v0.3.0 05). ``#article`` is the .com reader, ``#chapter-content`` the .net reader. The old
+# "largest container wins" rule picked wrappers that also hold the reader widgets (text-to-speech,
+# report form), and its noise/short-line filters then deleted real prose; measured on 1,398 cached
+# pages, they removed 2,274 story paragraphs ("Boom!", "He sighed.", "***", curly-quoted lines).
+# Generic wrappers (``main``, ``.chapter``) are deliberately not containers.
 _BODY_CONTAINER_SELECTORS = (
     "#article",
-    "article",
     "#chapter-content",
     ".chapter-content",
-    ".entry-content",
     ".read-content",
+    ".entry-content",
     ".novel-content",
     ".chapter-body",
-    ".chapter",
-    "main",
+    "article",
 )
+# This website's own promotional sentences, removed only when confidently identified
+# (``content.strip_promotions``).
+SITE_NAMES = ("freewebnovel",)
 
 # A discovered chapter count below this for a "known long novel" is suspicious
 # and is surfaced as a warning (never silently trusted).
@@ -127,6 +108,12 @@ _MISSING_PAGE_MARKER = ""
 _WALK_PADDING = 8
 _RECONCILIATION_FETCH_CEILING_PADDING = 64
 _RECONCILIATION_SEARCH_LOG_EVERY = 8
+
+
+def _meta_label(meta: ChapterMeta) -> str:
+    """The exact label of a chapter (the manifest's text when present: ``627.10`` survives)."""
+    carried = meta.extra.get("manifest_label") if isinstance(meta.extra, dict) else None
+    return carried if isinstance(carried, str) and carried else label_text(meta.index)
 
 
 def _ws(text: str) -> str:
@@ -287,69 +274,35 @@ def _extract_title(
     return fallback_num, ""
 
 
-# ── Body extraction (ported) ─────────────────────────────────────────────────
-def _is_noise_paragraph(text: str, heading_line: str) -> bool:
-    t = _ws(text)
-    if not t:
-        return True
-    lower = t.lower()
-    if lower == heading_line.lower().strip():
-        return True
-    if CHAPTER_TITLE_RE.match(t):          # duplicate-heading paragraph
-        return True
-    if _CREDIT_LINE_RE.match(t):           # translator/editor credit line
-        return True
-    if re.fullmatch(r"[\W_]+", t):
-        return True
-    if len(t) < 4:
-        return True
-    if len(t) < 12 and not (t.startswith('"') or t.startswith("'")):
-        return True
-    return any(snippet in lower for snippet in NOISE_SNIPPETS)
-
-
+# ── Body extraction (v0.3.0 05: structure, then the shared canonical cleanup) ─
 def _strip_embedded_watermarks(soup: BeautifulSoup) -> None:
     for tag in soup.find_all("subtxt"):
         tag.decompose()
 
 
-def _extract_paragraphs(soup: BeautifulSoup, heading_line: str) -> list[str]:
+def node_text(node) -> str:
+    """A paragraph's text with inline markup joined as the reader sees it ("<i>What</i>?" ->
+    "What?", never "What ?"), ``<br>`` as a space, then normalised (``content.normalize_text``)."""
+    for br in node.find_all("br"):
+        br.replace_with(" ")
+    return normalize_text(node.get_text())
+
+
+def _extract_paragraphs(soup: BeautifulSoup, heading_line: str | None = None) -> list[str]:
+    """The raw story paragraphs of the first body container present (see
+    ``_BODY_CONTAINER_SELECTORS``): watermark tags, reader-interface lines and this site's own
+    promotions removed; nothing else. ``heading_line`` is accepted for compatibility and unused
+    (the canonical cleanup handles repeated headings). ``[]`` when no container has paragraphs."""
     _strip_embedded_watermarks(soup)
-
-    best_paras: list[str] = []
-    best_score = -1
-
     for selector in _BODY_CONTAINER_SELECTORS:
-        for node in soup.select(selector):
-            paras = []
-            for p in node.find_all("p"):
-                txt = _ws(p.get_text(" ", strip=True))
-                if _is_noise_paragraph(txt, heading_line):
-                    continue
-                paras.append(txt)
-            score = sum(len(p) for p in paras)
-            if score > best_score and paras:
-                best_score = score
-                best_paras = paras
-
-    if not best_paras:
-        paras = []
-        for p in soup.find_all("p"):
-            txt = _ws(p.get_text(" ", strip=True))
-            if _is_noise_paragraph(txt, heading_line):
-                continue
-            paras.append(txt)
-        best_paras = paras
-
-    # Consecutive-duplicate paragraph dedup.
-    deduped: list[str] = []
-    last = None
-    for para in best_paras:
-        if para == last:
+        node = soup.select_one(selector)
+        if node is None:
             continue
-        deduped.append(para)
-        last = para
-    return deduped
+        paras = [strip_promotions(node_text(p), SITE_NAMES) for p in node.find_all("p")]
+        paras = [p for p in paras if p and not is_site_chrome(p)]
+        if paras:
+            return paras
+    return []
 
 
 def filter_duplicate_consecutive_chapters(
@@ -988,11 +941,9 @@ class FreeWebNovelAdapter(BaseAdapter):
                 "chapter list and run again)."
             )
 
-        # Heading text used only for noise filtering (exact-match dedup).
-        heading_for_filter = (
-            f"Chapter {meta.index}: {title}." if title else f"Chapter {meta.index}."
-        )
-        paragraphs = _extract_paragraphs(soup, heading_for_filter)
+        label = _meta_label(meta)
+        title = clean_title(title, label) or clean_title(meta.title or "", label)
+        paragraphs = clean_paragraphs(_extract_paragraphs(soup), label=label, title=title)
         if not paragraphs:
             # A fully-fetched, non-challenge page with no extractable body is an
             # extraction failure (its own class) — NOT a Cloudflare block. The
@@ -1002,12 +953,12 @@ class FreeWebNovelAdapter(BaseAdapter):
             )
 
         if not title:
-            # Degraded: content is kept; ChapterContent renders "Chapter N."
+            # Degraded: the content is kept under an explicit, deterministic heading.
             self._warn(
-                f"chapter {meta.index} — no title text found in any heading "
-                "candidate (content written, heading will be 'Chapter N.')"
+                f"chapter {label} — no title text found in any heading "
+                f"candidate (content written, heading will be 'Chapter {label}: Untitled')"
             )
 
         return ChapterContent(
-            index=meta.index, title=title or "", paragraphs=paragraphs
+            index=meta.index, title=title or "", paragraphs=paragraphs, label=label
         )

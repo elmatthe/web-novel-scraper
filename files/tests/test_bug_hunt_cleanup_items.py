@@ -18,7 +18,7 @@ def test_degraded_separate_filename_has_single_dot_pdf_suffix() -> None:
         paragraphs=["Body text long enough for a degraded chapter."],
     )
 
-    assert pipeline._separate_pdf_name(content) == "Chapter 7.pdf"
+    assert pipeline._separate_pdf_name(content) == "Chapter 7_ Untitled.pdf"
 
 
 def test_a_stray_pdf_with_a_matching_name_is_never_taken_as_already_saved(tmp_path) -> None:

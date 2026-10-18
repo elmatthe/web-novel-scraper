@@ -166,8 +166,10 @@ def final_counts(report: object | None) -> FinalCounts | None:
         return None
     problems = (set(getattr(report, "failed", ()) or ()) | set(getattr(report, "permanent_failed", ()) or ())
                 | set(getattr(report, "extraction_failed", ()) or ()))
+    files = [Path(p) for p in (getattr(report, "written", ()) or ())]
     return FinalCounts(
-        pdfs=len(getattr(report, "written", ()) or ()),
+        pdfs=sum(1 for p in files if p.suffix.lower() != ".txt"),
+        txts=sum(1 for p in files if p.suffix.lower() == ".txt"),
         already_present=len(getattr(report, "skipped_existing", ()) or ()),
         failed=len(problems),
         recovered=len(set(getattr(report, "rescued", ()) or ()) - problems),
@@ -259,6 +261,19 @@ def _coverage_events(report: object) -> list[ActivityEvent]:
     return events
 
 
+def _files_wording(report: object) -> tuple[str, str, str]:
+    """("PDFs", "3 PDFs", "3") for a PDF-only run (the established wording), otherwise
+    ("files", "3 PDFs and 3 TXT files", "3 PDF, 3 TXT")."""
+    formats = tuple(getattr(report, "formats", ("pdf",)) or ("pdf",))
+    files = [Path(p) for p in (getattr(report, "written", ()) or ())]
+    if formats == ("pdf",):
+        return "PDFs", _plural(len(files), "PDF"), str(len(files))
+    per = {f: sum(1 for p in files if p.suffix.lower() == "." + f) for f in formats}
+    text = " and ".join(_plural(n, "PDF" if f == "pdf" else "TXT file") for f, n in per.items())
+    detail = ", ".join(f"{n} {f.upper()}" for f, n in per.items())
+    return "files", text, detail
+
+
 def _processed_line(processed: tuple[int, int] | None, *, before: str = "") -> ActivityEvent | None:
     if processed is None:
         return None
@@ -295,6 +310,7 @@ def outcome_events(report: object | None, *, processed: tuple[int, int] | None =
     else:
         written = len(getattr(report, "written", ()) or ())
         skipped = len(getattr(report, "skipped_existing", ()) or ())
+        files_word, files_text, written_detail = _files_wording(report)
         failed = list(getattr(report, "failed", ()) or ())
         missing = list(getattr(report, "permanent_failed", ()) or ())
         empty = list(getattr(report, "extraction_failed", ()) or ())
@@ -324,17 +340,18 @@ def outcome_events(report: object | None, *, processed: tuple[int, int] | None =
                               "could not be accounted for.", WARNING))
         elif written == 0 and skipped == 0:
             outcome = "nothing_written"
-            events.append(run("Finished, but no PDFs were written.", WARNING))
+            events.append(run(f"Finished, but no {files_word} were written.", WARNING))
         elif written == 0:
             outcome = "completed"
-            events.append(run("Completed: every selected chapter was already in the output "
-                              "folder, so no new PDFs were written."))
+            events.append(run("Completed: every selected chapter was already saved in the run "
+                              f"folder, so no new {files_word} were written."))
         else:
             outcome = "completed"
-            events.append(run(f"Completed: {_plural(written, 'PDF')} written and no chapter "
+            events.append(run(f"Completed: {files_text} written and no chapter "
                               "failures recorded."))
         events.append(_processed_line(processed))
-        events.append(run(f"PDFs written: {written}. Already present (skipped): {skipped}."))
+        events.append(run(f"{files_word[0].upper() + files_word[1:]} written: {written_detail}. "
+                          f"Already present (skipped): {skipped}."))
         if failed:
             events.append(run(f"Failed chapters: {_chapter_list(failed)}.", WARNING))
         if missing:

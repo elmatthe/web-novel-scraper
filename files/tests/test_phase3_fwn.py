@@ -103,7 +103,7 @@ def test_fetch_chapter_extracts_title_and_paragraphs() -> None:
 
     assert content.index == 5
     assert content.title == "The Test"
-    assert content.heading == "Chapter 5: The Test."
+    assert content.heading == "Chapter 5: The Test"
     # The three real body paragraphs survive; junk is gone.
     assert len(content.paragraphs) == 3
     assert content.paragraphs[0].startswith("Sunny opened his eyes")
@@ -123,7 +123,7 @@ def test_fetch_chapter_invisible_char_title_cleaned() -> None:
     meta = ChapterMeta(index=2261, url=chapter_url_for(RI_SPEC, 2261))
     adapter = FreeWebNovelAdapter(request_manager=FakeRM(default_html=html))
     content = adapter.fetch_chapter(meta, RI_SPEC)
-    assert content.heading == "Chapter 2261: New Anti-Fang Alliance."
+    assert content.heading == "Chapter 2261: New Anti-Fang Alliance"
 
 
 def test_fetch_chapter_degraded_title_fallback() -> None:
@@ -132,19 +132,21 @@ def test_fetch_chapter_degraded_title_fallback() -> None:
     adapter = FreeWebNovelAdapter(request_manager=FakeRM(default_html=html))
     content = adapter.fetch_chapter(meta, SS_SPEC)
     assert content.is_degraded
-    assert content.heading == "Chapter 7."
+    assert content.heading == "Chapter 7: Untitled"
     assert content.paragraphs
 
 
-# ── Consecutive-paragraph dedup inside body extraction ───────────────────────
-def test_extract_paragraphs_dedupes_consecutive_duplicates() -> None:
+# ── Repeated story lines are prose, not noise (v0.3.0 05) ─────────────────────
+def test_extract_paragraphs_keeps_a_storys_own_repeated_lines() -> None:
+    """The old consecutive de-duplication deleted lines a story repeats on purpose (measured in the
+    cache: "Myriad Self!" / "Myriad Self!", "[You have slain...]" twice). They stay now."""
     html = (
         "<div id='article'>"
-        "<p>A repeated sentence that is long enough to pass the filter.</p>"
-        "<p>A repeated sentence that is long enough to pass the filter.</p>"
-        "<p>A different following sentence, also long enough to survive.</p>"
+        "<p>Myriad Self!</p>"
+        "<p>Myriad Self!</p>"
+        "<p>A different following sentence.</p>"
         "</div>"
     )
     soup = BeautifulSoup(html, "html.parser")
-    paras = fwn._extract_paragraphs(soup, heading_line="Chapter 1: X.")
-    assert len(paras) == 2  # the consecutive duplicate collapsed to one
+    paras = fwn._extract_paragraphs(soup)
+    assert paras == ["Myriad Self!", "Myriad Self!", "A different following sentence."]

@@ -131,7 +131,7 @@ def test_fetch_chapter_via_next_data(tmp_path) -> None:
 
     assert content.index == 3
     assert content.title == "The Gate"
-    assert content.heading == "Chapter 3: The Gate."
+    assert content.heading == "Chapter 3: The Gate"
     assert len(content.paragraphs) == 3
     assert content.paragraphs[0].startswith("Sunny stepped through the gate")
 
@@ -159,7 +159,7 @@ def test_fetch_chapter_parses_live_g_data_chapinfo_shape() -> None:
     )
     content = adapter.fetch_chapter(meta, NQ_SPEC)
     assert content.title == "Glory to the Victor"
-    assert content.heading == "Chapter 1: Glory to the Victor."
+    assert content.heading == "Chapter 1: Glory to the Victor"
     assert content.paragraphs == [
         "One strike after another.",
         "Queen Bee adjusted her stance.",
@@ -180,7 +180,7 @@ def test_fetch_chapter_dom_fallback(tmp_path) -> None:
     content = adapter.fetch_chapter(meta, NQ_SPEC)
 
     assert content.title == "The Keeper"  # from the DOM <h1> title selector
-    assert content.heading == "Chapter 4: The Keeper."
+    assert content.heading == "Chapter 4: The Keeper"
     # The two real paragraphs survive; the "Next chapter" / login-comment junk
     # is filtered out.
     assert len(content.paragraphs) == 2

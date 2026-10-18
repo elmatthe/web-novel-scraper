@@ -9,6 +9,29 @@ versioning.
 candidate. The macOS launcher and portable code are kept, but macOS acceptance is deferred to a
 later branch; nothing here claims macOS readiness.
 
+### Added / Changed — TXT output, one canonical chapter text and faithful PDFs (Checkpoint 05)
+- **TXT output:** tick **TXT**, **PDF** or both (PDF on, TXT off at every start). TXT files are UTF-8
+  and land in the run folder's `TXT/`, with exactly the same chapters, order and file grouping as the
+  PDFs. Unticking the last format is not possible, so every run produces something.
+- **Story text is no longer deleted.** The old cleanup threw away short lines and any paragraph
+  containing words like "comment", "report" or "login". Measured on cached pages it removed thousands
+  of real lines ("Painful!", "Boom!", "He sighed.", "***", quoted thoughts, a story's own repeated
+  lines, "He reported to the captain"). Now only what is clearly not the story goes: translator/editor
+  credit lines at the start or end, a repeated chapter heading at the top, whole lines of reader
+  interface ("Next Chapter", "COMMENT") and the website's own promotional sentences ("Continue
+  reading on freewebnovel.com"), never an author's note.
+- **One heading per chapter, the same in TXT and PDF:** `Chapter 12: Title` (no added period), with
+  the site's junk and repeated numbers removed ("Chapter 1 - 1 Foreigners" -> "Chapter 1: Foreigners",
+  "Chapter 714 – Title" -> "Chapter 714: Title"); `Chapter 12: Untitled` (with a warning) when a page
+  has no title. Fractional chapters (`Chapter 627.2: …`) now get a real heading in the PDF.
+- **PDFs keep every character:** letters and symbols the standard print font cannot draw (Chinese,
+  Greek, arrows, stars) are drawn from an installed Windows font instead of printing as the wrong
+  glyphs; ordinary text looks exactly as before (same layout and fonts). Headings never sit alone at
+  the bottom of a page.
+- **Tests:** 1,376 total (69 new in `test_content_output.py`: cleanup rules, both FreeWebNovel page
+  structures, TXT/PDF word-for-word equality, every format x grouping combination, Unicode in PDFs).
+  Older tests now expect headings without the forced period and a story's repeated lines kept.
+
 ### Added / Changed — Numbered run folders, a checksummed run journal and real Resume (Checkpoints 03.3-03.4)
 - **Every run gets its own folder:** `~/Downloads/Web-Novel-Scraper-Outputs/<novel>-N` (for example
   `lord-of-the-mysteries-1`), numbered per novel whatever the website, reserved safely so two runs

@@ -53,11 +53,11 @@ def test_chapter_meta_degraded_flag() -> None:
 
 def test_chapter_content_heading_and_raw_text() -> None:
     ch = ChapterContent(index=5, title="The Gate", paragraphs=["one", "two"])
-    assert ch.heading == "Chapter 5: The Gate."
-    assert ch.raw_text == "Chapter 5: The Gate.\n\none\n\ntwo"
+    assert ch.heading == "Chapter 5: The Gate"
+    assert ch.raw_text == "Chapter 5: The Gate\n\none\n\ntwo"
     degraded = ChapterContent(index=6, title="", paragraphs=["body"])
     assert degraded.is_degraded is True
-    assert degraded.heading == "Chapter 6."
+    assert degraded.heading == "Chapter 6: Untitled"
 
 
 def test_scrape_job_roundtrips() -> None:

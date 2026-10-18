@@ -57,7 +57,7 @@ def test_current_fwn_chapter_extracts_nonempty_body() -> None:
     )
     assert content.paragraphs, "current FWN markup must yield body paragraphs"
     assert len(content.paragraphs) > 20
-    assert content.heading == "Chapter 3: The Strings of Fate."
+    assert content.heading == "Chapter 3: The Strings of Fate"
 
 
 # ── 1a: the garble guard recognises a brotli-mis-decoded page ─────────────────

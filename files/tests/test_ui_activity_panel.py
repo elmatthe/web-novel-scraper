@@ -499,7 +499,7 @@ def test_an_unwritable_logs_folder_is_announced_and_the_window_still_works(monke
         win.flush_activity()
         summary = _text(win, "Summary")
         assert "WARNING: something worth seeing" in summary
-        assert ("Completed: every selected chapter was already in the output folder, so no "
+        assert ("Completed: every selected chapter was already saved in the run folder, so no "
                 "new PDFs were written.") in summary
         assert summary.count("session log could not be") == 1
     finally:

@@ -13,12 +13,28 @@
 - **Owner data on disk (gitignored, never touch destructively):** the 1.2 GB pre-0.3.0 HTML cache in
   `files/cache/<novel>/` (copied on demand into `files/cache/<host>/<novel>/`), `files/runtime-data/`.
 - **Done in this session (newest first):**
+  - **05 (canonical text, TXT, structured PDF, Unicode fallback):** plan §9.14, ADR 015. Gate PASS
+    1376 (3.13.12 and 3.12.10). Commit after `8926a30`.
   - **03.3-03.4 (run folders, journal, Resume):** plan §9.13, ADR 014. Gate PASS 1306 (3.13.12 and
-    3.12.10). Commit after `12e83be`.
+    3.12.10). `8926a30`.
   - **Overrides A + B, 03.2b (validated HTML cache):** plan §9.12, ADR 011/012. `12e83be`, 1272 passed.
 - **Next:** 04 (Lord of the Mysteries 1/2 on `.net`/`.com`: live investigation, catalog rows need a
   site key because `.net`/`.com` share adapter `freewebnovel`), 05 (canonical text, TXT/PDF),
   06 (hardening), 07 (Windows bootstrap, acceptance checklist, Codex prompt).
+- **Live evidence gathered 2026-10-18 (rate-limited, ~20 requests, robots.txt checked: both hosts allow
+  crawling; `.net` disallows only `/admin/` and `/ajax-`, which are never used):**
+  - `.net` LOTM: index `/lord-of-the-mysteries.html`, TOC `?page=N` (40 per page, 36 pages, 1-1432),
+    descriptive chapter URLs (`/lord-of-the-mysteries/chapter-1-crimson.html`), body `#chapter-content`,
+    heading `h1.chapter`; plain HTTP 200, no challenge. LOTM2: 30 pages, 1-1181, titles repeat the
+    number ("Chapter 1 - 1 Foreigners"), literal `&quot;` and one U+FFFD in TOC text.
+  - `.com` LOTM / LOTM2: `/novel/<slug>/chapter-N`, 1432 / 1181 chapters, plain HTTP 200 on the index
+    and on six sampled chapters, existing adapter extracts them.
+  - Offline (legacy cache, 1,398 `.com` pages): the old filter deleted 2,274 real paragraphs ("Boom!",
+    "He sighed.", "***", curly-quoted dialogue, consecutive repeats); credit lines are always in the
+    first 3 paragraphs; RI has inline "COMMENT"/digit artifacts. WebNovel's keyword filter deleted 381
+    real paragraphs (substring "comment", "report", "swipe", ...); its container has no repeated chrome.
+  - **Order change:** the canonical content/TXT/PDF work (05) is done before the adapters (04) because
+    the new novels need the corrected cleanup and headings.
 - **Open issues carried:** en-dash title separators ("Chapter 714: – Title", 05); docs mojibake in
   Briefing/handoff (07, C14). Fixed in 03.3: grouped content keyed by displayed number (now by page).
 

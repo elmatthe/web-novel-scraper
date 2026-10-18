@@ -117,23 +117,32 @@ class ChapterIndex(list):
 
 @dataclass
 class ChapterContent:
-    """A fully extracted chapter: resolved title + cleaned body paragraphs."""
+    """A fully extracted chapter: resolved title + cleaned body paragraphs (the one canonical
+    content both TXT and PDF render, v0.3.0 Checkpoint 05)."""
 
     index: int | float         # displayed chapter number (fractional for .x inserts;
     #                            renders naturally in ``heading``: "Chapter 627.2: …")
     title: str                 # resolved title (may be "" for a degraded chapter)
     paragraphs: list[str]      # cleaned body paragraphs (no nav/comment noise)
+    label: str | None = None   # exact label text when it differs from ``index`` ("627.10")
 
     @property
     def is_degraded(self) -> bool:
         return not (self.title and self.title.strip())
 
     @property
+    def label_text(self) -> str:
+        from .content import label_text
+
+        return label_text(self.label if self.label else self.index)
+
+    @property
     def heading(self) -> str:
-        """Normalized PDF header line, 'Chapter N: Title.' (or 'Chapter N.')."""
-        if self.is_degraded:
-            return f"Chapter {self.index}."
-        return f"Chapter {self.index}: {self.title.strip()}."
+        """The one heading line, ``Chapter N: Title`` (``Chapter N: Untitled`` when the title is
+        unknown). No period is added."""
+        from .content import heading_for
+
+        return heading_for(self.label_text, self.title or "")
 
     @property
     def raw_text(self) -> str:

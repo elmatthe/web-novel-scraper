@@ -31,6 +31,7 @@ from typing import Optional
 from bs4 import BeautifulSoup
 
 from ..models import ChapterContent, ChapterIndex, ChapterMeta, EmptyExtractionError, SiteSpec
+from ..content import clean_paragraphs, clean_title, is_site_chrome, label_text, normalize_text
 from .base import BaseAdapter, extract_validated
 
 logger = logging.getLogger(__name__)
@@ -38,19 +39,11 @@ logger = logging.getLogger(__name__)
 # Default dynamic host, used only if a spec carries no base_url.
 _DEFAULT_HOST = "https://dynamic.webnovel.com"
 
-# Navigation / chrome / comment keywords to drop during body extraction (ported
-# verbatim from the legacy JUNK_KEYWORDS).
-JUNK_KEYWORDS = (
-    "comment",
-    "discussion",
-    "login",
-    "reader mode",
-    "swipe",
-    "report",
-    "reader setting",
-    "previous chapter",
-    "next chapter",
-)
+# v0.3.0 05: the legacy JUNK_KEYWORDS substring filter ("comment", "report", "swipe", ...) is gone.
+# Measured on the 890 cached Noble Queen chapters it deleted 381 real story paragraphs ("He
+# reported...", "her husband's comment made sense"), and no reader-interface line repeats in the
+# chapter container at all. Only whole-paragraph interface text is dropped now
+# (``content.is_site_chrome``).
 
 # Fallback DOM selectors for the chapter body, used only when __NEXT_DATA__ does
 # not yield content (ported verbatim from the legacy CONTENT_SELECTORS).
@@ -156,34 +149,19 @@ def parse_g_data_chapter(html: str) -> Optional[dict]:
 
 
 def _is_junky(text: str) -> bool:
-    """True for nav/comment/reader-chrome paragraphs that are not body prose."""
-    lower = text.lower()
-    return any(word in lower for word in JUNK_KEYWORDS)
+    """True only for a whole paragraph of reader-interface text (never a substring match)."""
+    return is_site_chrome(text)
 
 
 def _content_to_text(raw: str) -> str:
-    """Convert a WebNovel content field to plain paragraph text."""
+    """Convert a WebNovel content field to plain paragraph text (inline markup joined as read)."""
     raw = str(raw or "")
     if "<" in raw and ">" in raw:
-        return _ws(BeautifulSoup(raw, "html.parser").get_text(" ", strip=True))
-    return _ws(raw)
-
-
-def _title_only(raw_title: str) -> str:
-    """Strip a leading ``Chapter N -/:`` prefix and trailing period from a raw
-    chapter name, leaving just the title text.
-
-    This is ``normalize_chapter_heading`` minus the final ``Chapter N: ...``
-    wrap — the wrap now lives in ``ChapterContent.heading`` (the shared rule), so
-    the adapter only needs to produce the bare title. Returns ``""`` when the raw
-    name is empty or is nothing but a bare ``Chapter N`` label (a degraded title,
-    which renders as ``Chapter N.``).
-    """
-    raw = _ws(raw_title)
-    raw = re.sub(r"^Chapter\s+\d+\s*[-–—:]\s*", "", raw, flags=re.IGNORECASE)
-    raw = re.sub(r"^Chapter\s+\d+\s*$", "", raw, flags=re.IGNORECASE)
-    raw = re.sub(r"^Chapter\s+\d+\s+", "", raw, flags=re.IGNORECASE)
-    return raw.strip().rstrip(".").strip()
+        soup = BeautifulSoup(raw, "html.parser")
+        for br in soup.find_all("br"):
+            br.replace_with(" ")
+        return normalize_text(soup.get_text())
+    return normalize_text(raw)
 
 
 def extract_chapter(
@@ -236,12 +214,8 @@ def extract_chapter(
     if container is None:
         return None, []
 
-    paras = [
-        _ws(p.get_text(" ", strip=True))
-        for p in container.find_all("p")
-        if _ws(p.get_text(" ", strip=True))
-    ]
-    paras = [p for p in paras if not _is_junky(p)]
+    paras = [_content_to_text(str(p)) for p in container.find_all("p")]
+    paras = [p for p in paras if p and not _is_junky(p)]
 
     title_text: Optional[str] = None
     for sel in _TITLE_SELECTORS:
@@ -397,15 +371,20 @@ class WebNovelDynamicAdapter(BaseAdapter):
         # source; fall back to whatever the page yielded. Then reduce to the
         # bare title — ChapterContent.heading applies the shared "Chapter N:"
         # wrap.
-        canonical = (meta.title or raw_title or "").strip()
-        title = _title_only(canonical)
+        label = label_text(meta.index)
+        title = clean_title(meta.title or "", label) or clean_title(raw_title or "", label)
+        paragraphs = clean_paragraphs(paragraphs, label=label, title=title)
+        if not paragraphs:
+            raise EmptyExtractionError(
+                f"Could not extract body paragraphs for chapter {meta.index} ({meta.url})."
+            )
 
         if not title:
             self._warn(
-                f"chapter {meta.index} — no title text found (content written, "
-                "heading will be 'Chapter N.')"
+                f"chapter {label} — no title text found (content written, "
+                f"heading will be 'Chapter {label}: Untitled')"
             )
 
         return ChapterContent(
-            index=meta.index, title=title, paragraphs=paragraphs
+            index=meta.index, title=title, paragraphs=paragraphs, label=label
         )

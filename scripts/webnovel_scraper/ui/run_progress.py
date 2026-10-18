@@ -60,7 +60,7 @@ OUTCOME_STATES = {
 OUTCOME_LABELS = {
     "completed": ("Complete", "info"),
     "completed_with_problems": ("Finished with problems", "warning"),
-    "nothing_written": ("Finished — no PDFs written", "warning"),
+    "nothing_written": ("Finished — nothing written", "warning"),
     "unconfirmed": ("Ended — results not confirmed", "warning"),
     "stopped": ("Stopped", "info"),
     "failed": ("Run failed", "error"),
@@ -115,9 +115,13 @@ def _plural(count: int, word: str) -> str:
 
 
 def format_final_counts(counts: "FinalCounts") -> str:
-    """The result counters once a run has ended; zero counters other than PDFs are left out.
+    """The result counters once a run has ended; zero counters other than files are left out.
     The window wraps this line rather than clipping it, and reserves its longest form."""
-    parts = [_plural(counts.pdfs, "PDF")]
+    parts = []
+    if counts.pdfs or not counts.txts:
+        parts.append(_plural(counts.pdfs, "PDF"))
+    if counts.txts:
+        parts.append(_plural(counts.txts, "TXT file"))
     if counts.failed:
         parts.append(f"{counts.failed} failed")
     if counts.recovered:
@@ -136,6 +140,7 @@ class FinalCounts:
     """Results, read from the pipeline's ``RunReport`` once the run has ended."""
 
     pdfs: int = 0              # PDF files written (one may hold many chapters)
+    txts: int = 0              # TXT files written (v0.3.0 05)
     already_present: int = 0   # chapters resume skipped
     failed: int = 0            # chapters that could not be saved (any reason)
     recovered: int = 0         # chapters saved by the rescue lane or the second pass

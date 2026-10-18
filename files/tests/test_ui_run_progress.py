@@ -199,7 +199,7 @@ def test_refused() -> None:
 @pytest.mark.parametrize(("outcome", "state", "status", "severity"), [
     ("completed", rp.COMPLETE, "Complete", "info"),
     ("completed_with_problems", rp.COMPLETE, "Finished with problems", "warning"),
-    ("nothing_written", rp.COMPLETE, "Finished — no PDFs written", "warning"),
+    ("nothing_written", rp.COMPLETE, "Finished — nothing written", "warning"),
     ("unconfirmed", rp.COMPLETE, "Ended — results not confirmed", "warning"),
     ("stopped", rp.CANCELLED, "Stopped", "info"),
     ("failed", rp.FAILED, "Run failed", "error"),

@@ -241,29 +241,162 @@ def chapters_to_text(chapters: list[ChapterContent]) -> str:
     return "\f\n\n".join(ch.raw_text for ch in chapters)
 
 
+# ── Structured rendering (v0.3.0 Checkpoint 05) ─────────────────────────────
+# The pipeline renders from canonical ``ChapterContent``: each chapter's heading is ITS heading,
+# styled as a heading, and every paragraph is body text. Nothing is guessed from text patterns, so a
+# story line that happens to read "Chapter 5: ..." stays body text, and fractional chapters
+# ("Chapter 627.2: ...") get a real heading. The print style is the established one above.
+#
+# Characters the standard Times-Roman font cannot encode (it covers WinAnsi: Latin letters, curly
+# quotes, dashes, ellipses, accents, €) would otherwise come out as wrong glyphs. Each run of such
+# characters is drawn from the first installed font that has them; everything else keeps the
+# established font, so ordinary text looks exactly as before. With no font for a character it is
+# left as it is (and reported), never replaced or dropped.
+_FALLBACK_FONT_FILES = (
+    # (registered name, file under %WINDIR%\Fonts, TrueType collection index)
+    ("WNS-TimesNewRoman", "times.ttf", None),
+    ("WNS-SegoeUI", "segoeui.ttf", None),
+    ("WNS-SegoeUISymbol", "seguisym.ttf", None),
+    ("WNS-SegoeUIEmoji", "seguiemj.ttf", None),
+    ("WNS-YaHei", "msyh.ttc", 0),
+    ("WNS-MSGothic", "msgothic.ttc", 0),
+    ("WNS-MalgunGothic", "malgun.ttf", None),
+    ("WNS-Nirmala", "Nirmala.ttf", None),
+    ("WNS-ArialUnicode", "arialuni.ttf", None),
+)
+_fallback_cache: list | None = None
+missing_glyphs: set[str] = set()   # characters no available font could draw (diagnostics)
+
+
+def _font_dirs() -> list[Path]:
+    dirs = []
+    windir = os.environ.get("WINDIR") or os.environ.get("SystemRoot")
+    if windir:
+        dirs.append(Path(windir) / "Fonts")
+    local = os.environ.get("LOCALAPPDATA")
+    if local:
+        dirs.append(Path(local) / "Microsoft" / "Windows" / "Fonts")
+    return dirs
+
+
+def _fallback_fonts() -> list:
+    """``[(font name, set of code points)]`` of the fallback fonts installed here (cached)."""
+    global _fallback_cache
+    if _fallback_cache is not None:
+        return _fallback_cache
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+
+    found = []
+    for name, filename, index in _FALLBACK_FONT_FILES:
+        for directory in _font_dirs():
+            path = directory / filename
+            if not path.is_file():
+                continue
+            try:
+                font = TTFont(name, str(path), subfontIndex=index or 0) if index is not None else TTFont(name, str(path))
+                pdfmetrics.registerFont(font)
+                found.append((name, set(font.face.charToGlyph)))
+            except Exception:  # noqa: BLE001 - an unusable font file is simply skipped
+                pass
+            break
+    _fallback_cache = found
+    return found
+
+
+def _encodable(char: str) -> bool:
+    try:
+        char.encode("cp1252")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def markup(text: str) -> str:
+    """ReportLab paragraph markup for plain *text*: escaped, with characters outside the standard
+    font drawn from a fallback font that has them."""
+    if all(_encodable(c) for c in text):
+        return _escape_html(text)
+    out: list[str] = []
+    run_font, run = None, []
+
+    def flush() -> None:
+        if run:
+            chunk = _escape_html("".join(run))
+            out.append(chunk if run_font is None else f'<font name="{run_font}">{chunk}</font>')
+            run.clear()
+
+    fonts = _fallback_fonts()
+    for char in text:
+        font = None
+        if not _encodable(char):
+            code = ord(char)
+            font = next((name for name, cmap in fonts if code in cmap), None)
+            if font is None:
+                missing_glyphs.add(char)
+        if font != run_font:
+            flush()
+            run_font = font
+        run.append(char)
+    flush()
+    return "".join(out)
+
+
+def _styles() -> tuple[ParagraphStyle, ParagraphStyle]:
+    styles = getSampleStyleSheet()
+    body = ParagraphStyle(
+        "CustomBody", parent=styles["BodyText"], fontName="Times-Roman", fontSize=11,
+        leading=15, alignment=TA_JUSTIFY, spaceBefore=6, spaceAfter=6,
+    )
+    heading = ParagraphStyle(
+        "ChapterHeading", parent=styles["Heading2"], fontName="Helvetica-Bold", fontSize=14,
+        leading=18, spaceBefore=18, spaceAfter=12, textColor="#134252", alignment=TA_LEFT,
+        keepWithNext=1,   # a heading never ends a page alone (no heading-only pages)
+    )
+    return body, heading
+
+
+def build_story(chapters: list[ChapterContent]) -> list:
+    """The ReportLab flowables: per chapter a page break (after the first), its heading, its
+    paragraphs, in the given order."""
+    body_style, heading_style = _styles()
+    story: list = []
+    for i, chapter in enumerate(chapters):
+        if i > 0:
+            story.append(PageBreak())
+        story.append(Paragraph(markup(chapter.heading), heading_style))
+        for paragraph in chapter.paragraphs:
+            story.append(Paragraph(markup(paragraph), body_style))
+    return story
+
+
 def create_pdf(
     chapters: list[ChapterContent], output_path: Path, title: str
 ) -> Path:
-    """Render chapters into one PDF and strip heading-only pages. Returns the path.
+    """Render chapters into one PDF and publish it atomically. Returns the path.
 
     The whole build is staged in a temp file in the SAME directory and published
-    onto ``output_path`` with a single atomic ``os.replace`` only after both the
-    ReportLab build and the heading-strip rewrite have fully succeeded — so a
-    cancel / crash / kill at any point leaves NO partial or corrupt final PDF (and
-    no leftover ``.part`` artifact). 0.2.0 BUG-2 partial-cleanup fix; applies to
-    SEPARATE (per-chapter), CHUNKED, and SINGLE output alike."""
+    onto ``output_path`` with a single atomic ``os.replace`` only after the build has fully
+    succeeded and been flushed to disk — so a cancel / crash / kill at any point leaves NO
+    partial or corrupt final PDF (and no leftover ``.part`` artifact). 0.2.0 BUG-2
+    partial-cleanup fix; applies to every grouping. Since v0.3.0 the layout is built from the
+    chapters' structure (``build_story``), not re-parsed from joined text."""
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    text = chapters_to_text(chapters)
 
     fd, tmp_name = tempfile.mkstemp(
         dir=str(output_path.parent), prefix=output_path.name + ".", suffix=".part"
     )
-    os.close(fd)  # ReportLab / pypdf open the path themselves
+    os.close(fd)  # ReportLab opens the path itself
     tmp = Path(tmp_name)
     try:
-        create_pdf_from_text(text, tmp, title=title)
-        remove_single_heading_pages(tmp)  # atomic rewrite of the temp itself
+        doc_kwargs = dict(
+            pagesize=letter, rightMargin=0.5 * inch, leftMargin=0.5 * inch,
+            topMargin=0.5 * inch, bottomMargin=0.5 * inch,
+        )
+        if title:
+            doc_kwargs["title"] = title
+        SimpleDocTemplate(str(tmp), **doc_kwargs).build(build_story(chapters))
         with open(tmp, "r+b") as handle:   # on disk before it is published (v0.3.0 03.3)
             os.fsync(handle.fileno())
         os.replace(tmp, output_path)       # atomic publish

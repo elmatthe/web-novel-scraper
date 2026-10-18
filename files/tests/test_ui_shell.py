@@ -163,17 +163,23 @@ def test_no_runnable_site_shows_the_hint_and_blocks_start() -> None:
         win.destroy()
 
 
-def test_output_options_pdf_on_txt_unavailable_and_exactly_one_grouping() -> None:
+def test_output_options_pdf_on_txt_off_both_live_and_exactly_one_grouping() -> None:
     from tkinter import ttk
 
     win = _make_app()
     try:
+        # v0.3.0 05: PDF on and TXT off at start-up; both are real choices now.
         assert win._pdf_var.get() is True and win._txt_var.get() is False
-        # Neither format box pretends to change the run: PDF is locked on, TXT is
-        # visibly unavailable until a TXT renderer exists.
-        assert win._pdf_check.instate(["disabled"])
-        assert win._txt_check.instate(["disabled"])
-        assert "TXT" in str(win._format_note.cget("text"))
+        assert not win._pdf_check.instate(["disabled"])
+        assert not win._txt_check.instate(["disabled"])
+        assert win.selected_formats() == ("pdf",)
+        win._txt_check.invoke()
+        assert win.selected_formats() == ("pdf", "txt")
+        win._pdf_check.invoke()
+        assert win.selected_formats() == ("txt",)
+        win._txt_check.invoke()                      # the last one cannot be unticked
+        assert win.selected_formats() == ("txt",) and win._txt_var.get() is True
+        assert "At least one output format" in win._status_var.get()
 
         radios = [w for w in _descendants(win._sections[1]) if isinstance(w, ttk.Radiobutton)]
         assert [str(r.cget("text")) for r in radios] == [
@@ -610,4 +616,32 @@ def test_worker_thread_never_touches_tk(monkeypatch, tmp_path) -> None:
         assert win._counts_var.get() == "3 / 3 · 100%"
         assert win._running is False
     finally:
+        win.destroy()
+
+
+def test_the_chosen_formats_reach_the_job_and_are_locked_during_a_run(tmp_path, monkeypatch) -> None:
+    import threading
+
+    win = _make_app()
+    started, release, jobs = threading.Event(), threading.Event(), []
+
+    def fake(job, **_kw):
+        jobs.append(job)
+        started.set()
+        release.wait(5)
+
+    monkeypatch.setattr(app.pipeline, "run_scrape", fake)
+    try:
+        win._txt_check.invoke()
+        win._output_parent = tmp_path
+        win._on_start()
+        assert started.wait(5)
+        assert jobs[0].formats == ("pdf", "txt") and jobs[0].allocate_run is True
+        assert win._pdf_check.instate(["disabled"]) and win._txt_check.instate(["disabled"])
+    finally:
+        release.set()
+        if win._worker is not None:
+            win._worker.join(5)
+        win.flush_activity()
+        assert not win._pdf_check.instate(["disabled"])
         win.destroy()

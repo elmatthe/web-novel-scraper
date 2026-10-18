@@ -129,7 +129,7 @@ ALL_CHAPTERS = 10 ** 9
 CLOSE_POLL_MS = 50
 
 APP_TITLE = "Web Novel Scraper"
-SUBTITLE = "Save web-novel chapters as clean, print-ready PDFs."
+SUBTITLE = "Save web-novel chapters as clean, print-ready PDF and TXT files."
 SECTION_TITLES = ("1. Web Novel Selection", "2. Output Options", "3. Run")
 ACTIVITY_TITLE = "Activity"
 # User-facing names for the three existing grouping modes (plan §8 C11): only the
@@ -139,7 +139,7 @@ GROUPING_LABELS = {
     OutputMode.SINGLE: "Whole selected range",
     OutputMode.CHUNKED: "Every",  # followed by the chapters-per-PDF field
 }
-FORMAT_NOTE = "(TXT not available yet)"
+FORMAT_NOTE = "(at least one)"
 NO_SITE_HINT = "No website is available yet — nothing to run."
 NO_WEBSITE_TEXT = "(no website available)"
 # Resume Existing Run (v0.3.0 03.3): continues an unfinished run in its own folder with the
@@ -380,6 +380,8 @@ class ScraperApp(tk.Tk):
             (rb_chunk, "normal"),
             (rb_single, "normal"),
             (self._cache_check, "normal"),
+            (self._pdf_check, "normal"),
+            (self._txt_check, "normal"),
             (self._refetch_check, "normal"),
             (self._refresh_check, "normal"),
         ]
@@ -471,22 +473,22 @@ class ScraperApp(tk.Tk):
     ) -> tuple[ttk.Radiobutton, ttk.Radiobutton, ttk.Radiobutton]:
         s, m = self._bundle["styles"], self._bundle["metrics"]
 
-        # Formats. PDF is the only renderer today and both formats may never be off,
-        # so PDF shows ticked and locked, and TXT shows visibly unavailable. Neither
-        # pretends to change the run; TXT is enabled when a TXT renderer exists.
+        # Formats (v0.3.0 05): PDF and/or UTF-8 TXT from the same canonical text, sharing the
+        # grouping. PDF on and TXT off at every start-up; the last ticked box cannot be unticked,
+        # so a run always produces at least one format.
         self._field_label(frame, "Format", 0)
         formats = ttk.Frame(frame, style=s["surface"])
         formats.grid(row=0, column=1, sticky="w")
         self._pdf_var = tk.BooleanVar(value=True)
         self._pdf_check = ttk.Checkbutton(
             formats, text="PDF", variable=self._pdf_var, style=s["checkbutton"],
-            state="disabled",
+            command=lambda: self._on_format_toggle(self._pdf_var),
         )
         self._pdf_check.grid(row=0, column=0, sticky="w")
         self._txt_var = tk.BooleanVar(value=False)
         self._txt_check = ttk.Checkbutton(
             formats, text="TXT", variable=self._txt_var, style=s["checkbutton"],
-            state="disabled",
+            command=lambda: self._on_format_toggle(self._txt_var),
         )
         self._txt_check.grid(row=0, column=1, sticky="w", padx=(m["gap_lg"], 0))
         # Beside the boxes (not on a row of its own) so it never makes the section taller.
@@ -521,7 +523,7 @@ class ScraperApp(tk.Tk):
             chunk_row, textvariable=self._chunk_var, width=5, style=s["entry"]
         )
         self._chunk_entry.grid(row=0, column=1, sticky="w", padx=(m["gap_sm"], m["gap_sm"]))
-        ttk.Label(chunk_row, text="chapters per PDF", style=s["label"]).grid(
+        ttk.Label(chunk_row, text="chapters per file", style=s["label"]).grid(
             row=0, column=2, sticky="w"
         )
         return rb_sep, rb_single, rb_chunk
@@ -1073,6 +1075,17 @@ class ScraperApp(tk.Tk):
         else:
             self._site_hint.grid_remove()
 
+    def _on_format_toggle(self, changed: tk.BooleanVar) -> None:
+        """Keep at least one format: unticking the last one puts it back."""
+        if not self._pdf_var.get() and not self._txt_var.get():
+            changed.set(True)
+            self._set_status("At least one output format is needed.")
+
+    def selected_formats(self) -> tuple[str, ...]:
+        """The output formats for the next run, in render order (always at least one)."""
+        chosen = tuple(f for f, var in (("pdf", self._pdf_var), ("txt", self._txt_var)) if var.get())
+        return chosen or ("pdf",)
+
     def _on_mode_change(self) -> None:
         chunked = self._mode_var.get() == OutputMode.CHUNKED.value
         self._chunk_entry.configure(state="normal" if chunked else "disabled")
@@ -1252,6 +1265,7 @@ class ScraperApp(tk.Tk):
             use_cache=self._cache_var.get(),
             output_dir=output_dir,
             allocate_run=True,
+            formats=self.selected_formats(),
             chunk_size=chunk,
             http_first=http_first,
             # 0.2.0 run-config (§3.14/§3.15): the run's behaviour now travels on the
@@ -1792,10 +1806,10 @@ def _ignore() -> None:
 def _grouping_text(mode: OutputMode, chunk: int) -> str:
     """The grouping as the Activity 'Output' line words it."""
     if mode is OutputMode.CHUNKED:
-        return f"every {chunk} chapters per PDF"
+        return f"every {chunk} chapters per file"
     if mode is OutputMode.SINGLE:
-        return "the whole selected range in one PDF"
-    return "one PDF per chapter"
+        return "the whole selected range in one file"
+    return "one file per chapter"
 
 
 def main() -> None:

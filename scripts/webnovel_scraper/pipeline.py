@@ -14,12 +14,13 @@ and the PDF builder (``create_pdf``), and owns only the run policy:
      uncovered window is discovered through the adapter and persisted, and an open-ended
      range re-checks the tail. A request the list cannot satisfy is refused, never clamped.
   3. Select the requested chapters by source page URL (never displayed number alone).
-  4. For each chapter: skip when its PDF already exists (resume), otherwise fetch
-     and collect it. A single failed chapter is recorded and skipped — never
-     fatal. The per-fetch ``delay`` and a ``cancel_event`` (Stop button) are
-     honoured between fetches.
-  5. Emit PDFs per the output mode (separate / chunked / single), each through
-     ``pdf_builder.create_pdf`` (which also strips heading-only pages).
+  4. Reserve (or, for Resume, reopen and verify) the run folder and its journal; skip
+     outputs whose recorded checksums still match, fetch the rest. A single failed chapter
+     is recorded and skipped — never fatal. The per-fetch ``delay`` and a ``cancel_event``
+     (Stop button) are honoured between fetches.
+  5. Publish PDF and/or UTF-8 TXT per the one grouping (individual / every X / whole
+     range) from the same canonical chapter content (``content``, ``pdf_builder``,
+     ``txt_builder``, ``run_output``).
   6. Return a :class:`RunReport` (written / skipped / failed counts + a resume
      hint for any failures).
 
@@ -47,6 +48,7 @@ from . import chapter_preflight
 from .atomic_io import write_json_atomic
 from . import pdf_builder
 from . import rescue_pool as rp
+from . import txt_builder
 from .adapters.base import BaseAdapter
 from .chapter_preflight import ChapterListRefused
 from .chapter_store import ChapterManifestStore
@@ -213,7 +215,8 @@ class RunReport:
     output_dir: Path
     requested_range: tuple[int, int] = (0, 0)
     effective_range: tuple[int, int] = (0, 0)
-    written: list[Path] = field(default_factory=list)        # PDF files written
+    written: list[Path] = field(default_factory=list)        # output files written (every format)
+    formats: tuple = ("pdf",)                                # the formats this run produces
     skipped_existing: list[int] = field(default_factory=list)  # resume-skipped ch.
     failed: list[int] = field(default_factory=list)          # ch. still failed after sweep
     permanent_failed: list[int] = field(default_factory=list)  # 403/404 — not swept
@@ -253,7 +256,7 @@ class RunReport:
             f"  Range:  requested {self.requested_range[0]}-{requested_end}, "
             f"scraped {self.effective_range[0]}-{self.effective_range[1]}",
             *(f"  Range adjusted: {note}." for note in self.range_notes),
-            f"  Written: {len(self.written)} PDF(s)",
+            f"  Written: {_written_text(self.written, self.formats)}",
             f"  Skipped (already present): {len(self.skipped_existing)}",
             f"  Failed:  {len(self.failed)}",
         ]
@@ -309,6 +312,15 @@ class RunReport:
             if len(self.warnings) > 5:
                 lines.append(f"    ... {len(self.warnings) - 5} more warning(s)")
         return "\n".join(lines)
+
+
+def _written_text(written: list, formats: tuple) -> str:
+    """``3 PDF(s)`` for a PDF-only run (the established wording), else per format."""
+    if tuple(formats) == ("pdf",):
+        return f"{len(written)} PDF(s)"
+    counts = [f"{sum(1 for p in written if Path(p).suffix.lower() == '.' + f)} {f.upper()}"
+              for f in formats]
+    return " + ".join(counts) + " file(s)"
 
 
 # ── Output-dir resolution ────────────────────────────────────────────────────
@@ -490,7 +502,9 @@ def render_output(fmt: str, contents: list[ChapterContent], path: Path, title: s
     """Render one output file atomically (temp in the same folder, fsync, replace)."""
     if fmt == "pdf":
         pdf_builder.create_pdf(contents, path, title=title)
-    else:  # pragma: no cover - TXT arrives with Checkpoint 05
+    elif fmt == "txt":
+        txt_builder.create_txt(contents, path)
+    else:
         raise ValueError(f"unsupported output format {fmt!r}")
 
 
@@ -980,6 +994,7 @@ def run_scrape(
         output_dir=Path(job.output_dir),
         requested_range=(job.start, job.end),
         effective_range=(job.start, job.end),
+        formats=tuple(job.formats),
     )
 
     # 2a. FWN-browser scope gate (§3.14): the fast-primary + single-lane rescue

@@ -79,7 +79,7 @@ def test_invisible_title_extracted_cleanly_from_live_fixture() -> None:
     adapter = FreeWebNovelAdapter(request_manager=FakeRM(default_html=html))
     content = adapter.fetch_chapter(meta, RI_SPEC)
     assert content.title == "New Anti-Fang Alliance"
-    assert content.heading == "Chapter 2261: New Anti-Fang Alliance."
+    assert content.heading == "Chapter 2261: New Anti-Fang Alliance"
     assert content.paragraphs  # body survived
     # No invisible characters left in the title (ZWNJ U+200C, NBSP U+00A0).
     assert "‌" not in content.title and " " not in content.title
@@ -113,7 +113,7 @@ def test_degraded_title_falls_back_without_crash() -> None:
     content = adapter.fetch_chapter(meta, SS_SPEC)
     assert content.title == ""
     assert content.is_degraded
-    assert content.heading == "Chapter 7."
+    assert content.heading == "Chapter 7: Untitled"
     assert content.paragraphs  # body still captured
     assert any("no title text" in w for w in adapter.warnings)
 

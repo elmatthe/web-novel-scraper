@@ -452,6 +452,23 @@ check: 16/16 caught. Gate: see the CHANGELOG entry.
 the HTML cache); `pipeline.resolve_output_dir` remains only for its old tests and is unused by the app;
 the Resume list reads journals only (checksums are verified when the resume starts).
 
+### 9.14 Checkpoint 05 result: canonical text, TXT and PDF (2026-10-18; done before 04)
+
+Done before 04 because the new novels need the corrected cleanup and headings (ADR 015).
+- `content.py` (normalisation, titles, the one heading, body cleanup, interface lines, site
+  promotions), `txt_builder.py`, structured `pdf_builder.create_pdf` (`build_story`, `markup` with
+  installed-font fallback for characters outside WinAnsi), `ChapterContent.label`/`heading`.
+- FreeWebNovel: first body container present wins (`#article`, `#chapter-content`, ...); NOISE_SNIPPETS,
+  the short-line rule and consecutive de-duplication removed. WebNovel: the JUNK_KEYWORDS substring
+  filter replaced by whole-paragraph interface detection; `_title_only` removed.
+- GUI: PDF/TXT boxes live (at least one), formats on the job, counts and outcome text per format.
+- Evidence (offline, owner's cache): §9.12 and ADR 015; on 2,000 sampled `.com` pages the new
+  extraction removed only credit lines (382), "COMMENT" artifacts (11), promotions and repeated
+  headings, with no failures and no untitled chapters.
+- Known limits: Reverend Insanity's inline comment-count digits ("1") stay (a countdown would look
+  the same); a PDF character with no installed font is left as is and listed in
+  `pdf_builder.missing_glyphs`; macOS font fallback is untested (deferred, ADR 013).
+
 ## 10. Owner overrides and autonomous completion mandate (2026-10-18)
 
 The owner approved 03.2a and authorised autonomous completion of 03.2b through 07 for a **Windows-only

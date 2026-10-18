@@ -344,8 +344,8 @@ def test_chapters_the_pipeline_did_not_account_for_are_not_a_success(tmp_path) -
 
 def test_a_resumed_run_with_nothing_new_to_write_says_why(tmp_path) -> None:
     _, events = ra.outcome_events(_report(tmp_path, skipped_existing=[1, 2, 3]), processed=(3, 3))
-    assert _summary(events)[0] == ("Completed: every selected chapter was already in the output "
-                                   "folder, so no new PDFs were written.")
+    assert _summary(events)[0] == ("Completed: every selected chapter was already saved in the "
+                                   "run folder, so no new PDFs were written.")
 
 
 def test_final_counts_come_from_the_report_not_the_progress(tmp_path) -> None:

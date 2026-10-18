@@ -160,7 +160,7 @@ def test_identity_novel_indexes_and_filenames_unchanged() -> None:
     assert metas[24].url == "https://freewebnovel.com/novel/shadow-slave/chapter-25"
 
     content = ChapterContent(index=5, title="The Test", paragraphs=["body"])
-    assert content.heading == "Chapter 5: The Test."
+    assert content.heading == "Chapter 5: The Test"
     assert pipeline._separate_pdf_name(content) == "Chapter 5_ The Test.pdf"
 
 
@@ -170,7 +170,7 @@ def test_fractional_index_renders_naturally_in_heading_and_filename() -> None:
     content = ChapterContent(
         index=627.2, title="Birthday and Anniversary Part 1", paragraphs=["body"]
     )
-    assert content.heading == "Chapter 627.2: Birthday and Anniversary Part 1."
+    assert content.heading == "Chapter 627.2: Birthday and Anniversary Part 1"
     assert (
         pipeline._separate_pdf_name(content)
         == "Chapter 627.2_ Birthday and Anniversary Part 1.pdf"
