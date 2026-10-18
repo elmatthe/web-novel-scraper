@@ -107,9 +107,14 @@ INDEX_FILENAME = "chapter_index.json"
 # ── 0.2.0 circuit-breaker thresholds (pipeline-owned, headless-only — §3.9) ───
 # The breaker watches PRIMARY network results and, when headless mode is broadly
 # blocked, switches the primary to a visible browser for the rest of the run.
-BREAKER_CONSECUTIVE_CHALLENGES = 5   # consecutive primary network challenges → trip
+# v0.3.0 04 (plan decision 6, §8 C9): the headless primary is a short, bounded PROBE. The first
+# Cloudflare challenge it meets switches the run to a visible browser for the rest of the run (that
+# chapter is retried there at once); a headless run is never retried chapter after chapter. Live
+# 2026-10-18: headless Camoufox cleared freewebnovel.com, so most runs never need the switch. (0.2.0
+# tripped only after 5 consecutive or 9 of 20 challenges, sending each one to rescue meanwhile.)
+BREAKER_CONSECUTIVE_CHALLENGES = 1   # consecutive primary network challenges → trip
 BREAKER_WINDOW = 20                  # rolling window of primary network fetches
-BREAKER_WINDOW_CHALLENGES = 9        # ≥ this many challenges in the window → trip (>40%)
+BREAKER_WINDOW_CHALLENGES = 1        # ≥ this many challenges in the window → trip
 # Bounded primary retry budget after a 429 host cooldown (§3.9 tail). Past this the
 # chapter is recorded as a transient failure for a later resume rather than launching
 # a browser against a rate-limited host.
@@ -369,6 +374,16 @@ def resolve_output_dir(
     while (root / f"{name}-{n}").exists():
         n += 1
     return root / f"{name}-{n}"
+
+
+def _legacy_limiter(job: ScrapeJob, monotonic_fn, sleep_fn) -> Optional[HostRateLimiter]:
+    """Pace every top-level request of a standard-path run, chapter-list pages included (a
+    paginated list such as freewebnovel.net's would otherwise be read back to back). Only when
+    the clock pair is consistent: a caller that fakes ``sleep`` but not ``monotonic`` (tests)
+    would make the limiter spin on the real clock, so it gets none, as before."""
+    if (sleep_fn is time.sleep) != (monotonic_fn is time.monotonic):
+        return None
+    return HostRateLimiter(max(HOST_MIN_INTERVAL, job.delay), monotonic=monotonic_fn, sleep=sleep_fn)
 
 
 def _site_key(spec: SiteSpec) -> Optional[str]:
@@ -1042,6 +1057,7 @@ def run_scrape(
                 sleep_fn=sleep_fn,
                 site_key=_site_key(spec),
                 refresh_cache=job.refresh_html_cache,
+                host_limiter=host_limiter or _legacy_limiter(job, monotonic_fn, sleep_fn),
             )
             owns_rm = True
         if cancel_event is not None:

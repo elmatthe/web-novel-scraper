@@ -340,7 +340,7 @@ def test_a_real_offline_run_reports_the_outcome_from_the_run_report(monkeypatch,
         win.flush_activity()
 
         summary, detailed = _text(win, "Summary"), _text(win, "Detailed")
-        assert "Run started: Shadow Slave from Free Web Novel." in summary
+        assert "Run started: Shadow Slave from Free Web Novel (.com)." in summary
         assert "Building chapter index (TOC) …" in summary
         assert "Warning: chapter 2 FAILED (extraction, not a block)" in summary
         # Both chapters were processed, yet the run is not called a success.

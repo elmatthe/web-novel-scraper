@@ -15,6 +15,7 @@ from __future__ import annotations
 from .adapters.base import BaseAdapter
 from .adapters.empire_novel import EmpireNovelAdapter
 from .adapters.freewebnovel import FreeWebNovelAdapter
+from .adapters.freewebnovel_net import FreeWebNovelNetAdapter
 from .adapters.novel_bin import NovelBinAdapter
 from .adapters.telegraph import TelegraphAdapter
 from .adapters.webnovel_dynamic import WebNovelDynamicAdapter
@@ -66,6 +67,7 @@ def get_adapter_for_spec(spec: SiteSpec) -> BaseAdapter:
 
 # ── Registration (the single source of registered adapters) ──────────────────
 register("freewebnovel", FreeWebNovelAdapter)
+register("freewebnovel_net", FreeWebNovelNetAdapter)
 register("webnovel_dynamic", WebNovelDynamicAdapter)
 register("empire_novel", EmpireNovelAdapter)
 register("novel_bin", NovelBinAdapter)

@@ -21,9 +21,10 @@ import pytest
 import app
 
 
-def test_headless_default_constant_is_off() -> None:
-    # Visible browser by default (0.1.3 headful-camoufox-primary architecture).
-    assert app.DEFAULT_HEADLESS is False
+def test_headless_default_constant_is_on() -> None:
+    # v0.3.0 04 (plan decision 6, C9): a short headless probe first, visible after the first
+    # challenge. Live 2026-10-18: headless Camoufox cleared freewebnovel.com.
+    assert app.DEFAULT_HEADLESS is True
 
 
 def test_browser_and_http_first_default_constants() -> None:
@@ -32,14 +33,14 @@ def test_browser_and_http_first_default_constants() -> None:
     assert app.DEFAULT_HTTP_FIRST is False
 
 
-def test_headless_checkbox_initialises_off() -> None:
+def test_headless_checkbox_initialises_on() -> None:
     tk = pytest.importorskip("tkinter")
     try:
         win = app.ScraperApp()
     except tk.TclError as exc:  # no display (headless CI) — not applicable here
         pytest.skip(f"no Tk display available: {exc}")
     try:
-        assert win._headless_var.get() is False
+        assert win._headless_var.get() is True
         # Browser mode on, HTTP-first off — GUI defaults agree with the constants.
         assert win._browser_var.get() is True
         assert win._http_first_var.get() is False

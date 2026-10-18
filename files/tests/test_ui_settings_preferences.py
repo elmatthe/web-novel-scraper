@@ -34,8 +34,8 @@ def test_fresh_install_defaults_are_the_documented_startup_values() -> None:
     d = Settings()
     assert (d.appearance, d.website, d.novel) == ("light", "", "")
     assert (d.output_mode, d.chunk_size, d.delay, d.timeout) == ("separate", 10, 3.0, 30)
-    # Headless stays OFF until the headless-first work (Checkpoint 04); PDF/TXT are not stored.
-    assert (d.browser_mode, d.headless, d.http_first, d.use_cache) == (True, False, False, True)
+    # Headless-first since Checkpoint 04; PDF/TXT are not stored (PDF on, TXT off at every start).
+    assert (d.browser_mode, d.headless, d.http_first, d.use_cache) == (True, True, False, True)
     assert SCHEMA_VERSION == 2
 
 
@@ -44,7 +44,7 @@ def test_the_window_defaults_and_the_settings_defaults_agree() -> None:
     assert d.delay == float(app.DEFAULT_DELAY)
     assert d.timeout == int(app.DEFAULT_TIMEOUT)
     assert d.chunk_size == int(app.DEFAULT_CHUNK)
-    assert d.headless is app.DEFAULT_HEADLESS and app.DEFAULT_HEADLESS is False
+    assert d.headless is app.DEFAULT_HEADLESS and app.DEFAULT_HEADLESS is True
     assert d.browser_mode is app.DEFAULT_BROWSER_MODE
     assert d.http_first is app.DEFAULT_HTTP_FIRST
     assert d.output_mode == app.OutputMode.SEPARATE.value

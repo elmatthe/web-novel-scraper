@@ -35,7 +35,9 @@ class SourceIdentityError(ValueError):
 # whether a source is runnable remains the catalog's decision.
 SUPPORTED_HOSTS: Mapping[str, frozenset[str]] = {
     "freewebnovel.com": frozenset({"freewebnovel"}),
-    "freewebnovel.net": frozenset({"freewebnovel"}),
+    # .net has its own adapter (paginated list, descriptive addresses; v0.3.0 04); "freewebnovel"
+    # stays allowed so identities recorded before 04 still validate.
+    "freewebnovel.net": frozenset({"freewebnovel", "freewebnovel_net"}),
     "dynamic.webnovel.com": frozenset({"webnovel_dynamic"}),
     "www.empirenovel.com": frozenset({"empire_novel"}),
     "telegra.ph": frozenset({"telegraph"}),

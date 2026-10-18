@@ -383,32 +383,15 @@ def test_rescue_exhausted_is_failed_not_rescued(tmp_path) -> None:
 
 # ── circuit breaker (§3.9/§3.10) ──────────────────────────────────────────────
 def test_breaker_unit_thresholds() -> None:
-    # consecutive ≥ 5 trips
+    """v0.3.0 04 (plan decision 6, §8 C9): the headless primary is one bounded probe — its first
+    challenge trips the switch to a visible browser; nothing else does."""
+    assert pipeline.BREAKER_CONSECUTIVE_CHALLENGES == 1
     b = _CircuitBreaker(armed=True)
-    for _ in range(4):
-        b.record_network(is_challenge=True)
+    for _ in range(25):
+        b.record_network(is_challenge=False)      # successes, 5xx, not-found: never a trip
     assert b.should_trip() is False
     b.record_network(is_challenge=True)
     assert b.should_trip() is True
-
-    # a non-challenge network fetch (success / 5xx / not-found) resets the streak
-    b2 = _CircuitBreaker(armed=True)
-    for _ in range(4):
-        b2.record_network(is_challenge=True)
-    b2.record_network(is_challenge=False)        # e.g. a transient 5xx or a success
-    assert b2.consecutive == 0
-    assert b2.should_trip() is False
-
-    # ≥ 9 challenges within the rolling window trips even without 5 in a row
-    b3 = _CircuitBreaker(armed=True)
-    pattern_tripped = False
-    for i in range(1, 21):
-        b3.record_network(is_challenge=(i % 5 != 0))  # 4-in-a-row max, 16/20 challenges
-        if b3.should_trip():
-            pattern_tripped = True
-            assert b3.consecutive < pipeline.BREAKER_CONSECUTIVE_CHALLENGES
-            break
-    assert pattern_tripped is True
 
     # not armed (visible primary) never trips
     b4 = _CircuitBreaker(armed=False)
@@ -422,9 +405,9 @@ def test_breaker_trips_switches_visible_retries_sync_and_latches(tmp_path) -> No
     record: list = []
 
     def behave(index, manager):
-        # Headless: chapters 1-5 are blocked (5 consecutive → trips on #5).
+        # Headless: chapter 1 succeeds, chapter 2 is challenged (the first challenge trips).
         # Visible (after the switch): everything succeeds.
-        if manager.headless:
+        if manager.headless and index >= 2:
             return ("raise", ChallengeFetchError(f"headless block {index}"))
         return ("ok", _content(index))
 
@@ -437,13 +420,12 @@ def test_breaker_trips_switches_visible_retries_sync_and_latches(tmp_path) -> No
     # exactly one switch → two managers, each closed exactly once (§3.15)
     assert len(created) == 2
     assert [m.closed for m in created] == [1, 1]
-    # the triggering chapter (5) was retried synchronously on the VISIBLE primary
-    assert (5, False) in record
-    # chapters 6-8 ran on the visible primary (latched), never headless
-    assert (6, False) in record and (7, False) in record and (8, False) in record
-    assert (6, True) not in record
-    # chapters 1-4 were owned by rescue (rescued); 5-8 by the visible primary
-    assert set(report.rescued) == {1, 2, 3, 4}
+    # chapter 1 was fetched headless; the triggering chapter (2) was retried synchronously on
+    # the VISIBLE primary, never queued for rescue
+    assert (1, True) in record and (2, True) in record and (2, False) in record
+    # chapters 3-8 ran on the visible primary (latched), never headless
+    assert all((n, False) in record and (n, True) not in record for n in range(3, 9))
+    assert report.rescued == []
     assert report.failed == []
     assert len(_pdfs(tmp_path)) == 8
 

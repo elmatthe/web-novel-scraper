@@ -13,14 +13,14 @@
 - **Owner data on disk (gitignored, never touch destructively):** the 1.2 GB pre-0.3.0 HTML cache in
   `files/cache/<novel>/` (copied on demand into `files/cache/<host>/<novel>/`), `files/runtime-data/`.
 - **Done in this session (newest first):**
+  - **04 (LOTM 1/2 on .com and .net, .net adapter, headless-first):** plan §9.15, ADR 016.
+    Commit after `7ce33ff`.
   - **05 (canonical text, TXT, structured PDF, Unicode fallback):** plan §9.14, ADR 015. Gate PASS
-    1376 (3.13.12 and 3.12.10). Commit after `8926a30`.
+    1376 (3.13.12 and 3.12.10). `7ce33ff`.
   - **03.3-03.4 (run folders, journal, Resume):** plan §9.13, ADR 014. Gate PASS 1306 (3.13.12 and
     3.12.10). `8926a30`.
   - **Overrides A + B, 03.2b (validated HTML cache):** plan §9.12, ADR 011/012. `12e83be`, 1272 passed.
-- **Next:** 04 (Lord of the Mysteries 1/2 on `.net`/`.com`: live investigation, catalog rows need a
-  site key because `.net`/`.com` share adapter `freewebnovel`), 05 (canonical text, TXT/PDF),
-  06 (hardening), 07 (Windows bootstrap, acceptance checklist, Codex prompt).
+- **Next:** 06 (reliability hardening), then 07 (Windows bootstrap, acceptance checklist, Codex prompt).
 - **Live evidence gathered 2026-10-18 (rate-limited, ~20 requests, robots.txt checked: both hosts allow
   crawling; `.net` disallows only `/admin/` and `/ajax-`, which are never used):**
   - `.net` LOTM: index `/lord-of-the-mysteries.html`, TOC `?page=N` (40 per page, 36 pages, 1-1432),

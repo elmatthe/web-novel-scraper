@@ -120,7 +120,7 @@ def test_selection_is_website_first_and_keeps_the_existing_catalog_behaviour() -
         assert win._site_menubtn.grid_info()["row"] < win._novel_combo.grid_info()["row"]
         assert win._website_var.get() == "freewebnovel.com"
         assert win._current_slug() == "shadow-slave"
-        assert str(win._site_menubtn.cget("text")) == "Free Web Novel"
+        assert str(win._site_menubtn.cget("text")) == "Free Web Novel (.com)"
         menu = win._site_menu
         entries = [
             (str(menu.entrycget(i, "label")), str(menu.entrycget(i, "state")))
@@ -531,7 +531,7 @@ def test_start_and_stop_drive_the_unchanged_run_lifecycle(monkeypatch, tmp_path)
 
         win.flush_activity()  # what the Tk-thread pump does on its timer
         summary, detailed = _views(win)
-        assert "Run started: Shadow Slave from Free Web Novel." in summary
+        assert "Run started: Shadow Slave from Free Web Novel (.com)." in summary
         assert "fetching chapter 1" in detailed
         assert "fetching chapter 1" not in summary  # a routine line is Detailed only
         assert win._counts_var.get() == "1 / 5 · 20%"

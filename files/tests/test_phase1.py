@@ -87,8 +87,10 @@ def test_all_novel_slugs_unique_and_ordered() -> None:
         "reverend-insanity",
         "renegade-immortal",
         "supreme-magus",
+        "lord-of-the-mysteries",
+        "lord-of-mysteries-2-circle-of-inevitability",
     ]
-    assert len(slugs) == len(set(slugs)) == 5
+    assert len(slugs) == len(set(slugs)) == 7
 
 
 def test_shadow_slave_has_three_sites_one_enabled() -> None:

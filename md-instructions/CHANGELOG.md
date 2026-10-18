@@ -9,6 +9,20 @@ versioning.
 candidate. The macOS launcher and portable code are kept, but macOS acceptance is deferred to a
 later branch; nothing here claims macOS readiness.
 
+### Added — Lord of the Mysteries 1 and 2 on Free Web Novel (.com) and (.net) (Checkpoint 04)
+- **Two new novels, each on two websites:** *Lord of the Mysteries* and *Lord of Mysteries 2: Circle
+  of Inevitability* on **Free Web Novel (.com)** and **Free Web Novel (.net)**, each checked live
+  (chapter lists, early/middle/late chapters, small end-to-end runs). The two websites are separate
+  choices with separate chapter lists, saved pages and run folders; a run never mixes them.
+- **Free Web Novel (.net)** reads the site's paginated chapter list (only the pages a run needs) and
+  works over plain HTTP, with no browser window. Its list for Lord of the Mysteries skips chapter 1303
+  (reported as a gap; the .com list has it).
+- **Browser runs start hidden (headless) by default.** At the first Cloudflare check the app opens a
+  visible browser for the rest of the run and retries that chapter there. A saved choice is kept.
+- The Website menu now says "Free Web Novel (.com)" and "Free Web Novel (.net)".
+- **Tests:** 1,392 total (12 new in `test_freewebnovel_net.py`; catalog, headless-default and breaker
+  tests updated to the approved behaviour).
+
 ### Added / Changed — TXT output, one canonical chapter text and faithful PDFs (Checkpoint 05)
 - **TXT output:** tick **TXT**, **PDF** or both (PDF on, TXT off at every start). TXT files are UTF-8
   and land in the run folder's `TXT/`, with exactly the same chapters, order and file grouping as the

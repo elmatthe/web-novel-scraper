@@ -469,6 +469,30 @@ Done before 04 because the new novels need the corrected cleanup and headings (A
   the same); a PDF character with no installed font is left as is and listed in
   `pdf_builder.missing_glyphs`; macOS font fallback is untested (deferred, ADR 013).
 
+### 9.15 Checkpoint 04 result: Lord of the Mysteries 1/2 on .com and .net (2026-10-18)
+
+**Live evidence** (rate-limited, 3.5 s per host; robots.txt allows both; `/ajax-` never used; ~130
+requests in total; metadata only kept, in the session scratch area, nothing committed):
+
+| Novel | Website | Index / TOC | Chapters listed | Sampled live (adapter) | E2E run | Result |
+|---|---|---|---|---|---|---|
+| Lord of the Mysteries | `.com` | `/novel/lord-of-the-mysteries` (identity) | 1-1432 | 1, 700, 1303, 1432 (HTTP), 2 headless + 3 visible Camoufox | 1-3 PDF+TXT, headless | **Enabled** |
+| Lord of the Mysteries | `.net` | `/lord-of-the-mysteries.html?page=1..36` | 1431 entries, 1-1432, **1303 not listed** | 1, 700, 1180, 1302, 1304, 1432 | 1-3; 1301-1305 (gap 1303 reported) | **Enabled** |
+| LOTM 2: Circle of Inevitability | `.com` | `/novel/lord-of-mysteries-2-circle-of-inevitability` | 1-1181 | 1, 600, 888, 1181 | 1-3 single file, headless | **Enabled** |
+| LOTM 2: Circle of Inevitability | `.net` | `/lord-of-mysteries-2-circle-of-inevitability.html?page=1..30` | 1-1181 | 1, 600, 888, 1069, 1180, 1181 | 1-3 chunked; 1180-5000 clamped to 1181 | **Enabled** |
+
+Also smoke-tested live after the 05 cleanup changes: Shadow Slave, Reverend Insanity, Renegade
+Immortal, Supreme Magus (offset reconciliation, chapters 4-5) on `.com` headless, and The Noble Queen
+on WebNovel (HTTP): all saved. `.com`/`.net` sampled chapters agree in paragraph count (LOTM2 888:
+52 vs 53) and are byte-identical for late chapters. Known source irregularities: `.net` LOTM list
+omits 1303; `.net` pages without titles (LOTM2 888, 1069; LOTM 1180 list entry) -> `Untitled` with a
+warning; `.net` titles repeat the number ("1 Foreigners") and double-escape quotes (handled); a stray
+quote in one source title ("New Life“") is kept as published. Not run: any full-novel download.
+
+**Implemented** (ADR 016): `adapters/freewebnovel_net.py`, catalog rows (4), registry, host table,
+headless-first default and one-challenge breaker, standard-path limiter, website labels.
+**Tests:** `test_freewebnovel_net.py` (12) and updated catalog/headless/breaker tests.
+
 ## 10. Owner overrides and autonomous completion mandate (2026-10-18)
 
 The owner approved 03.2a and authorised autonomous completion of 03.2b through 07 for a **Windows-only

@@ -101,14 +101,20 @@ def parse_heading(text: object) -> tuple[Optional[str], str]:
 def clean_title(raw: object, label: object) -> str:
     """The title of chapter *label* from its raw site text (heading, list entry or metadata)."""
     title = normalize_text(html.unescape(html.unescape(normalize_text(raw))))
-    number, rest = parse_heading(title)
-    if number is not None and number == label_text(label):
-        title = rest
     for suffix in _SITE_SUFFIXES:
         title = suffix.sub("", title)
     num = re.escape(label_text(label))
-    # A leading repeat of the number: "1 Foreigners", "1431 - Bonus Chapter", "12: Title".
-    title = re.sub(rf"^{num}(?:\s*{_SEP}+\s*|\s+)(?=\S)", "", title)
+    # Repeats of the chapter's own number at the start, however many the site stacked:
+    # "Chapter 887 - Chapter 887 The Function", "1 Foreigners", "1431 - Bonus Chapter".
+    for _ in range(3):
+        number, rest = parse_heading(title)
+        if number is not None and number == label_text(label):
+            title = rest
+            continue
+        stripped = re.sub(rf"^{num}(?:\s*{_SEP}+\s*|\s+)(?=\S)", "", title)
+        if stripped == title:
+            break
+        title = stripped
     if title == label_text(label):
         title = ""
     title = re.sub(rf"^(?:\s*{_SEP})+\s*", "", title)

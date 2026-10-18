@@ -5,6 +5,43 @@ See AI-WORKSPACE.md for how this fits alongside Briefing, Changelog, and Handoff
 
 ---
 
+## 016 — freewebnovel.net is its own adapter on plain HTTP; browser runs start headless and latch visible at the first challenge — 2026-10-18 — Claude (Opus 5.5)
+
+**Status:** Accepted (v0.3.0 Checkpoint 04; plan decision 5/6, §8 C9)
+
+**Context:** Live inspection (2026-10-18, robots.txt honoured) showed `freewebnovel.net` is not a
+mirror of `.com`: a paginated chapter list (`/<novel>.html?page=N`, 40 a page) with descriptive
+chapter addresses that cannot be generated from a number, the same reader structure for chapter pages
+(`h1.chapter`, `#chapter-content`), and plain HTTP answering every request with no challenge. On
+`.com`, headless Camoufox cleared the site on the first attempt. The 0.2.0 breaker switched a headless
+run to visible only after 5 consecutive (or 9 of 20) challenges, rescuing each meanwhile.
+
+**Decision:**
+1. A separate adapter key, `freewebnovel_net` (`FreeWebNovelNetAdapter`, subclassing the `.com`
+   adapter for chapter pages and replacing only discovery). Catalog lookups by (novel, adapter) stay
+   unambiguous, `.net` stays on the standard HTTP path (`use_browser=False`, escalation ladder intact)
+   and outside the `.com` rescue conductor. `SUPPORTED_HOSTS["freewebnovel.net"]` allows both keys.
+2. Discovery reads only the list pages a window needs (page 1, the overlapping pages, one page of
+   margin, widening while the window's ends are missing; an open end always reads the last page),
+   always fresh, never `/ajax-`. The tail is confirmed only when the last page was read, matches the
+   selector's range and is not behind the latest-chapters widget.
+3. The standard path now gives its own request manager a per-host limiter (`max(3 s, delay)`), so list
+   pages are paced like chapters.
+4. Headless-first: the GUI default is a hidden browser, and the breaker trips on the first primary
+   challenge (`BREAKER_CONSECUTIVE_CHALLENGES = BREAKER_WINDOW_CHALLENGES = 1`): that chapter is retried
+   at once on a visible browser and the run stays visible. A saved preference is respected.
+5. Website labels become "Free Web Novel (.com)" and "Free Web Novel (.net)".
+
+**Alternatives considered:** one adapter with host branches (rejected: ambiguous catalog keys and the
+browser-only rescue scope); using the site's AJAX list (rejected: robots.txt); keeping the 5/9 breaker
+(rejected: the approved policy is one bounded headless probe).
+
+**Consequences:** Both novels are available on both hosts. LOTM on `.net` lacks chapter 1303 in the
+site's own list (a reported TOC gap; `.com` has it). A few `.net` pages have no title (LOTM2 888,
+1069; LOTM 1180's list entry), which become `Chapter N: Untitled` with a warning.
+
+---
+
 ## 015 — One canonical chapter text; cleanup only where measured evidence makes it confident — 2026-10-18 — Claude (Opus 5.5)
 
 **Status:** Accepted (v0.3.0 Checkpoint 05)

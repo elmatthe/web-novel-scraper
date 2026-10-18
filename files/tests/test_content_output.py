@@ -48,6 +48,10 @@ def test_labels_keep_fractions_exactly(value, text):
     ("Chapter 627.2 Birthday and Anniversary Part 1", "627.2", "Birthday and Anniversary Part 1"),
     ("And yet...", 9, "And yet..."),                                      # its own punctuation stays
     ("Chapter 7", 7, ""),
+    ("Chapter 887 - Chapter 887 The Function of the Lucky Coins", 887, "The Function of the Lucky Coins"),
+    ("Chapter 888 - &nbsp;", 888, ""),                                    # .net LOTM2: an empty title
+    ("Chapter 1301 - New Life“", 1301, "New Life“"),                      # a source typo stays as published
+    ("Chapter 12 - 120 Years Later", 12, "120 Years Later"),              # another number is not a repeat
 ])
 def test_titles_lose_only_site_junk_and_a_repeated_number(raw, label, title):
     assert C.clean_title(raw, label) == title

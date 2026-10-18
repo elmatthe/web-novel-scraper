@@ -22,9 +22,9 @@ def _spec(slug, adapter, name, url, *, enabled=True, base_url="", title=None):
 
 
 # ── The real catalog, unchanged ──────────────────────────────────────────────
-def test_the_catalog_is_unchanged_and_has_no_net_or_com_pairs_yet() -> None:
-    """Checkpoint 02.3 must not add catalog entries: separate .net/.com rows are validated
-    one by one in Checkpoint 04."""
+def test_the_catalog_rows_and_the_validated_net_and_com_pairs() -> None:
+    """Checkpoint 04 added exactly the two Lord of the Mysteries novels, each on .com and on .net,
+    after live validation; every earlier row is unchanged and the stubs stay disabled."""
     rows = [(s.novel_slug, s.adapter_key, s.enabled) for s in catalog.all_specs()]
     assert rows == [
         ("shadow-slave", "freewebnovel", True),
@@ -35,29 +35,38 @@ def test_the_catalog_is_unchanged_and_has_no_net_or_com_pairs_yet() -> None:
         ("reverend-insanity", "freewebnovel", True),
         ("renegade-immortal", "freewebnovel", True),
         ("supreme-magus", "freewebnovel", True),
+        ("lord-of-the-mysteries", "freewebnovel", True),
+        ("lord-of-the-mysteries", "freewebnovel_net", True),
+        ("lord-of-mysteries-2-circle-of-inevitability", "freewebnovel", True),
+        ("lord-of-mysteries-2-circle-of-inevitability", "freewebnovel_net", True),
     ]
     hosts = {selection.website_key(s) for s in catalog.all_specs()}
-    assert hosts == {"freewebnovel.com", "empirenovel.com", "telegra.ph", "novelbin.com",
-                     "dynamic.webnovel.com"}
+    assert hosts == {"freewebnovel.com", "freewebnovel.net", "empirenovel.com", "telegra.ph",
+                     "novelbin.com", "dynamic.webnovel.com"}
 
 
 def test_websites_come_from_the_catalog_in_first_seen_order() -> None:
     sites = selection.websites(catalog.all_specs())
     assert [(w.key, w.label, w.enabled) for w in sites] == [
-        ("freewebnovel.com", "Free Web Novel", True),
+        ("freewebnovel.com", "Free Web Novel (.com)", True),
         ("empirenovel.com", "Empire Novel", False),
         ("telegra.ph", "Telegraph", False),
         ("novelbin.com", "Novel Bin", False),
         ("dynamic.webnovel.com", "WebNovel (Dynamic)", True),
+        ("freewebnovel.net", "Free Web Novel (.net)", True),
     ]
 
 
 def test_each_website_offers_only_the_novels_it_can_run() -> None:
     specs = catalog.all_specs()
     assert [n.slug for n in selection.novels_for("freewebnovel.com", specs)] == [
-        "shadow-slave", "reverend-insanity", "renegade-immortal", "supreme-magus"]
+        "shadow-slave", "reverend-insanity", "renegade-immortal", "supreme-magus",
+        "lord-of-the-mysteries", "lord-of-mysteries-2-circle-of-inevitability"]
     assert [n.title for n in selection.novels_for("freewebnovel.com", specs)] == [
-        "Shadow Slave", "Reverend Insanity", "Renegade Immortal", "Supreme Magus"]
+        "Shadow Slave", "Reverend Insanity", "Renegade Immortal", "Supreme Magus",
+        "Lord of the Mysteries", "Lord of Mysteries 2: Circle of Inevitability"]
+    assert [n.slug for n in selection.novels_for("freewebnovel.net", specs)] == [
+        "lord-of-the-mysteries", "lord-of-mysteries-2-circle-of-inevitability"]
     assert [n.slug for n in selection.novels_for("dynamic.webnovel.com", specs)] == [
         "the-noble-queen"]
     # Websites that are "coming soon" offer nothing: their rows are disabled.

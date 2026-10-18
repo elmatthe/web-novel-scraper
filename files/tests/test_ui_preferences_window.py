@@ -99,7 +99,7 @@ def test_a_fresh_install_starts_with_the_documented_defaults_and_writes_nothing(
         assert win._chunk_var.get() == app.DEFAULT_CHUNK
         assert (win._delay_var.get(), win._timeout_var.get()) == ("3.0", "30")
         assert win._browser_var.get() is True
-        assert win._headless_var.get() is False and app.DEFAULT_HEADLESS is False
+        assert win._headless_var.get() is True and app.DEFAULT_HEADLESS is True
         assert win._http_first_var.get() is False and win._cache_var.get() is True
         assert str(win._chunk_entry.cget("state")) == "disabled"
         assert win._start_var.get() == "1" and win._end_var.get() == ""
@@ -209,20 +209,20 @@ def test_advanced_settings_are_saved_on_close_and_restored(tmp_path) -> None:
         again.destroy()
 
 
-def test_the_current_headless_choice_survives_but_the_default_stays_off(tmp_path) -> None:
+def test_a_saved_visible_browser_choice_survives_and_the_default_is_headless(tmp_path) -> None:
     fresh = _make_app(_store(tmp_path))
     try:
-        assert fresh._headless_var.get() is False
-        fresh._headless_var.set(True)
+        assert fresh._headless_var.get() is True
+        fresh._headless_var.set(False)
         fresh.close_advanced_settings()
     finally:
         fresh.destroy()
     again = _make_app(_store(tmp_path))
     try:
-        assert again._headless_var.get() is True
+        assert again._headless_var.get() is False
     finally:
         again.destroy()
-    assert Settings().headless is False  # a missing value still means "off"
+    assert Settings().headless is True  # a missing value means the headless-first default
 
 
 # ── Upgrade and invalid data ─────────────────────────────────────────────────
@@ -302,7 +302,7 @@ def test_a_newer_schema_is_ignored_and_the_window_still_works(tmp_path) -> None:
     win = _make_app(_store(tmp_path))
     try:
         assert "Settings problem" in win._status_var.get()
-        assert win._bundle["appearance"] == "light" and win._headless_var.get() is False
+        assert win._bundle["appearance"] == "light" and win._headless_var.get() is True
         assert win._current_spec() is not None
     finally:
         win.destroy()

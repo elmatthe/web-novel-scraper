@@ -56,8 +56,8 @@ APPEARANCES = (LIGHT, DARK)
 DEFAULT_APPEARANCE = LIGHT
 
 # Fresh-install values for the ordinary preferences. They mirror the window's own defaults
-# (``app.DEFAULT_*``; a test pins that they agree). DEFAULT_HEADLESS stays off until the
-# headless-first work of Checkpoint 04.
+# (``app.DEFAULT_*``; a test pins that they agree). Headless-first is the default since
+# Checkpoint 04 (a saved choice is kept).
 OUTPUT_MODES = ("separate", "chunked", "single")   # the OutputMode values, as strings
 DEFAULT_OUTPUT_MODE = "separate"                   # Individual chapters
 DEFAULT_CHUNK_SIZE = 10
@@ -81,7 +81,7 @@ class Settings:
     delay: float = DEFAULT_DELAY
     timeout: int = DEFAULT_TIMEOUT
     browser_mode: bool = True
-    headless: bool = False
+    headless: bool = True
     http_first: bool = False
     use_cache: bool = True
 

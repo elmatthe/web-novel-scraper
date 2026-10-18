@@ -108,7 +108,7 @@ DEFAULT_CHUNK = "10"       # chapters per PDF in CHUNKED mode
 # clears for (a headless browser is exactly what it blocks). A visible browser
 # window WILL appear during a FreeWebNovel scrape; that is expected (like the old
 # tool). An advanced user can still tick "Headless browser" to force it.
-DEFAULT_HEADLESS = False
+DEFAULT_HEADLESS = True
 # Browser mode ON by default for Cloudflare-protected sites (FreeWebNovel). The
 # checkbox is only active for browser-capable adapters; for the HTTP-only
 # WebNovel-dynamic it is inert and the browser is never forced.
@@ -152,9 +152,9 @@ BROWSER_HINT = "Opens a visible browser window, which clears Cloudflare."
 # The accurate Headless description (0.2.0 §4.2): the breaker may switch a headless
 # run to a visible browser for the rest of the run, and the rescue lane is visible.
 HEADLESS_HINT = (
-    "If Cloudflare broadly blocks headless mode, the app may automatically open and "
-    "keep a visible browser for the rest of the run; hard chapters may also open a "
-    "visible rescue browser."
+    "Starts with a hidden browser. At the first Cloudflare check the app opens a visible browser "
+    "for the rest of the run (complete the check in it if one is shown); a hard chapter may also "
+    "open a visible rescue browser."
 )
 # Chapter list (v0.3.0 03.2a): chapter lists are saved per website and novel and reused, so a
 # run needs no table-of-contents request for chapters it already knows. This one-shot box asks the
@@ -776,7 +776,7 @@ class ScraperApp(tk.Tk):
         self._headless_var = tk.BooleanVar(value=DEFAULT_HEADLESS)
         self._headless_check = ttk.Checkbutton(
             browser,
-            text="Headless primary browser (advanced)",
+            text="Start with a hidden (headless) browser",
             variable=self._headless_var,
             style=s["checkbutton"],
         )

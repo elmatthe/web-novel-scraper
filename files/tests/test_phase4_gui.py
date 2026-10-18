@@ -106,7 +106,7 @@ def test_worker_is_non_daemon_and_passes_job_without_a_manager(monkeypatch, tmp_
         assert job.delay == 3.0                   # the new default reached the job
         assert job.request_timeout == 30          # the Timeout field
         assert job.use_browser is True            # FWN + browser box on by default
-        assert job.headless is False
+        assert job.headless is True               # headless-first by default (v0.3.0 04, C9)
     finally:
         release.set()
         if win._worker is not None:

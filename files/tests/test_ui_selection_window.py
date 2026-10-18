@@ -142,11 +142,12 @@ def test_the_website_menu_lists_catalog_websites_and_greys_unavailable_ones() ->
             for i in range(menu.index("end") + 1)
         ]
         assert entries == [
-            ("Free Web Novel", "normal"),
+            ("Free Web Novel (.com)", "normal"),
             ("Empire Novel (coming soon)", "disabled"),
             ("Telegraph (coming soon)", "disabled"),
             ("Novel Bin (coming soon)", "disabled"),
             ("WebNovel (Dynamic)", "normal"),
+            ("Free Web Novel (.net)", "normal"),
         ]
         # Choosing a disabled entry (a click, or Enter on it) does nothing.
         before = (win._website_var.get(), win._current_slug())
@@ -162,7 +163,12 @@ def test_the_novel_list_follows_the_chosen_website() -> None:
     win = _make_app()
     try:
         assert _novel_titles(win) == [
-            "Shadow Slave", "Reverend Insanity", "Renegade Immortal", "Supreme Magus"]
+            "Shadow Slave", "Reverend Insanity", "Renegade Immortal", "Supreme Magus",
+            "Lord of the Mysteries", "Lord of Mysteries 2: Circle of Inevitability"]
+        _pick_website(win, "freewebnovel.net")
+        assert _novel_titles(win) == [
+            "Lord of the Mysteries", "Lord of Mysteries 2: Circle of Inevitability"]
+        assert win._current_spec().adapter_key == "freewebnovel_net"
         _pick_website(win, "dynamic.webnovel.com")
         assert _novel_titles(win) == ["The Noble Queen"]
         assert win._novel_combo.get() == "The Noble Queen"
