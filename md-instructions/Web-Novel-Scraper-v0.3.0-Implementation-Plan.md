@@ -589,6 +589,37 @@ The owner's nine small GUI runs (29 PDFs, no chapter failures) found two problem
 Verification: 1,476 tests pass on Python 3.13.12 and 3.12.10; `scripts/verify.py` PASS; each fix
 mutation-checked.
 
+### 9.19 Composite chapter headings (Lord of Mysteries 2, .com 1130–1138; 2026-10-18)
+
+The owner's whole-novel run of Lord of Mysteries 2 (.com) failed chapters 1130–1138 ("shows chapter
+1129.1 / 1130 / 1131 … but the list expects 1130 / 1131 / 1132 …"; 1127–1129 and 1139–1140 were fine).
+
+1. **Reproduced** with two polite live requests (`chapter-1130`, `chapter-1131`, Camoufox, scratch
+   cache). The page `<span class="chapter">` and `<title>` read `Chapter 1129.1 - 1130 Initiative` and
+   `Chapter 1130 - 1131 Individual Preparations`; the body's first line is `Chapter 1130 Initiative` /
+   `Chapter 1131 Individual Preparations`. `_normalize_heading_line` reads `Chapter A - B Title` as
+   chapter A with title "B Title"; A is 1129.1 / 1130 ≠ the expected 1130 / 1131, so
+   `ChapterMismatchError` (correctly, given what it was told). The list, the addresses and the
+   expected numbers were right; the heading reader was not.
+2. **Fix** (`adapters/freewebnovel.py`, `_composite_heading`, used by `_extract_chapter` and by the
+   displayed-number probe `_fetch_and_read`, so offset discovery does not see a false offset): a
+   heading `Chapter A - B Title` is a pair only if B is a whole number with 0 < B − A ≤ 1 and the
+   body's first two lines contain a heading `Chapter B <same title>` (case-insensitive). The chapter
+   identity stays `B` (= `meta.index`, which must equal the list's expected number, so the displayed
+   number check still applies); only `ChapterContent.label` carries the display pair, giving the file
+   heading `Chapter 1129.1-1130: Initiative`. Number validation is not relaxed anywhere else, side
+   chapters (`1129.1`) are never merged with ordinary ones, and nothing is invented.
+3. **Live check** (scratch list copy, scratch cache/output, delay 3.5 s): 1127–1140 → 14 chapters, 28
+   files (PDF + TXT), none failed, `audit_run.py --pdf-text` passes, 14 distinct bodies of 1,450–1,860
+   words, no leftover story heading line. Headings: 1127, 1128, `1129.1-1130`, 1129, `1130-1131` …
+   `1137-1138`, 1139, 1140.
+4. **Resume:** failed pages were never written, and the wrong-chapter pages were set aside in the
+   cache, so a Resume of the owner's run fetches 1130–1138 afresh and keeps everything else
+   (separate-file mode fetches only those nine; grouped mode rebuilds the unfinished group without ever
+   shrinking a fuller file). Tested offline end to end.
+
+Verification: 1495 tests pass; `scripts/verify.py` PASS; the new tests fail when the fix is removed.
+
 ## 10. Owner overrides and autonomous completion mandate (2026-10-18)
 
 The owner approved 03.2a and authorised autonomous completion of 03.2b through 07 for a **Windows-only

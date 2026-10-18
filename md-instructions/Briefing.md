@@ -178,7 +178,7 @@ What v0.3.0 is, in short:
   environment, packages and browser engines for real (`scripts/setup_check.py`), repairs only what is
   missing, installs Python 3.12 per-user after asking (WinGet, else the verified python.org installer
   via `scripts/install_python.ps1`), and refuses too-deep or read-only folders (ADR 017).
-- **Verification:** 1,476 offline tests pass on Python 3.12.10 and 3.13.12; the launcher was run end to
+- **Verification:** 1495 offline tests pass on Python 3.12.10 and 3.13.12; the launcher was run end to
   end from a scratch copy in ten scenarios; limited live smoke runs passed for all nine pairings.
   Full-novel runs are the owner's acceptance step and have **not** been run.
 
@@ -602,7 +602,9 @@ Detail per checkpoint: `CHANGELOG.md`. Current state and next action: `handoff.m
 - **Live site behaviour can change from day to day.** Free Web Novel (.com) sits behind Cloudflare;
   the headless-first browser switches to a visible one at the first challenge. A day when neither
   clears shows up as failed chapters that Resume can retry later.
-- **Site-side irregularities:** the .net list for Lord of the Mysteries gives chapter 1303 a
+- **Site-side irregularities:** Lord of Mysteries 2 on .com shows two-number headings for chapters
+  1130–1138 (`Chapter 1129.1 - 1130 Initiative`; the story says `Chapter 1130 Initiative`); read as
+  chapter 1130 and shown `Chapter 1129.1-1130: Initiative` (plan §9.19). The .net list for Lord of the Mysteries gives chapter 1303 a
   misspelt address (`chaspter-1303-…`), used as listed since owner acceptance round 1 (plan §9.18).
   Three .net list entries carry no title (LOTM2 888 and 1069, LOTM 1180); a
   chapter whose page has no title either is saved as `Chapter N: Untitled`, with a warning.

@@ -45,8 +45,18 @@ from webnovel_scraper.txt_builder import CHAPTER_SEPARATOR  # noqa: E402
 _HEADING = re.compile(r"^Chapter (\S+?): ", re.MULTILINE)
 
 
+# A page the site shows as "Chapter 1129.1 - 1130" is written "Chapter 1129.1-1130: ..."; the chapter it
+# is, for the manifest, is the final number (the first one is the page before it).
+_COMPOSITE = re.compile(r"^\d+(?:\.\d+)?-(\d+)$")
+
+
+def _identity(shown: str) -> str:
+    composite = _COMPOSITE.match(shown)
+    return composite.group(1) if composite else shown
+
+
 def _headings_in_txt(text: str) -> list[str]:
-    return [m.group(1) for block in text.split(CHAPTER_SEPARATOR) if (m := _HEADING.match(block))]
+    return [_identity(m.group(1)) for block in text.split(CHAPTER_SEPARATOR) if (m := _HEADING.match(block))]
 
 
 def _pdf_lacks_heading(path: Path, expected: list[str]) -> str | None:
@@ -58,7 +68,7 @@ def _pdf_lacks_heading(path: Path, expected: list[str]) -> str | None:
     text = "\n".join(page.extract_text() or "" for page in PdfReader(str(path)).pages)
     position = 0
     for label in expected:
-        found = re.compile(rf"^Chapter {re.escape(label)}: ", re.MULTILINE).search(text, position)
+        found = re.compile(rf"^Chapter (?:\d+(?:\.\d+)?-)?{re.escape(label)}: ", re.MULTILINE).search(text, position)
         if found is None:
             return label
         position = found.end()

@@ -9,14 +9,39 @@ versioning.
 candidate. The macOS launcher and portable code are kept, but macOS acceptance is deferred to a
 later branch; nothing here claims macOS readiness.
 
+### Fixed — composite chapter headings: Lord of Mysteries 2 (.com) chapters 1130–1138 (2026-10-18)
+- **Chapters 1130–1138 of Lord of Mysteries 2 on Free Web Novel (.com) were reported as failed.** For
+  those pages the website's heading shows two numbers, e.g. `Chapter 1129.1 - 1130 Initiative` at
+  `chapter-1130` and `Chapter 1130 - 1131 Individual Preparations` at `chapter-1131`, while the story
+  itself begins `Chapter 1130 Initiative` / `Chapter 1131 Individual Preparations`. The reader took the
+  first number as the chapter, so the page looked like a different chapter and was rightly refused by
+  the wrong-chapter check.
+- A heading with two numbers is now read as a pair only when everything agrees: the second is a whole
+  number above the first by at most one, it equals the chapter the list expects at that address, and the
+  story's own opening line says `Chapter <second> <same title>`. The chapter keeps its real number
+  (1130, 1131, … for selection, the saved list, Resume and the audit); the file shows the pair the site
+  shows: `Chapter 1129.1-1130: Initiative`, `Chapter 1130-1131: Individual Preparations` (the story's
+  repeated opening line is removed as for any chapter). A page showing another chapter, a heading whose
+  pair is not confirmed by the story, or any other pair of numbers is still refused.
+- `files/audit_run.py` understands these headings (a pair counts as its final number).
+- **Existing incomplete runs:** nothing to repair. The refused pages were never saved, and finished
+  files, cached pages and saved lists are untouched. Choose the same run folder with **Resume Existing
+  Run** (with the same ranges and file types): in separate-file mode only the missing chapters are
+  fetched, in grouped mode the unfinished group is rebuilt (a fuller file is never replaced).
+- **Tests:** 1495 total.
+
 ### Owner acceptance results to date (2026-10-18)
 - Owner-confirmed in the GUI: nine small ranges (29 PDFs, no chapter failures); .net Lord of the
   Mysteries 1301–1305 saves all five chapters (10/10 files audited); Reverend Insanity 1–13 (14/14
   audited); Lord of the Mysteries (.com) 1430–99999 lowered to 1430–1432 (6/6 audited) and Start 1433
   refused with nothing written; Reverend Insanity 14–43 stopped and resumed in the same folder
   (30 chapters, six grouped files, audit passed).
-- **Not yet confirmed:** the clean rebuild and window checks, cache refresh, new-chapter discovery and
-  whole-novel runs. v0.3.0 stays Unreleased until they are.
+- **Whole novels (owner-reported 2026-10-18):** Shadow Slave (.com), The Noble Queen (WebNovel) and
+  Lord of the Mysteries (.net) passed; Lord of Mysteries 2 (.com) failed on chapters 1130–1138 (fixed
+  above; its whole-novel re-run is not yet reported).
+- **Not yet confirmed:** the clean rebuild and window checks, cache refresh, new-chapter discovery,
+  whole-novel runs of the other pairings and the re-run of Lord of Mysteries 2 (.com). v0.3.0 stays
+  Unreleased until they are.
 
 ### Fixed — owner acceptance, round 1 (2026-10-18)
 - **Free Web Novel (.net): Lord of the Mysteries chapter 1303 is no longer missing.** The site does

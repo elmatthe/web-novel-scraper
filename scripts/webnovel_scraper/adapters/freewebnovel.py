@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import re
+from decimal import Decimal
 from typing import Callable, Optional
 from urllib.parse import urldefrag, urljoin, urlparse
 
@@ -28,6 +29,7 @@ from ..content import (
     is_site_chrome,
     label_text,
     normalize_text,
+    parse_heading,
     strip_promotions,
 )
 from ..models import (
@@ -54,6 +56,16 @@ CHAPTER_LIST_TEXT_RE = re.compile(r"\bChapter\s+(-?\d+)\b", re.IGNORECASE)
 # Anchor-text number for (slug ↔ displayed) pair harvesting: also fractional and
 # negative ("Chapter -1 Volume 2 Glossary" marks a non-chapter insert page).
 _ANCHOR_NUM_RE = re.compile(r"\bChapter\s+(-?\d+(?:\.\d+)?)\b", re.IGNORECASE)
+
+
+# How many opening lines of a page's body are checked against its heading.
+_HEADING_LINES = 2
+
+# Composite heading some pages show: "Chapter 1129.1 - 1130 Initiative" (the story itself begins
+# "Chapter 1130 Initiative"). The first number is the page before it, the second the real chapter.
+_COMPOSITE_RE = re.compile(
+    r"\bChapter\s+(\d+(?:\.\d+)?)\s*[-–—]\s*(\d+)(?![\d.])\s*(.*)$", re.IGNORECASE
+)
 
 
 def _parse_chapter_number(raw: str) -> int | float:
@@ -252,6 +264,28 @@ def _normalize_heading_line(
     title = re.sub(r"\s*\|\s*Free\s*Web\s*Novel.*$", "", title, flags=re.IGNORECASE)
     title = title.strip(" -|:;.")
     return number, title
+
+
+def _composite_heading(soup: BeautifulSoup) -> Optional[tuple[str, int, str]]:
+    """``(shown, number, title)`` for a composite heading "Chapter 1129.1 - 1130 Initiative",
+    else ``None``. It counts only when everything agrees: the second number is a whole number
+    above the first by at most one, and the story's own opening line (a different element of
+    the page) says "Chapter <second number> <same title>". Any other pair of numbers in a
+    heading is not a composite, so a page showing a different chapter is still rejected."""
+    paragraphs = _extract_paragraphs(soup)[:_HEADING_LINES]
+    for candidate in _candidate_title_texts(soup):
+        match = _COMPOSITE_RE.search(candidate)
+        if match is None:
+            continue
+        first, second = Decimal(match.group(1)), int(match.group(2))
+        if not 0 < second - first <= 1:
+            continue
+        title = clean_title(match.group(3), second)
+        for line in paragraphs:
+            story_number, story_title = parse_heading(line)
+            if story_number == str(second) and clean_title(story_title, second).casefold() == title.casefold():
+                return label_text(match.group(1)), second, title
+    return None
 
 
 def _extract_title(
@@ -618,9 +652,9 @@ class FreeWebNovelAdapter(BaseAdapter):
                     "treating it as a chapter-number discontinuity."
                 )
             else:
-                num, _title = _extract_title(
-                    BeautifulSoup(html, "html.parser"), None
-                )
+                page = BeautifulSoup(html, "html.parser")
+                composite = _composite_heading(page)
+                num = composite[1] if composite else _extract_title(page, None)[0]
                 known[slug] = (html, num)
         return known[slug][1]
 
@@ -932,6 +966,12 @@ class FreeWebNovelAdapter(BaseAdapter):
     def _extract_chapter(self, html: str, meta: ChapterMeta) -> ChapterContent:
         soup = BeautifulSoup(html, "html.parser")
         number, title = _extract_title(soup, meta.index)
+        shown = None
+        composite = _composite_heading(soup) if number is not None else None
+        if composite is not None and float(composite[1]) == float(meta.index):
+            # "Chapter 1129.1 - 1130 Initiative" on the page for chapter 1130: the chapter is 1130
+            # (the story says so too); the heading keeps the number pair the site shows.
+            shown, number, title = f"{composite[0]}-{composite[1]}", composite[1], composite[2]
         if number is not None and float(number) != float(meta.index):
             # The offset guard (plan §9.6): a page showing another chapter is never published
             # as this one, however it reached us (cache, network or reconciliation).
@@ -944,6 +984,8 @@ class FreeWebNovelAdapter(BaseAdapter):
         label = _meta_label(meta)
         title = clean_title(title, label) or clean_title(meta.title or "", label)
         paragraphs = clean_paragraphs(_extract_paragraphs(soup), label=label, title=title)
+        if shown is not None:
+            label = shown
         if not paragraphs:
             # A fully-fetched, non-challenge page with no extractable body is an
             # extraction failure (its own class) — NOT a Cloudflare block. The

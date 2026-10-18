@@ -3,17 +3,21 @@
 ## Snapshot — v0.3.0 Windows release candidate, awaiting owner acceptance
 **2026-10-18 · HOME-PC (Windows 11) · Claude Code (Opus 5.5) · branch `feature/v0.3.0-modernization`**
 
-- **State:** Checkpoints 01–07 plus owner-acceptance round-1 fixes implemented, verified and pushed.
+- **State:** Checkpoints 01–07, owner-acceptance round-1 fixes and the composite-heading fix
+  (Lord of Mysteries 2 .com 1130–1138, plan §9.19) implemented, verified and pushed.
   Not merged, tagged or released; `main` untouched. macOS deferred (ADR 013).
 - **Owner results so far:** nine small ranges (29 PDFs, no failures); .net LOTM 1301–1305 all five
   after the 1303 fix; Reverend Insanity 1–13 and LOTM (.com) 1430–99999 (clamped to 1432) audited;
   Start 1433 refused; Reverend Insanity 14–43 Stop then Resume audited (table in the acceptance doc).
-  **No whole-novel run exists yet**; the earlier automated full-novel batch was BLOCKED by a local
+  **Whole novels (owner):** Shadow Slave (.com), The Noble Queen (WebNovel) and LOTM (.net) PASS; Lord
+  of Mysteries 2 (.com) FAILED 1130–1138 (composite headings, now fixed and live-verified for 1127–1140;
+  owner re-run not yet reported). The earlier automated full-novel batch was BLOCKED by a local
   network denial (not a pass, not an app fault).
-- **Last verification:** 1,476 tests pass on Python 3.13.12 (`.venv`) and 3.12.10; `scripts/verify.py`
+- **Last verification:** 1495 tests pass on Python 3.13.12 (`.venv`) and 3.12.10; `scripts/verify.py`
   PASS. Live: .net LOTM 1301–1305 saves all five (scratch copy of the owner's list self-corrected).
-- **Release blockers:** whole-novel runs (item 11, at least one pairing per website) and the unreported
-  checks listed in the acceptance doc ("Owner results so far").
+- **Release blockers:** the owner's re-run of Lord of Mysteries 2 (.com) after the composite-heading fix,
+  whole-novel runs of the .com pairings not yet run and the unreported checks listed in the acceptance
+  doc ("Owner results so far"). Recovery steps: "Recovering the Lord of Mysteries 2 (.com) run" there.
 - **Ready:** the independent GO/NO-GO review prompt (Part 2 of `v0.3.0-Acceptance-and-Review.md`),
   draft notes in `md-instructions/v0.3.0-Release-Notes-DRAFT.md`. Review must not merge, tag or release.
 - **Next exact action:** the owner starts the independent review and/or runs a whole-novel pairing.
@@ -33,8 +37,9 @@
 | 06 | `fb7dfe9` | Stop during builds, offline open-ended runs, memory |
 | 07 | `3fd7b99` | Windows setup and repair (ADR 017), review fixes, cache-hit pacing, `files/audit_run.py` |
 | Acceptance round 1 | `89ce3da` | .net irregular chapter addresses (LOTM 1303), smooth preparing bar, ETA ignores cached chapters |
+| Composite headings | (this commit; see Git) | `Chapter A - B Title` pages (LOM2 .com 1130–1138) read as chapter B, shown `A-B`; audit tool follows |
 
-The round-1 commit is the last code commit; the commit after it only records its SHA here.
+The composite-heading commit is the last code commit; later commits may only touch documentation.
 
 ## Novel × website (Windows)
 | Website | Novel | Enabled | Evidence so far |
@@ -62,6 +67,9 @@ Whole-novel runs: **none yet** (owner checklist item 11).
 - Older deferred minors #3–#6 from `files/test-logs/v0.1.0_pre-release.md` remain for owner review.
 
 ## Log (newest first; Git has the full record)
+- 2026-10-18 · composite headings (plan §9.19): `Chapter 1129.1 - 1130 Initiative` pages (LOM2 .com 1130–1138)
+  failed the wrong-chapter check because the first number was read as the chapter; now a pair counts
+  only when the story's own opening line confirms the second number. Live 1127–1140 all saved, audited.
 - 2026-10-18 · release preparation: owner results recorded, review prompt corrected, draft release notes,
   regenerable caches (`__pycache__`, `.pytest_cache`) removed; everything else kept (inventory in the
   final report).
