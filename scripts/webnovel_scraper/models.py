@@ -108,11 +108,17 @@ class ChapterIndex(list):
     """A discovered chapter list (``ChapterMeta`` rows) that also says whether the adapter could
     confirm it runs to the site's real last chapter. ``tail_confirmed=False`` means the list may be
     short (for example the site's own chapter count disagrees with it), so the preflight never uses
-    its last chapter to clamp a requested End. A plain list counts as confirmed."""
+    its last chapter to clamp a requested End. A plain list counts as confirmed.
 
-    def __init__(self, items=(), *, tail_confirmed: bool = True) -> None:
+    ``examined`` is set by an adapter that reads only part of a paginated list: the chapter-number
+    spans of the parts it read. A number missing between two of them was never looked at, so it is
+    not a gap in the site's list. ``None`` means the whole list was read."""
+
+    def __init__(self, items=(), *, tail_confirmed: bool = True,
+                 examined: tuple[tuple[int, int], ...] | None = None) -> None:
         super().__init__(items)
         self.tail_confirmed = tail_confirmed
+        self.examined = examined
 
 
 @dataclass

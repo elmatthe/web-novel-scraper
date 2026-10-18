@@ -52,9 +52,11 @@ _SITE_SUFFIXES = (
     re.compile(r"\s*[|\-–—]\s*Free\s*Web\s*Novel.*$", re.IGNORECASE),
     re.compile(r"\s*[|\-–—]\s*FreeWebNovel.*$", re.IGNORECASE),
 )
+# The keyword must be followed by a colon, or by a dash with spaces on both sides: "Editor-in-Chief
+# Zhou frowned" and "Ed—he was always first" are story prose, not credits.
 _CREDIT = re.compile(
     r"^(?:translator|translated by|translation|tl|editor|edited by|editing|ed|proofreader|"
-    r"proofread by|proofreading|pr)\s*[:：\-–—]\s*\S",
+    r"proofread by|proofreading|pr)(?:\s*[:：]|\s+[\-–—]\s)\s*\S",
     re.IGNORECASE,
 )
 _CREDIT_MAX_LEN = 160

@@ -516,6 +516,49 @@ visible latch (now one challenge), browser teardown (live: no Camoufox process l
 worker-thread rules (no Tk off the Tk thread). Mutation check: 8 rules, all caught except one
 equivalent mutant (`finish(cancelled=True)` early return; the between-file check gives the same result).
 
+### 9.17 Checkpoint 07 result: Windows setup, independent review and release readiness (2026-10-18)
+
+Setup (ADR 017): the launcher trusts only real checks (`scripts/setup_check.py`: `python`, `base`,
+`deps`, `browsers`) and repairs only what is missing. Python 3.12/3.13 final releases only, every
+candidate executed, never a virtual environment as the base; WinGet, else the python.org 3.12.10
+installer through `scripts/install_python.ps1` (SHA-256 + PSF Authenticode, per-user, PATH
+unchanged, `PSModulePath` cleared first). Browser engines checked on disk at every start (Camoufox
+executable without downloading, GeoIP file, Playwright's `INSTALLATION_COMPLETE` for the expected
+Chromium revisions); marker files removed. Refusals before any install: folder path over 140
+characters, unwritable folder, launcher started from inside the ZIP. `VIRTUAL_ENV`, `PYTHONHOME`,
+`PYTHONPATH` cleared. Start-up stderr saved and shown. The window warns about a missing engine at
+start-up and is DPI aware. `__version__` 0.3.0; README rewritten.
+
+Launcher evidence (scratch copy in `W N (1) & !`, mapped to a short drive letter; the owner's `.venv`
+never touched): fresh build; a too-long path refused (a run from a 218-character path first failed
+with "The filename or extension is too long", which is what led to the guard); GeoIP repair; a broken
+environment rebuilt from the base install; a start-up crash shown; everyday start in 1.9 s; a 3.12-only
+build; an unwritable folder; no usable Python with the install declined. The full suite also passed
+inside the fresh 3.12 environment with exactly the pinned packages. The python.org installer download
+and verification passed (and failed closed when PowerShell could not load its signature module).
+
+Independent review (read-only reviewer over df08070..fb7dfe9), each finding reproduced, fixed and
+pinned by a test that fails without the fix:
+1. (Critical) a resume that fetched fewer pages could replace a fuller grouped file: never again.
+2. (Important) the credit-line filter deleted prose ("Editor-in-Chief Zhou frowned"): a credit now
+   needs a colon or a spaced dash.
+3. (Important) .net downward widening never ran, so unread chapters became invented gaps: widening
+   uses the window's pages only, and adapters report the spans they read (`ChapterIndex.examined`);
+   the preflight refuses rather than calling an unread number a gap.
+4. (Minor) .net page selector without ranges clamped End to page 1: pages estimated, tail not vouched.
+5. (Minor) a part-written journal line followed by another record blocked Resume: cut off on failure;
+   journal lines no longer get CRLF from `os.open` text mode on Windows.
+
+Found while preparing acceptance: on the standard path a chapter served by the saved-page cache still
+waited the inter-fetch delay (a cached 1,432-chapter .net run: ~72 min of idle waiting). Fixed in
+`_fetch_one` (no wait, counted as `RunReport.from_cache`, shown in the summary); confirmed on the real
+stack by repeating two earlier live runs from their saved pages.
+
+Acceptance aid: `files/audit_run.py` checks a finished run folder against its selection and journal
+(order, repeats, gaps, checksums, TXT/PDF headings, failures) without printing chapter text.
+
+Verification: 1,456 tests pass on Python 3.13.12 and 3.12.10; `scripts/verify.py` PASS.
+
 ## 10. Owner overrides and autonomous completion mandate (2026-10-18)
 
 The owner approved 03.2a and authorised autonomous completion of 03.2b through 07 for a **Windows-only

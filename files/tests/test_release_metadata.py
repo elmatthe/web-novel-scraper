@@ -1,8 +1,9 @@
 """Release-metadata checks (offline, no imports of the package).
 
-0.2.1 is an unreleased development section at the top of CHANGELOG.md. Briefing.md
-still records the latest released version, so the release guard checks that 0.2.0
-remains stamped and dated below the new unreleased section.
+0.3.0 is the unreleased Windows release candidate at the top of CHANGELOG.md; it is stamped with
+a date only when the owner accepts and releases it. Briefing.md still records the latest released
+version, so the release guard checks that 0.2.0 remains stamped and dated below it, and that the
+package version and every module that stamps it into saved files say 0.3.0.
 """
 
 from __future__ import annotations
@@ -45,9 +46,23 @@ def _briefing_current_version() -> str:
     return v.group(1)
 
 
-def test_changelog_top_version_is_0_2_1_unreleased() -> None:
-    assert _top_changelog_version() == "0.2.1"
-    assert "Unreleased" in _changelog_heading("0.2.1")
+def test_changelog_top_version_is_0_3_0_unreleased() -> None:
+    assert _top_changelog_version() == "0.3.0"
+    assert "Unreleased" in _changelog_heading("0.3.0")
+
+
+def _assigned(path: Path, name: str) -> str:
+    m = re.search(rf'^{name} = "([^"]+)"', path.read_text(encoding="utf-8"), re.MULTILINE)
+    assert m, f"no {name} in {path.name}"
+    return m.group(1)
+
+
+def test_the_package_and_every_saved_file_stamp_the_changelog_version() -> None:
+    package = REPO_ROOT / "scripts" / "webnovel_scraper"
+    version = _assigned(package / "__init__.py", "__version__")
+    assert version == _top_changelog_version()
+    for module in ("chapter_store.py", "html_cache.py", "run_journal.py"):
+        assert _assigned(package / module, "APP_VERSION") == version, module
 
 
 def test_briefing_current_version_is_0_2_0() -> None:

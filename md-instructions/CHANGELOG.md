@@ -3,11 +3,61 @@
 All notable changes to this project are recorded here. Versions follow semantic
 versioning.
 
-## [Unreleased] — v0.3.0 (in progress on `feature/v0.3.0-modernization`)
+## [0.3.0] — Unreleased (Windows release candidate on `feature/v0.3.0-modernization`; awaiting owner acceptance)
 
 **Release scope (owner decision 2026-10-18, ADR 013):** v0.3.0 is a **Windows-only** release
 candidate. The macOS launcher and portable code are kept, but macOS acceptance is deferred to a
 later branch; nothing here claims macOS readiness.
+
+### Added / Fixed — Windows setup, repair and release readiness (Checkpoint 07)
+- **The setup file now checks what is really there and repairs only what is missing** (ADR 017):
+  - Uses only the tested Python 3.13 or 3.12 (final releases) and actually runs each candidate: a
+    Microsoft Store "python" shortcut, a broken install, an older or newer Python, or another
+    project's virtual environment is skipped. With none available it offers to install Python 3.12
+    for your user only: through the Windows Package Manager when present, otherwise (or if that
+    fails) with the official python.org installer, which is run only after its SHA-256 and its
+    Python Software Foundation signature check out. PATH is not changed.
+  - Rebuilds the program's environment when it is missing or broken, and reinstalls packages when
+    they changed or no longer import.
+  - Checks the browser engines on disk at every start (no more marker files) and downloads only
+    the missing part: the Camoufox browser, its GeoIP data, or Chromium. If one is still missing it
+    says which website will not work.
+  - Refuses, with a plain explanation, a folder whose path is too long for Windows to load the
+    program from (over 140 characters), a folder it cannot write to, and a setup file started from
+    inside the downloaded ZIP.
+  - Works from folders whose names contain spaces, `&`, `!` or brackets, and ignores Python
+    settings left over from other tools.
+  - If the program fails to start, the error is shown in the setup window and saved to
+    `files\runtime-data\logs\last-launch-errors.log`.
+- **The window warns at start-up when a browser engine is missing**, and draws sharply on scaled
+  (125%/150%) Windows displays.
+- **Version 0.3.0** in the package (`__version__`), and the README rewritten for this release.
+- **Verified on Python 3.12.10 and 3.13.12:** the full test suite on both, and the setup file run
+  end to end from a scratch copy (a fresh build, a broken environment rebuilt, a start-up crash shown,
+  the everyday start in about 2 seconds, and a build on 3.12 alone).
+
+### Fixed — findings of the independent code review (Checkpoint 07)
+- **Resume never shrinks a saved file.** If a resume could fetch fewer chapters of a grouped file
+  than the file already held, the smaller file used to replace it. The earlier file is now kept and
+  the group stays open for a later resume; chapters it holds are not reported as failed.
+- **More story kept:** "Editor-in-Chief Zhou frowned…", "Ed—he was…" and similar opening or closing
+  lines were removed as translator credits. A credit now needs a colon or a spaced dash.
+- **Free Web Novel (.net) never reports chapters it did not read as missing:** when a list's numbers
+  run ahead of their positions, the run now reads back to the requested Start instead of calling the
+  unread chapters gaps, and a gap is only ever reported inside list pages that were read.
+- **Free Web Novel (.net) with an unreadable page selector** estimates the pages and does not shorten
+  End to the first page.
+- **Repeat runs from saved pages are fast on Free Web Novel (.net) and WebNovel:** a chapter served
+  from the saved-page cache no longer waits the delay between fetches (a cached 1,432-chapter run
+  waited about 72 minutes for nothing). The run summary now says how many chapter pages came from
+  the cache ("From the saved-page cache: N chapter page(s), no request to the site").
+- **Run journal:** a write that fails part-way (a full disk) is cut off, so the journal stays usable
+  for Resume; every journal line now ends the same way on Windows.
+- **Acceptance aid:** `files/audit_run.py <run folder>` checks a finished run against its own record
+  (chapter order, repeats and gaps, every file's checksum, TXT headings vs the recorded chapters,
+  PDF headings with `--pdf-text`, failed chapters with reasons) without printing any chapter text.
+- **Tests:** 1,456 total (31 new in `test_setup_bootstrap.py`, 5 in `test_audit_run.py`; new tests for
+  each review finding and the cache-hit pacing).
 
 ### Fixed — Stop, offline runs and memory on long runs (Checkpoint 06)
 - **Stop is prompt while files are being built.** A long "Whole selected range" or "Every X chapters"

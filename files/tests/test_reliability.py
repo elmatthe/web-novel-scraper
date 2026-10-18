@@ -119,6 +119,39 @@ def replace_job(the_job, **kw):
     return replace(the_job, allocate_run=False, **kw)
 
 
+def test_a_resume_that_fetches_fewer_chapters_never_shrinks_a_saved_file(tmp_path, store):
+    """Session 1 saves chapters 1-10 without 3; the resume can fetch only 1-2. The 9-chapter file
+    must stay as it was (not be replaced by a 2-chapter one), and only chapter 3 is a failure."""
+    import json
+    from dataclasses import replace
+
+    first_job = replace(job(tmp_path / "out", 1, 10, formats=("txt",)), chunk_size=10)
+    first = run(store, first_job, Site(10, fail_always={3}))
+    folder = first.output_dir
+    path = folder / "TXT" / "Shadow_Slave_Chapters_1-10.txt"
+    before = path.read_bytes()
+    assert before.count(b"Chapter ") == 9
+
+    logs: list[str] = []
+    again = run(store, replace_job(replace(job(folder, 1, 10, formats=("txt",)), chunk_size=10), resume=True),
+                Site(10, fail_always=set(range(3, 11))), logs=logs)
+    assert path.read_bytes() == before
+    assert any("kept Shadow_Slave_Chapters_1-10.txt as it was" in line for line in logs)
+    assert sorted(again.failed) == [3]
+    replay = replay_journal(folder / JOURNAL_FILENAME)
+    assert len(replay.publishes[("chunk-00001", "txt")]["pages"]) == 9
+    assert replay.last_end == "complete_with_problems"
+    assert [int(f["label"]) for f in replay.failures if f["seq"] > first_end_seq(replay)] == [3]
+    rows = json.loads((folder / pipeline.AUDIT_FILENAME).read_text(encoding="utf-8"))["chapters"]
+    assert {r["label"]: r["status"] for r in rows} == {
+        **{str(n): "saved" for n in range(1, 11)}, "3": "failed"}
+
+
+def first_end_seq(replay):
+    """Sequence number of the journal's first session end (records after it are the resume's)."""
+    return replay.ends[0]["seq"]
+
+
 def test_the_chapter_in_progress_when_stop_is_pressed_is_still_saved(tmp_path, store):
     cancel = threading.Event()
 
@@ -174,6 +207,36 @@ def test_while_another_window_updates_the_list_an_open_run_reads_the_saved_one(t
         report = run(store, job(tmp_path / "out", 1, 10**9, mode=OutputMode.SEPARATE), site, logs=logs)
     assert site.built == 0 and len(report.written) == 6
     assert any("another run is updating the saved chapter list" in line for line in logs)
+
+
+# ── saved-page cache hits ─────────────────────────────────────────────────────
+def test_chapters_from_the_saved_page_cache_wait_no_delay_and_are_counted(tmp_path, store):
+    """Standard (non-browser) path: a cached page made no request, so a repeat run of a cached novel
+    must not sleep the inter-fetch delay after it (1,432 cached chapters at 3 s would be 72 min)."""
+    from types import SimpleNamespace
+
+    class CachedSite(Site):
+        def __init__(self, count, cached):
+            super().__init__(count)
+            self.cached = set(cached)
+            self._rm = SimpleNamespace(last_fetch_info=None)
+
+        def fetch_chapter(self, meta, spec, **kw):
+            content = super().fetch_chapter(meta, spec, **kw)
+            if meta.index in self.cached:   # a network fetch here reports nothing, so a stale "from
+                self._rm.last_fetch_info = SimpleNamespace(from_cache=True)   # cache" must not linger
+            return content
+
+    sleeps: list[float] = []
+    logs: list[str] = []
+    the_job = ScrapeJob(novel_slug="shadow-slave", adapter_key="freewebnovel", start=1, end=4, delay=2.0,
+                        output_mode=OutputMode.SEPARATE, use_cache=True, output_dir=tmp_path / "out",
+                        allocate_run=True, formats=("txt",))
+    report = pipeline.run_scrape(the_job, adapter=CachedSite(4, cached={1, 2}), log=logs.append,
+                                 sleep_fn=sleeps.append, manifest_store=store)
+    assert report.from_cache == 2 and len(report.written) == 4
+    assert sleeps == [2.0, 2.0]                                   # after chapters 3 and 4 only
+    assert any("From the saved-page cache: 2 chapter page(s)" in line for line in logs)
 
 
 # ── memory ────────────────────────────────────────────────────────────────────

@@ -103,11 +103,9 @@ _BROWSER_CAPABLE_ADAPTERS = {"freewebnovel"}
 DEFAULT_DELAY = "3.0"
 DEFAULT_TIMEOUT = "30"     # per-request timeout (matches request_manager default)
 DEFAULT_CHUNK = "10"       # chapters per PDF in CHUNKED mode
-# Headless browser OFF by default (0.1.3). The FreeWebNovel primary path is a
-# persistent VISIBLE camoufox browser — the legacy-matched configuration Cloudflare
-# clears for (a headless browser is exactly what it blocks). A visible browser
-# window WILL appear during a FreeWebNovel scrape; that is expected (like the old
-# tool). An advanced user can still tick "Headless browser" to force it.
+# Headless browser ON by default (v0.3.0 04, headless-first): the run starts with a hidden
+# browser and the breaker opens a visible one for the rest of the run at the first Cloudflare
+# challenge (see HEADLESS_HINT). Unticking the box starts with a visible browser instead.
 DEFAULT_HEADLESS = True
 # Browser mode ON by default for Cloudflare-protected sites (FreeWebNovel). The
 # checkbox is only active for browser-capable adapters; for the HTTP-only
@@ -173,6 +171,11 @@ REFETCH_HINT = (
     "Fetches every selected chapter from the site again instead of using saved pages, and saves "
     "the new copies. Applies to the next run only."
 )
+# Browser readiness (v0.3.0 07): appended to each "engine missing" warning shown at start-up.
+BROWSER_REPAIR_HINT = (
+    "Free Web Novel (.com) uses it; close this window and run Setup_and_Run-Web-Novel-Scraper.bat "
+    "again to install it."
+)
 ADVANCED_NOTE = (
     "These settings are read when you press Start and are locked while a run is "
     "in progress."
@@ -211,7 +214,7 @@ class ScraperApp(tk.Tk):
 
     def __init__(
         self, store: SettingsStore | None = None, *, platform: str | None = None,
-        logs_dir: str | Path | None = None,
+        logs_dir: str | Path | None = None, check_browsers: bool = False,
     ) -> None:
         super().__init__()
         self.title(APP_TITLE)
@@ -310,6 +313,28 @@ class ScraperApp(tk.Tk):
             self._set_status(problem)
             self._events.report(ActivityEvent("settings", problem, WARNING, summary=True))
         self._pump.start()
+        # The launcher repairs missing browser engines before it starts the window; started any
+        # other way, the window still names a missing engine before a run fails on it. The check
+        # only looks at files, off the Tk thread so the window appears at once.
+        if check_browsers:
+            threading.Thread(
+                target=self._report_browser_readiness, name="browser-readiness", daemon=True
+            ).start()
+
+    def _report_browser_readiness(self) -> None:
+        """Worker thread: one Summary warning for each browser engine that is not installed."""
+        from webnovel_scraper import browser_env
+
+        try:
+            _mask, lines = browser_env.browser_readiness()
+        except Exception as exc:  # noqa: BLE001 - a failed check must never stop the window
+            lines = [f"MISSING Browser check failed ({type(exc).__name__}: {exc})"]
+        for line in lines:
+            if line.startswith("MISSING "):
+                self._events.emit(ActivityEvent(
+                    "setup", f"{line.removeprefix('MISSING ')}. {BROWSER_REPAIR_HINT}",
+                    WARNING, summary=True,
+                ))
 
     # ── UI construction ──────────────────────────────────────────────────────
     def _unit(self) -> int:
@@ -1812,11 +1837,33 @@ def _grouping_text(mode: OutputMode, chunk: int) -> str:
     return "one file per chapter"
 
 
+def _enable_dpi_awareness() -> None:
+    """Draw the window at the display's real resolution on Windows.
+
+    Python does not declare itself DPI aware, so at 125% or 150% display scaling Windows
+    stretches the window as a bitmap and its text looks blurred. Declared aware, Tk reports the
+    real scaling and ``appearance`` sizes fonts and spacing from it. Must run before the first
+    Tk window exists; any failure leaves Windows' default behaviour.
+    """
+    if sys.platform != "win32":
+        return
+    import ctypes
+
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)  # system aware (Windows 8.1 and later)
+    except (AttributeError, OSError):
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except (AttributeError, OSError):
+            pass
+
+
 def main() -> None:
     """GUI entry point — launched by Setup_and_Run / the package."""
+    _enable_dpi_awareness()
     store = SettingsStore()
     store.load()
-    app = ScraperApp(store)
+    app = ScraperApp(store, check_browsers=True)
     app.mainloop()
 
 

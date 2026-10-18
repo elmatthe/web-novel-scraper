@@ -1,383 +1,348 @@
 @echo off
-setlocal EnableDelayedExpansion
+setlocal EnableExtensions DisableDelayedExpansion
 cd /d "%~dp0"
 
 :: ============================================================================
-::  Setup_and_Run-Web-Novel-Scraper  --  Windows setup + launcher
+::  Setup_and_Run-Web-Novel-Scraper  --  Windows setup, repair and launcher
 :: ============================================================================
-::  WHAT THIS FILE DOES (per AI-WORKSPACE.md "Setup and Launch Files")
-::  ------------------------------------------------------------------
-::  One double-click does everything for a NON-TECHNICAL user:
-::    1. Scans the PC for Python (the one unavoidable system dependency).
-::    2. If Python is missing, asks Y/N and installs it FOR THE CURRENT USER
-::       only (user scope, no admin).
-::    3. Creates a fresh .venv IN THE REPO ROOT and installs all dependencies
-::       (scripts\requirements.txt) into it (never system-wide).
-::    4. Downloads the browser engines the Cloudflare retry ladder uses:
-::       camoufox (anti-detect Firefox, the primary browser rung) AND Chromium
-::       (for the playwright-stealth last-resort rungs). Both are contained in the
-::       repo / per-user cache - no admin, nothing system-wide.
-::    5. Launches the GUI (scripts\app.py). On every later run it acts
-::       as the launcher.
+::  One double-click does everything for a NON-TECHNICAL user, and the same
+::  double-click repairs whatever is missing:
+::    1. Checks the in-folder Python environment (.venv). If it is missing or
+::       broken, finds a working Python 3.12 or 3.13 on this PC (asking to
+::       install Python 3.12 for the current user only if there is none) and
+::       rebuilds .venv from it.
+::    2. Installs the pinned packages (scripts\requirements.txt) into .venv when
+::       they changed or no longer import - never system-wide.
+::    3. Checks the browser engines that are actually on disk (Camoufox, its
+::       GeoIP data, and Chromium for Playwright in files\bin\ms-playwright) and
+::       downloads only what is missing.
+::    4. Starts the program (scripts\app.py).
 ::
-::  SELF-HEALING: delete .venv (to move/shrink/reset the repo) and re-run -- it
-::  rebuilds from scratch. Delete Python and re-run -- it detects the absence
-::  and offers to reinstall. Re-running always returns you to a working state.
+::  Every check is real (scripts\setup_check.py runs the interpreter, imports the
+::  packages, looks for the browser files); no step trusts a marker file.
+::  Delete .venv and run this file again to rebuild it from scratch.
 ::
-::  Goal: the MINIMUM installed on the PC; everything else contained in the repo
-::  and the venv.
+::  (Delayed expansion is off on purpose: a folder name containing "!" or "&"
+::  must not break this script.)
 :: ============================================================================
 
-:: ============================================================================
-::  Configuration
-:: ============================================================================
 set "PROJECT_NAME=Web-Novel-Scraper"
-
-:: Minimum Python major.minor this project supports (platform-neutral package).
-set "PY_MIN_MAJOR=3"
-set "PY_MIN_MINOR=10"
-:: Version winget installs if Python must be installed from scratch.
-set "PYTHON_WINGET_ID=Python.Python.3.12"
-:: Official python.org fallback if winget is unavailable.
-set "PYTHON_INSTALLER_URL=https://www.python.org/ftp/python/3.12.8/python-3.12.8-amd64.exe"
-
-:: requirements.txt lives in scripts\ per AI-WORKSPACE.md.
 set "REQUIREMENTS=scripts\requirements.txt"
-
-:: Single-window GUI entry point (no separate launcher.py for this project).
 set "MAIN_SCRIPT=scripts\app.py"
+set "CHECK=scripts\setup_check.py"
+set "VENV_PY=.venv\Scripts\python.exe"
+set "VENV_PYW=.venv\Scripts\pythonw.exe"
+set "LOCK=.venv\requirements.lock"
+set "LOG_DIR=files\runtime-data\logs"
+set "LAUNCH_LOG=files\runtime-data\logs\last-launch-errors.log"
+:: Python installed when none is usable (supported: 3.12 and 3.13): the Windows Package
+:: Manager when it is there, else the verified python.org installer (scripts\install_python.ps1).
+set "PYTHON_WINGET_ID=Python.Python.3.12"
+set "PY_INSTALLER=scripts\install_python.ps1"
+:: Browsers stay inside this folder (the program sets the same default itself).
+set "PLAYWRIGHT_BROWSERS_PATH=%CD%\files\bin\ms-playwright"
+:: An activated environment or a Python variable left by another tool must not decide which
+:: Python is used or where it loads modules from (cleared for this window only).
+set "VIRTUAL_ENV="
+set "PYTHONHOME="
+set "PYTHONPATH="
+:: Windows cannot load a program part (.pyd/.dll/.exe) whose full path is longer than 259
+:: characters, and the deepest part sits about 110 characters inside this folder.
+set "MAX_FOLDER_LEN=140"
 
-:: This project does not use ffmpeg.
-set "USE_FFMPEG=0"
-
-:: Where in-repo tools/binaries are kept. Self-contained, nothing installed.
-set "BIN_DIR=%~dp0files\bin"
-
-:: ============================================================================
-::  Banner + first-run security note
-:: ============================================================================
 cls
 echo ========================================
-echo   %PROJECT_NAME% - Setup ^& Launcher
-echo   Folder: %~dp0
+echo   %PROJECT_NAME% - Setup and Launcher
 echo ========================================
+echo   Folder: "%CD%"
 echo.
-echo   This window sets up and launches the program. Setup keeps everything
-echo   inside this project folder where it can. You should not need to install
-echo   anything system-wide unless a required tool (Python) is completely
-echo   missing from this PC -- and it will ask you first if so.
+echo   This window checks, repairs and starts the program. Everything is kept
+echo   inside this folder except Python itself, which is only installed (after
+echo   asking you) if no usable Python is on this PC.
 echo.
-echo   FIRST-RUN NOTE: Because this file came from the internet, Windows (or
-echo   your work security software) may warn you the first time. If you see
-echo   "Windows protected your PC", click "More info" then "Run anyway".
-echo   This is normal and only happens once.
+echo   FIRST-RUN NOTE: Windows may say "Windows protected your PC" the first time.
+echo   Click "More info" and then "Run anyway". This only happens once.
 echo.
 
+if not exist "%MAIN_SCRIPT%" goto :missing_program
+if not exist "%CHECK%" goto :missing_program
+call :measure_folder
+if %FOLDER_LEN% GTR %MAX_FOLDER_LEN% goto :fail_long_path
+if not exist "%LOG_DIR%" mkdir "%LOG_DIR%" >nul 2>&1
+(echo ok> "%LOG_DIR%\write-check.tmp") 2>nul
+if not exist "%LOG_DIR%\write-check.tmp" goto :fail_readonly
+del "%LOG_DIR%\write-check.tmp" >nul 2>&1
+
 :: ============================================================================
-::  STEP 1 - Ensure Python (the only unavoidable system dependency)
+::  STEP 1 - The in-folder Python environment
 :: ============================================================================
-echo [Step 1 of 5] Checking for Python...
-call :detect_python
-if not defined PYTHON_OK (
-    echo.
-    echo   Python is not installed on this PC, and it is required to run this
-    echo   program. This is the ONLY tool that has to be installed onto the
-    echo   computer itself - everything else stays in this folder.
-    echo.
-    set "do_py="
-    set /p do_py=Install Python now? ^(Y/N^):
-    if /i "!do_py!"=="Y" (
-        call :install_python
-        rem PATH may be stale in this window after a fresh install; re-detect.
-        call :detect_python
-        if not defined PYTHON_OK (
-            echo.
-            echo   Python was installed but isn't visible in THIS window yet.
-            echo   Close this window, re-open it, and run this file again so the
-            echo   updated PATH takes effect.
-            echo.
-            pause
-            exit /b 1
-        )
-    ) else (
-        echo.
-        echo   Python is required. You can install it manually from
-        echo     https://www.python.org/downloads/
-        echo   During install, check "Add python.exe to PATH", then run this
-        echo   file again.
-        echo.
-        pause
-        exit /b 1
-    )
+echo [Step 1 of 4] Checking the program's Python environment...
+call :venv_healthy
+if not errorlevel 1 (
+    echo   The environment is ready.
+    goto :deps
 )
-
-:: Warn (don't block) if the present Python is older than the project minimum.
-call :check_python_version
+echo   The environment is missing or incomplete; it will be (re)built.
+call :find_python
+if errorlevel 1 call :offer_python_install
+if errorlevel 1 goto :fail_python
+call :rebuild_venv
+if errorlevel 1 goto :fail_venv
 
 :: ============================================================================
-::  STEP 2 - Virtual environment (self-healing; everything below stays in repo)
+::  STEP 2 - Packages (into .venv only)
 :: ============================================================================
-echo [Step 2 of 5] Preparing the in-folder virtual environment...
-set "VENV_OK="
-if exist ".venv\Scripts\activate.bat" set "VENV_OK=1"
-
-:: NOTE: below, %PYTHON_CMD% is used UNQUOTED on purpose. It may be the two-token
-:: command "py -3"; wrapping that in quotes makes cmd look for an executable
-:: literally named "py -3" and fail with errorlevel 9009. We already cd'd into
-:: %~dp0, so ".venv" is a relative, space-free path that needs no quoting.
-if not defined VENV_OK (
-    if exist ".venv" (
-        echo   Existing .venv looks incomplete - removing it to rebuild cleanly...
-        rmdir /s /q ".venv"
-        if exist ".venv" (
-            echo.
-            echo   ERROR: Could not remove the old .venv folder. A previous run is
-            echo   probably still open and holding it open ^("open in another
-            echo   program"^). Close any open %PROJECT_NAME% windows, then in Task
-            echo   Manager end any stray python.exe / pythonw.exe processes, and
-            echo   run this file again.
-            echo.
-            pause
-            exit /b 1
-        )
-    ) else (
-        echo   Creating a new virtual environment in this folder...
-    )
-    %PYTHON_CMD% -m venv .venv
-    if !errorlevel! neq 0 (
-        echo.
-        echo   ERROR: Failed to create the virtual environment using:
-        echo       %PYTHON_CMD% -m venv .venv
-        echo   Make sure Python installed correctly, then run this file again.
-        echo.
-        pause
-        exit /b 1
-    )
+:deps
+set "NEED_DEPS=1"
+if exist "%LOCK%" (
+    fc /b "%REQUIREMENTS%" "%LOCK%" >nul 2>&1
+    if not errorlevel 1 set "NEED_DEPS="
 )
-
-if not exist ".venv\Scripts\activate.bat" (
-    echo.
-    echo   ERROR: The virtual environment is missing its activation script.
-    echo   Delete the .venv folder in this directory and run this file again.
-    echo.
-    pause
-    exit /b 1
+if not defined NEED_DEPS (
+    "%VENV_PY%" "%CHECK%" deps >nul 2>&1
+    if errorlevel 1 set "NEED_DEPS=1"
 )
-call ".venv\Scripts\activate.bat"
+if not defined NEED_DEPS (
+    echo [Step 2 of 4] Packages are installed and up to date.
+    goto :browsers
+)
+echo [Step 2 of 4] Installing the program's packages into this folder ^(a few minutes the first time^)...
+"%VENV_PY%" -m pip install --disable-pip-version-check -r "%REQUIREMENTS%"
+if errorlevel 1 goto :fail_deps
+"%VENV_PY%" "%CHECK%" deps
+if errorlevel 1 goto :fail_deps
+copy /y "%REQUIREMENTS%" "%LOCK%" >nul 2>&1
 
 :: ============================================================================
-::  STEP 3 - Dependencies (into the venv - never system-wide, installed quietly)
+::  STEP 3 - Browser engines (checked on disk every start; only missing parts
+::  are downloaded)
 :: ============================================================================
-:: Idempotent installs: only (re)install when requirements.txt has changed since
-:: the last successful run, or when the venv was just rebuilt (no lock present).
-:: A copy of requirements.txt is stored at .venv\requirements.lock after a good
-:: install; a binary compare against it tells us whether anything changed. This
-:: is what makes a second double-click skip straight to launch.
-if exist "%REQUIREMENTS%" (
-    set "NEED_DEPS=1"
-    if exist ".venv\requirements.lock" (
-        fc /b "%REQUIREMENTS%" ".venv\requirements.lock" >nul 2>&1
-        if !errorlevel! equ 0 set "NEED_DEPS="
-    )
-    if defined NEED_DEPS (
-        echo [Step 3 of 5] Installing dependencies into the project environment...
-        python -m pip install --upgrade pip >nul 2>&1
-        python -m pip install -r "%REQUIREMENTS%"
-        if !errorlevel! neq 0 (
-            echo   ERROR: Some dependencies failed to install. See messages above.
-            pause
-            exit /b 1
-        )
-        copy /y "%REQUIREMENTS%" ".venv\requirements.lock" >nul 2>&1
-    ) else (
-        echo [Step 3 of 5] Dependencies already up to date - skipping install.
-    )
+:browsers
+echo [Step 3 of 4] Checking the browser engines...
+call :browser_mask
+if "%BROWSER_MASK%"=="0" (
+    echo   Browser engines are ready.
+    goto :launch
+)
+call :repair_browsers
+call :browser_mask
+if "%BROWSER_MASK%"=="0" (
+    echo   Browser engines are ready.
+    goto :launch
+)
+echo.
+echo   WARNING: a browser engine is still missing ^(details above^).
+echo     - Free Web Novel ^(.com^) uses these engines and may fail until they are installed.
+echo     - Free Web Novel ^(.net^) and WebNovel work without them.
+echo   Check your internet connection and run this file again to retry.
+echo.
+echo   Press any key to start the program anyway, or close this window.
+pause >nul
+
+:: ============================================================================
+::  STEP 4 - Start the program
+:: ============================================================================
+:launch
+echo.
+echo [Step 4 of 4] Starting %PROJECT_NAME%...
+echo   ^(Keep this window open while you use the program. Close the program's own
+echo    window when you are done; this window then closes after a key press.^)
+echo.
+if exist "%VENV_PYW%" (
+    "%VENV_PYW%" "%MAIN_SCRIPT%" 2> "%LAUNCH_LOG%"
 ) else (
-    echo [Step 3 of 5] Note: No requirements.txt at %REQUIREMENTS% - skipping deps.
-)
-
-:: ============================================================================
-::  STEP 3b - Browser engine for the Cloudflare / browser fetch path
-:: ============================================================================
-:: FreeWebNovel sits behind Cloudflare. The bypass engine this project actually
-:: uses is camoufox (an anti-detect Firefox) - see scripts\requirements.txt,
-:: which pins camoufox[geoip] as "the only path that clears FreeWebNovel". Its
-:: browser binary is downloaded with "python -m camoufox fetch" (~once, into the
-:: per-user camoufox cache; no admin, nothing system-wide). A marker file in the
-:: venv lets later launches skip straight past this.
-if not exist ".venv\camoufox.fetched" (
-    echo [Step 4 of 5] Downloading the camoufox browser engine ^(~once^)...
-    python -m camoufox fetch
-    if !errorlevel! neq 0 (
-        echo   WARNING: The camoufox browser download did not complete. The plain
-        echo            HTTP path still works, but the Cloudflare/browser bypass
-        echo            ^(needed for FreeWebNovel^) will not until this succeeds.
-        echo            Re-run this file to retry.
-        echo.
-    ) else (
-        echo done> ".venv\camoufox.fetched"
-    )
-) else (
-    echo [Step 4 of 5] camoufox browser engine already downloaded - skipping.
-)
-
-:: ============================================================================
-::  STEP 4b - Chromium browser engine for the playwright-stealth rescue rungs
-:: ============================================================================
-:: The LAST-RESORT Cloudflare rungs (playwright_stealth / playwright_stealth_fresh)
-:: drive a Chromium browser through Playwright. camoufox above does NOT provide
-:: Chromium, so without this download those rungs can never launch (the live
-:: "Executable doesn't exist ... playwright install" failure). We install
-:: Chromium ONLY (never full Chrome) and CONTAIN it inside the repo at
-:: files\bin\ms-playwright via PLAYWRIGHT_BROWSERS_PATH - portable, no admin,
-:: consistent with how this project keeps binaries in-folder. The same variable
-:: is exported below so the GUI finds the engine where setup put it. A sentinel
-:: file lets later launches skip the download.
-set "PLAYWRIGHT_BROWSERS_PATH=%~dp0files\bin\ms-playwright"
-if not exist ".venv\playwright.fetched" (
-    echo [Step 4b of 5] Downloading the Chromium browser engine ^(~once, into this folder^)...
-    python -m playwright install chromium
-    if !errorlevel! neq 0 (
-        echo   WARNING: The Chromium browser download did not complete. camoufox
-        echo            ^(the primary bypass^) still works; only the last-resort
-        echo            playwright-stealth rungs are unavailable until this
-        echo            succeeds. Re-run this file to retry.
-        echo.
-    ) else (
-        echo done> ".venv\playwright.fetched"
-    )
-) else (
-    echo [Step 4b of 5] Chromium browser engine already downloaded - skipping.
-)
-
-:: ============================================================================
-::  STEP 4c - Optional self-contained ffmpeg (unused by this project)
-:: ============================================================================
-if "%USE_FFMPEG%"=="1" call :ensure_ffmpeg
-if exist "%BIN_DIR%" set "PATH=%BIN_DIR%;%PATH%"
-
-:: ============================================================================
-::  STEP 5 - Launch the GUI
-:: ============================================================================
-if not exist "%MAIN_SCRIPT%" (
-    echo.
-    echo   ERROR: Could not find the program's entry point:
-    echo     %MAIN_SCRIPT%
-    echo   The repo may be incomplete - re-download it and try again.
-    echo.
-    pause
-    exit /b 1
-)
-
-echo.
-echo [Step 5 of 5] Launching %PROJECT_NAME%...
-echo   ^(Keep this window open while you use the program. To stop, close the
-echo    program's own window - do not just close this one, or a background
-echo    process can be left holding the .venv folder open.^)
-echo.
-:: Launch with pythonw (the GUI/no-console Python) so the tkinter window is the
-:: ONLY new window the user sees - no extra console pops up behind it. This setup
-:: window stays open as the live log. Fall back to plain python only if the venv
-:: somehow lacks pythonw.exe.
-set "PYW=.venv\Scripts\pythonw.exe"
-if exist "%PYW%" (
-    "%PYW%" "%MAIN_SCRIPT%"
-) else (
-    python "%MAIN_SCRIPT%"
+    "%VENV_PY%" "%MAIN_SCRIPT%" 2> "%LAUNCH_LOG%"
 )
 set "RUN_EXIT=%errorlevel%"
-
 echo.
-if not "%RUN_EXIT%"=="0" (
-    echo Program exited with code %RUN_EXIT%.
-) else (
+if "%RUN_EXIT%"=="0" (
     echo Program finished.
+) else (
+    echo The program stopped with an error ^(code %RUN_EXIT%^). Details:
+    echo ----------------------------------------
+    type "%LAUNCH_LOG%"
+    echo ----------------------------------------
+    echo These details are also saved in "%CD%\%LAUNCH_LOG%".
 )
+echo.
 pause
-endlocal
-exit /b %RUN_EXIT%
+endlocal & exit /b %RUN_EXIT%
+
+
+:: ============================================================================
+::  Failures (each says what to do)
+:: ============================================================================
+:missing_program
+echo.
+echo   ERROR: This folder is incomplete: "%MAIN_SCRIPT%" or "%CHECK%" is missing.
+echo   If you opened this file from inside the downloaded ZIP, first extract the
+echo   whole ZIP ^(right-click it, then "Extract All"^) and run this file from the
+echo   extracted folder. Otherwise download the program again.
+goto :fail_end
+
+:fail_python
+echo.
+echo   ERROR: No usable Python 3.12 or 3.13 was found, so the program cannot run.
+echo   Install Python 3.12 from https://www.python.org/downloads/release/python-31210/
+echo   ^("Windows installer (64-bit)"^), then run this file again.
+goto :fail_end
+
+:fail_venv
+echo.
+echo   ERROR: The program's environment ^(.venv^) could not be built.
+echo   If another copy of the program is open, close it first. Then delete the
+echo   .venv folder in this folder and run this file again.
+goto :fail_end
+
+:fail_deps
+echo.
+echo   ERROR: The program's packages could not be installed ^(see the messages
+echo   above^). Check your internet connection and run this file again. If it
+echo   keeps failing, delete the .venv folder in this folder and try once more.
+goto :fail_end
+
+:fail_long_path
+echo.
+echo   ERROR: This folder's location is too long for Windows: %FOLDER_LEN% characters, and the
+echo   program needs %MAX_FOLDER_LEN% or fewer ^(Windows cannot load program parts from deeper^).
+echo   Move this folder somewhere shorter - for example straight into Downloads or onto the
+echo   Desktop - and run this file again from there.
+goto :fail_end
+
+:fail_readonly
+echo.
+echo   ERROR: The program cannot save anything in this folder ^(it is read-only or
+echo   protected, for example inside "Program Files"^). Move this folder to Downloads
+echo   or the Desktop and run this file again from there.
+goto :fail_end
+
+:fail_end
+echo.
+pause
+endlocal & exit /b 1
 
 
 :: ============================================================================
 ::  Helpers
 :: ============================================================================
 
-:: ----------------------------------------------------------------------------
-:: detect_python - set PYTHON_OK and PYTHON_CMD if a usable Python is found.
-:: Tries the "py" launcher first (most reliable on Windows), then "python",
-:: then an existing in-repo venv interpreter.
-:: ----------------------------------------------------------------------------
-:detect_python
-set "PYTHON_OK="
-set "PYTHON_CMD="
-py -%PY_MIN_MAJOR% --version >nul 2>&1
-if !errorlevel! equ 0 (
-    set "PYTHON_CMD=py -%PY_MIN_MAJOR%"
-    set "PYTHON_OK=1"
-    goto :eof
-)
-python --version >nul 2>&1
-if !errorlevel! equ 0 (
-    set "PYTHON_CMD=python"
-    set "PYTHON_OK=1"
-    goto :eof
-)
-if exist ".venv\Scripts\python.exe" (
-    ".venv\Scripts\python.exe" --version >nul 2>&1
-    if !errorlevel! equ 0 (
-        set "PYTHON_CMD=.venv\Scripts\python.exe"
-        set "PYTHON_OK=1"
+:: measure_folder - FOLDER_LEN = the number of characters in this folder's full path.
+:measure_folder
+set "REST=%CD%"
+set "FOLDER_LEN=0"
+:measure_folder_loop
+if not defined REST exit /b 0
+set "REST=%REST:~1%"
+set /a FOLDER_LEN+=1
+goto :measure_folder_loop
+
+:: venv_healthy - errorlevel 0 when .venv's interpreter runs, is 3.12 or 3.13, has
+:: venv/ensurepip/tkinter, and has pip.
+:venv_healthy
+if not exist "%VENV_PY%" exit /b 1
+if not exist ".venv\pyvenv.cfg" exit /b 1
+"%VENV_PY%" "%CHECK%" python >nul 2>&1
+if errorlevel 1 exit /b 1
+"%VENV_PY%" -m pip --version >nul 2>&1
+if errorlevel 1 exit /b 1
+exit /b 0
+
+:: find_python - set BASE_PY to the first working base Python 3.12 or 3.13 (3.13
+:: first). Each candidate must actually run the check, which rejects Microsoft Store
+:: "python" redirects, broken installs, unsupported versions and virtual environments
+:: (the environment is never rebuilt from an interpreter inside one).
+:find_python
+set "BASE_PY="
+for %%V in (3.13 3.12) do (
+    if not defined BASE_PY (
+        py -%%V "%CHECK%" base >nul 2>&1
+        if not errorlevel 1 set "BASE_PY=py -%%V"
     )
 )
-goto :eof
-
-:: ----------------------------------------------------------------------------
-:: check_python_version - warn if the detected Python is below the minimum.
-:: ----------------------------------------------------------------------------
-:check_python_version
-:: "Python 3.13.12" -> tokens split on space and dot -> token 3 is the MINOR (13).
-for /f "tokens=3 delims=. " %%a in ('%PYTHON_CMD% --version 2^>^&1') do set "FOUND_MINOR=%%a"
-if defined FOUND_MINOR (
-    if !FOUND_MINOR! lss %PY_MIN_MINOR% (
-        echo   WARNING: Detected Python 3.!FOUND_MINOR!, but this project targets
-        echo            %PY_MIN_MAJOR%.%PY_MIN_MINOR% or newer. Some features may not work.
-        echo.
+if defined BASE_PY goto :found_python
+:: Then the standard python.org install folders of the supported versions (also found right
+:: after this window installed Python, before PATH is refreshed).
+for %%D in ("%LOCALAPPDATA%\Programs\Python\Python313" "%LOCALAPPDATA%\Programs\Python\Python312" "%ProgramFiles%\Python313" "%ProgramFiles%\Python312") do (
+    if not defined BASE_PY if exist "%%~D\python.exe" (
+        "%%~D\python.exe" "%CHECK%" base >nul 2>&1
+        if not errorlevel 1 set "BASE_PY="%%~D\python.exe""
     )
 )
-goto :eof
+if defined BASE_PY goto :found_python
+:: Last, whatever else is installed (accepted only if it is 3.12 or 3.13).
+py -3 "%CHECK%" base >nul 2>&1
+if not errorlevel 1 set "BASE_PY=py -3"
+if defined BASE_PY goto :found_python
+python "%CHECK%" base >nul 2>&1
+if not errorlevel 1 set "BASE_PY=python"
+if defined BASE_PY goto :found_python
+exit /b 1
+:found_python
+%BASE_PY% -c "import sys; print('  Using Python', sys.version.split()[0], 'at', sys.executable)"
+exit /b 0
 
-:: ----------------------------------------------------------------------------
-:: install_python - install Python for the current user only.
-:: ----------------------------------------------------------------------------
-:install_python
-echo   Installing Python for the current user only (no admin)...
+:: offer_python_install - ask, install Python 3.12 for this user, then find it again.
+:offer_python_install
+echo.
+echo   No usable Python 3.12 or 3.13 is installed on this PC. Python is the one
+echo   tool this program needs on the computer itself.
+set "DO_PY="
+set /p "DO_PY=  Install Python 3.12 now, for your user only (no admin)? (Y/N): "
+if /i not "%DO_PY%"=="Y" exit /b 1
 where winget >nul 2>&1
-if %errorlevel% equ 0 (
+if not errorlevel 1 (
+    echo   Installing Python 3.12 with the Windows Package Manager...
     winget install -e --id %PYTHON_WINGET_ID% --scope user --accept-source-agreements --accept-package-agreements
-    goto :eof
+    call :find_python
+    if not errorlevel 1 exit /b 0
+    echo   That did not give a usable Python; trying the official python.org installer.
 )
+:: Windows PowerShell cannot load its own modules when PSModulePath was set by PowerShell 7.
+set "PSModulePath="
+powershell -NoProfile -ExecutionPolicy Bypass -File "%PY_INSTALLER%"
+if errorlevel 1 exit /b 1
+call :find_python
+exit /b %errorlevel%
 
-echo   Windows Package Manager (winget) is not available.
-echo   Downloading the official Python installer from python.org...
-set "PYTHON_INSTALLER=%TEMP%\python-3.12-user-installer.exe"
-powershell -NoProfile -ExecutionPolicy Bypass -Command "Invoke-WebRequest -Uri '%PYTHON_INSTALLER_URL%' -OutFile '%PYTHON_INSTALLER%'"
-if !errorlevel! neq 0 (
-    echo   ERROR: Could not download Python. You can install it manually from:
-    echo     https://www.python.org/downloads/
-    echo   During install, check "Add python.exe to PATH", then run this file again.
-    echo.
-    pause
-    goto :eof
+:: rebuild_venv - replace a missing or broken .venv with a fresh one.
+:rebuild_venv
+if exist ".venv" (
+    echo   Removing the old environment...
+    rmdir /s /q ".venv" >nul 2>&1
+    if exist ".venv" (
+        echo   The old .venv is in use ^(is the program still open?^).
+        exit /b 1
+    )
 )
-"%PYTHON_INSTALLER%" /passive InstallAllUsers=0 PrependPath=1 Include_launcher=1 Include_pip=1
-goto :eof
+echo   Creating the environment in this folder...
+%BASE_PY% -m venv ".venv"
+if errorlevel 1 exit /b 1
+call :venv_healthy
+if errorlevel 1 (
+    "%VENV_PY%" -m ensurepip --upgrade >nul 2>&1
+    call :venv_healthy
+)
+exit /b %errorlevel%
 
-:: ----------------------------------------------------------------------------
-:: ensure_ffmpeg - prefer a self-contained in-repo copy; no system install.
-:: (Unused by this project; kept for parity with the template.)
-:: ----------------------------------------------------------------------------
-:ensure_ffmpeg
-where ffmpeg >nul 2>&1
-if %errorlevel% equ 0 goto :eof
-if exist "%BIN_DIR%\ffmpeg.exe" goto :eof
-goto :eof
+:: browser_mask - BROWSER_MASK = 0 when ready, else 1 Camoufox / 2 GeoIP data /
+:: 4 Chromium (added together). Problems are printed by the check itself.
+:browser_mask
+"%VENV_PY%" "%CHECK%" browsers
+set "BROWSER_MASK=%errorlevel%"
+exit /b 0
+
+:: repair_browsers - download only the missing parts.
+:repair_browsers
+set /a "NEED_CAMOUFOX=BROWSER_MASK & 1, NEED_GEOIP=BROWSER_MASK & 2, NEED_CHROMIUM=BROWSER_MASK & 4"
+if not "%NEED_CAMOUFOX%"=="0" (
+    echo   Downloading the Camoufox browser ^(about 150 MB, once^)...
+    "%VENV_PY%" -m camoufox fetch
+) else if not "%NEED_GEOIP%"=="0" (
+    echo   Downloading Camoufox's GeoIP data...
+    "%VENV_PY%" -c "from camoufox.locale import download_mmdb; download_mmdb()"
+)
+if not "%NEED_CHROMIUM%"=="0" (
+    echo   Downloading Chromium for Playwright into this folder ^(about 150 MB, once^)...
+    "%VENV_PY%" -m playwright install chromium
+)
+exit /b 0

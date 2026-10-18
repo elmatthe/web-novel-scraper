@@ -149,6 +149,7 @@ class RunOutputs:
         # Which group owns which relative path (from earlier sessions and this one).
         self._owner: dict[str, str] = {}
         self._records: dict[tuple[str, str], dict] = dict(replay.publishes) if replay else {}
+        self._earlier = bool(self._records)            # files from an earlier session exist
         for (key, _fmt), record in self._records.items():
             self._owner.setdefault(record["path"].casefold(), key)
         # (ordinal, count) of each page among the pages sharing its displayed label.
@@ -160,18 +161,24 @@ class RunOutputs:
             self._ordinal[i] = (seen[label], totals[label])
 
     # ── planning ───────────────────────────────────────────────────────────
-    def _verified(self, key: str, fmt: str) -> bool:
+    def _intact(self, key: str, fmt: str) -> Optional[dict]:
+        """The latest record of this group's file in *fmt*, if that file is still on disk exactly
+        as recorded (else ``None``: there is nothing there worth keeping)."""
         record = self._records.get((key, fmt))
-        if record is None or record["missing"]:
-            return False
+        if record is None:
+            return None
         path = self.run_dir / record["path"]
         try:
             if not path.is_file() or path.is_symlink():
-                return False
+                return None
             size, digest = file_sha256(path)
         except OSError:
-            return False
-        return size == record["size"] and digest == record["sha256"]
+            return None
+        return record if size == record["size"] and digest == record["sha256"] else None
+
+    def _verified(self, key: str, fmt: str) -> bool:
+        record = self._intact(key, fmt)
+        return record is not None and not record["missing"]
 
     def plan_fetch(self) -> list[ChapterMeta]:
         """Record already-complete groups as resumed and return the pages still needed."""
@@ -223,9 +230,35 @@ class RunOutputs:
                 continue
             self._publish(group)
         if not cancelled:
+            self._keep_saved_failures()
             for position, reason in sorted(self.failed.items()):
                 self.journal.failure(position=position, page_url=self.metas[position].url,
                                      label=self.labels[position], reason=reason)
+
+    def _keep_saved_failures(self) -> None:
+        """A chapter that failed this session but is still in an earlier session's intact file in
+        every format is saved, not failed: it is neither recorded nor reported as a failure."""
+        if not self._earlier or not self.failed:
+            return                                  # only an earlier session's file can hold one
+        held: dict[tuple[str, str], set] = {}
+
+        def holds(position: int, fmt: str) -> bool:
+            key = self._group_of[position].key
+            if (key, fmt) not in held:              # each file is checked once
+                held[(key, fmt)] = set((self._intact(key, fmt) or {}).get("pages", ()))
+            return position in held[(key, fmt)]
+
+        kept = [p for p in sorted(self.failed) if all(holds(p, fmt) for fmt in self.formats)]
+        if not kept:
+            return
+        for position in kept:
+            del self.failed[position]
+            index = self.metas[position].index
+            if index in self.report.failed:
+                self.report.failed.remove(index)
+        labels = ", ".join(self.labels[p] for p in kept[:20]) + (" …" if len(kept) > 20 else "")
+        self.log(f"  {len(kept)} chapter(s) could not be fetched again but are still in the files "
+                 f"saved earlier, which were kept: {labels}")
 
     # ── publication ────────────────────────────────────────────────────────
     def _name(self, group: OutputGroup, fmt: str, contents: list[ChapterContent]) -> str:
@@ -248,6 +281,15 @@ class RunOutputs:
         contents = [self.contents[p] for p in present]
         for fmt in self.formats:
             if fmt not in self.pending.get(group.key, ()):
+                continue
+            # Never replace an earlier file with one that lacks a chapter it holds (a resume that
+            # could not fetch every page again): keep it, and leave the group for a later resume.
+            earlier = self._intact(group.key, fmt) if missing else None
+            lost = sorted(set(earlier["pages"]) - set(present)) if earlier else []
+            if lost:
+                labels = ", ".join(self.labels[p] for p in lost[:20]) + (" …" if len(lost) > 20 else "")
+                self.log(f"  kept {Path(earlier['path']).name} as it was: it holds chapter(s) {labels} "
+                         "that could not be fetched again; Resume Existing Run tries again later")
                 continue
             relative = self._name(group, fmt, contents)
             path = self.run_dir / relative

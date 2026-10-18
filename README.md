@@ -1,41 +1,58 @@
 # Web Novel Scraper
 
 A simple desktop app for Windows that downloads web-novel chapters from supported
-sites and saves them as clean, print-ready PDFs. Pick a novel and a source site,
-choose a chapter range and how you want the chapters split up, and click **Start** —
-the app fetches the chapters and writes the PDFs to your Downloads folder. It only
-cleans up site clutter (navigation links, comment sections, blank lines); the actual
-words of the chapters and their titles are left exactly as published.
+websites and saves them as clean, print-ready **PDF** and/or plain **TXT** files.
+Pick a website and a novel, choose a chapter range and how the chapters are grouped
+into files, and click **Start**. The app fetches the chapters and writes the files to
+your Downloads folder. It only removes site clutter (navigation links, comment
+prompts, adverts for the site); the words of the chapters are kept as published, and
+every chapter starts with one heading such as `Chapter 12: The Lost Tomb`.
 
-## Supported novels and sites
+## Supported novels and websites
 
-| Novel | Site | Status in this version |
-|-------|------|------------------------|
-| Shadow Slave | Free Web Novel | ✅ Available |
+| Novel | Website | Status in this version |
+|-------|---------|------------------------|
+| Shadow Slave | Free Web Novel (.com) | ✅ Available |
 | Shadow Slave | Empire Novel | ⏳ Coming soon |
 | Shadow Slave | Telegraph | ⏳ Coming soon |
-| The Noble Queen | WebNovel | ✅ Available |
+| The Noble Queen | WebNovel (Dynamic) | ✅ Available |
 | The Noble Queen | Novel Bin | ⏳ Coming soon |
-| Reverend Insanity | Free Web Novel | ✅ Available |
-| Renegade Immortal | Free Web Novel | ✅ Available |
-| Supreme Magus | Free Web Novel | ✅ Available |
+| Reverend Insanity | Free Web Novel (.com) | ✅ Available |
+| Renegade Immortal | Free Web Novel (.com) | ✅ Available |
+| Supreme Magus | Free Web Novel (.com) | ✅ Available |
+| Lord of the Mysteries | Free Web Novel (.com) | ✅ Available |
+| Lord of the Mysteries | Free Web Novel (.net) | ✅ Available |
+| Lord of Mysteries 2: Circle of Inevitability | Free Web Novel (.com) | ✅ Available |
+| Lord of Mysteries 2: Circle of Inevitability | Free Web Novel (.net) | ✅ Available |
 
-"Coming soon" sites are listed in the app but greyed out — they're planned for a
+"Coming soon" websites are listed in the app but greyed out; they are planned for a
 later release.
 
 ## Quick start
 
-You do **not** need to install Python or anything else yourself, and you don't need
-to open a terminal.
+You do **not** need to install anything yourself, and you never need to open a
+terminal.
 
 1. Download the project as a ZIP and unzip it anywhere (Desktop, Downloads, a USB
-   stick — wherever you like).
+   stick, wherever you like).
 2. Double-click **`Setup_and_Run-Web-Novel-Scraper.bat`**.
-3. The first time, a setup window opens and gets everything ready. If Python isn't on
-   your PC, it will ask permission (just for your account — no admin needed) and
-   install it for you. It then sets up everything else inside the project folder.
+3. The first time, the setup window gets everything ready. If no suitable Python
+   (3.12 or 3.13) is on your PC, it asks first and then installs Python 3.12 for
+   your account only (no admin needed; the official installer is checked before it
+   runs). Everything else (the program's packages and its browser engines) is
+   installed **inside the project folder**.
 4. When setup finishes, the app window opens. Every time after that, the same
-   double-click takes you straight to the app.
+   double-click checks that nothing is missing, repairs anything that is, and opens
+   the app.
+
+If the program ever stops starting, delete the **`.venv`** folder inside the
+project folder and double-click the setup file again; it rebuilds everything.
+
+Keep the project folder somewhere short and writable, such as Downloads or the
+Desktop: Windows cannot load the program from a folder path longer than about 140
+characters, or from a protected place such as Program Files. The setup window
+explains it if that happens. Extract the whole ZIP first; don't run the setup
+file from inside the ZIP.
 
 ### First-run security note
 
@@ -45,77 +62,78 @@ may warn you the **first** time you run it ("Windows protected your PC"). Click
 
 ## Using the app
 
-1. Pick a **Novel**, then a **Site** (greyed-out sites aren't available yet).
-2. Set the **start** and **end** chapter (leave the end blank to grab everything).
-3. Set the **Delay between fetches (seconds)** — this is your anti-detection /
-   politeness control. Higher is slower but less likely to be blocked; the default
-   (3 seconds) is a good balance. If the site starts blocking mid-run the app also
-   **raises this delay automatically** to back off, then keeps going.
-4. Choose how to save the chapters:
-   - **Separate** — one PDF per chapter
-   - **Chunked** — a set number of chapters per PDF
-   - **Single** — all chapters in one PDF
-5. Click **Start**. Use **Stop** to cancel cleanly at any time.
+**1. Web Novel Selection**
 
-The app does not give up on a chapter easily: each chapter is retried several
-times through escalating methods, and after the main run finishes it makes a
-**second pass** over any chapters that failed (intermittent blocks often clear a
-few minutes later). Only chapters that are genuinely missing (a real "not found")
-are skipped quickly so a long run never hangs.
+- Choose the **Website**, then the **Novel** (greyed-out websites aren't available yet).
+- Set the **Start** and **End** chapter. Leave End blank to get every chapter up to the
+  latest one. If End is past the novel's latest chapter, the app lowers it to the
+  latest chapter and says so in the Activity panel. If the website's own chapter list
+  is missing a chapter, the app reports it instead of guessing.
 
-### Cloudflare handling
+**2. Output Options**
 
-Free Web Novel sits behind Cloudflare's bot protection, and Cloudflare clears for
-a **real, visible browser** while it blocks hidden (headless) automation. So for
-Free Web Novel the app uses a real browser engine **from the very first request**,
-in a **visible window** — it tries camoufox first and, if that can't get through,
-automatically falls back to a second visible browser engine (stealth Chromium); both
-are downloaded once during setup, no admin needed. You don't need to change anything
-— just press Start.
+- Tick **PDF**, **TXT** or both (at least one). PDF is on by default.
+- Choose how chapters are grouped into files:
+  - **Individual chapters**: one file per chapter
+  - **Every N chapters per file**: for example 10 chapters in each file
+  - **Whole selected range**: everything in one file
 
-**A browser window will open and stay open while a Free Web Novel scrape runs.**
-That is expected and is how the download clears Cloudflare (just like the older
-tool). Don't close it; it is reused for every chapter and closes itself when the
-run ends.
+**3. Run**
 
-Keep that window **visible on screen** while it works — a Firefox-based browser may
-have its Cloudflare-challenge timers throttled when its window is minimised or fully
-hidden behind other windows on Windows, which can slow or stall a chapter; if a
-chapter seems stuck, click into the window to bring it forward and it should resume.
+- Click **Start**. Use **Stop** to stop cleanly at any time; files already finished
+  are kept.
+- **Resume Existing Run** continues a stopped or unfinished run in its own folder. The
+  files that are already saved are checked and kept, and only what is missing is done.
 
-You normally won't touch these checkboxes:
+The app does not give up on a chapter easily: each chapter is retried through
+escalating methods, and after the main pass it makes a **second pass** over any
+chapters that failed (short blocks often clear a few minutes later). At the end the
+Activity panel lists any chapter that still could not be saved.
 
-- **Use browser mode** — on by default for Free Web Novel; leave it on.
-- **Headless browser** — *advanced*, off by default. Ticking it hides the window,
-  but Cloudflare usually blocks a hidden browser, so leave it **off**. If you do turn
-  it on and Cloudflare broadly blocks the hidden browser, the app automatically opens
-  and keeps a **visible** browser for the rest of the run; individual hard chapters may
-  also open a visible rescue browser to get through.
-- **Try fast HTTP first** — *advanced*, off by default. It tries a couple of quick
-  no-browser attempts before the browser. Plain HTTP usually trips Cloudflare on
-  Free Web Novel, so leave it **off** unless you're experimenting.
+### Advanced Settings
 
-WebNovel (Dynamic) is not behind Cloudflare and uses the fast no-browser path
-automatically — no window appears for it.
+You normally won't need these:
+
+- **Delay between fetches (seconds)**: the politeness control. Higher is slower but
+  less likely to be blocked; the default (3 seconds) is a good balance. If a website
+  starts blocking, the app also slows down on its own.
+- **Use browser mode**: on by default for Free Web Novel (.com); leave it on.
+- **Start with a hidden (headless) browser**: on by default. The browser starts
+  hidden. If Cloudflare shows a check, the app switches to a **visible** browser for
+  the rest of the run; complete the check in that window if one is shown.
+- **Try fast HTTP first**: off by default; leave it off unless you're experimenting.
+- **Use HTML cache** and **Re-download saved chapter pages on the next run**: chapter
+  pages are saved and reused, so a repeat run is much faster. The re-download box
+  fetches them fresh once.
+- **Refresh chapter list on the next run**: rebuilds the saved chapter list from the
+  website once (the old list is kept as a backup).
+
+### Browser windows
+
+Free Web Novel (.com) is behind Cloudflare's bot protection, so the app uses a real
+browser engine for it (Camoufox, with stealth Chromium as a fallback; both are
+installed by the setup file). It starts hidden; if a visible browser window opens
+during a run, that is expected. Don't close it, and keep it **on screen** (not
+minimised) while it works, because a minimised browser can stall a Cloudflare check.
+It closes itself when the run ends.
+
+Free Web Novel (.net) and WebNovel (Dynamic) don't need a browser, and no window
+appears for them.
 
 ## Where the files go
 
-By default, finished PDFs are saved to your Downloads folder in a new folder named
-for the novel, for example:
+Each run gets its own numbered folder, so a new run never overwrites an old one:
 
 ```
-C:\Users\<you>\Downloads\shadow-slave-1\
+C:\Users\<you>\Downloads\Web-Novel-Scraper-Outputs\lord-of-the-mysteries-1\
+    PDF\    the PDF files
+    TXT\    the TXT files (when TXT is ticked)
 ```
 
-You can change this before you start: click **Browse…** next to **Output folder**
-to pick any folder with the normal Windows picker, and optionally type a **Folder
-name** of your own (leave it blank to use the novel's name).
-
-Either way, a number (`-1`, `-2`, …) is added to the end, so each run creates a
-fresh folder and a new run never overwrites an old one. The app also remembers what
-it already downloaded, so if you stop and re-run **into the same folder**, it skips
-chapters you already have.
+Click **Browse…** to choose a different parent folder. Each run folder also holds a
+small run record (`run-journal.jsonl`, `run-audit.json`) that lets **Resume** pick up
+exactly where a run stopped and lists every chapter that was saved or missed.
 
 ## Platform
 
-Windows only for now. macOS support is planned for a later release.
+Windows only (Windows 10 and 11). macOS support is planned for a later release.

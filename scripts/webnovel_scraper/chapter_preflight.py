@@ -99,6 +99,14 @@ class Selection:
     range_notes: list = field(default_factory=list)    # human lines: how the range was adjusted
 
 
+def unread_spans(examined: object) -> tuple[tuple[int, int], ...]:
+    """The numbers between consecutive spans an adapter says it examined (see ``ChapterIndex``)."""
+    if not examined:
+        return ()
+    spans = sorted((int(a), int(b)) for a, b in examined)
+    return tuple((b + 1, c - 1) for (_a, b), (c, _d) in zip(spans, spans[1:]) if c - 1 >= b + 1)
+
+
 def index_tail_confirmed(metas: object) -> bool:
     """Whether a discovery result vouches that its list runs to the site's real last chapter.
 
@@ -207,6 +215,9 @@ class _Preflight:
         self._shown: set[str] = set()
         # Whether this run's discovery vouched for its tail (only then may an End be clamped).
         self.tail_confirmed = False
+        # Spans between the parts of a paginated list this run's discovery read: never examined, so
+        # a number missing there is not a gap in the site's list.
+        self.unread: tuple[tuple[int, int], ...] = ()
 
     # -- entry --------------------------------------------------------------
     def execute(self) -> Selection:
@@ -397,6 +408,7 @@ class _Preflight:
         if not metas and not effective.chapters:
             return effective, None, True
         self.tail_confirmed = index_tail_confirmed(metas)
+        self.unread = unread_spans(getattr(metas, "examined", None))
         if not self.tail_confirmed:
             self.log(
                 "WARNING: the site could not confirm that its chapter list is complete, so its "
@@ -535,7 +547,9 @@ class _Preflight:
                     unresolved.append(part)
             inner = (max(a, low_x), min(b, high_x))
             if inner[0] <= inner[1]:
-                (unresolved if inner[1] - inner[0] + 1 > MAX_TOC_GAP_RUN else gap_runs).append(inner)
+                unread = any(u <= inner[1] and inner[0] <= v for u, v in self.unread)
+                too_long = inner[1] - inner[0] + 1 > MAX_TOC_GAP_RUN
+                (unresolved if unread or too_long else gap_runs).append(inner)
         if unresolved:
             raise ChapterListRefused(self._refusal(unresolved, wholes))
 

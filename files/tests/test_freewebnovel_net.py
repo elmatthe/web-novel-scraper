@@ -14,8 +14,9 @@ import pytest
 
 from webnovel_scraper import catalog, pipeline
 from webnovel_scraper.adapters.freewebnovel_net import FreeWebNovelNetAdapter, parse_list_page
+from webnovel_scraper.chapter_preflight import ChapterListRefused, resolve_chapters
 from webnovel_scraper.chapter_store import ChapterManifestStore
-from webnovel_scraper.models import ChapterMeta, ChapterMismatchError, OutputMode, ScrapeJob
+from webnovel_scraper.models import ChapterIndex, ChapterMeta, ChapterMismatchError, OutputMode, ScrapeJob
 from webnovel_scraper.registry import REGISTRY
 from webnovel_scraper.source_identity import SourceIdentity
 from webnovel_scraper.ui import selection
@@ -145,6 +146,73 @@ def test_a_list_that_disagrees_with_its_latest_widget_never_confirms_its_tail():
 def test_a_short_last_page_never_confirms_its_tail():
     _rm, a = adapter(92, short_last=True)
     assert a.build_chapter_index(NET).tail_confirmed is False
+
+
+class ListRM(FakeRM):
+    """List pages of *positions* entries, 40 a page. With ``drift`` the site's list skips chapters
+    101-160, so the entry at position p > 100 is chapter p + 60. ``ranges=False`` labels the page
+    selector "Page k" (no "C.a - C.b" range); ``widget=False`` drops the latest-chapters widget."""
+
+    def __init__(self, positions, *, drift=False, ranges=True, widget=True):
+        super().__init__(positions)
+        self.labels = [p + 60 if drift and p > 100 else p for p in range(1, positions + 1)]
+        self.ranges, self.widget = ranges, widget
+
+    def fetch(self, url, *, use_browser=False, use_cache=None, fast_path=False):
+        self.fetched.append((url, use_cache))
+        page = int(url.split("page=")[1]) if "page=" in url else 1
+        count = len(self.labels)
+        options = "".join(
+            f'<option data-url="{NOVEL_PATH}.html{"" if p == 1 else f"?page={p}"}" value="{p}">'
+            + (f"C.{(p - 1) * 40 + 1} - C.{min(p * 40, count)}" if self.ranges else f"Page {p}")
+            + "</option>" for p in range(1, (count + 39) // 40 + 1))
+        entries = "".join(f'<li><a href="{NOVEL_PATH}/chapter-{n}-t.html" title="Chapter {n} - T{n}">x</a></li>'
+                          for n in self.labels[(page - 1) * 40: page * 40])
+        top = self.labels[-1]
+        latest = (f"<div class='m-newest1'><a href='{NOVEL_PATH}/chapter-{top}-t.html'>Chapter {top}</a></div>"
+                  if self.widget else "")
+        return (f"<html><body>{latest}<ul id='idData'>{entries}</ul>"
+                f"<select id='indexselect'>{options}</select></body></html>")
+
+
+def _resolve(tmp_path, discover, start, end):
+    store = ChapterManifestStore(tmp_path / "b", tmp_path / "r")
+    return resolve_chapters(NET, start=start, end=end, store=store, discover=discover, log=lambda _m: None)
+
+
+def test_a_list_numbered_above_its_positions_widens_down_to_start_and_invents_no_gap(tmp_path):
+    rm = ListRM(400, drift=True)
+    a = FreeWebNovelNetAdapter(request_manager=rm, log=lambda _m: None)
+    metas = a.build_chapter_index(NET, start_hint=300, end_hint=320)
+    assert rm.list_pages_read() == [1, 6, 7, 8, 9]                       # page 6 holds chapter 300
+    assert metas.examined == ((1, 40), (261, 420))
+    selection_ = _resolve(tmp_path, lambda **kw: FreeWebNovelNetAdapter(
+        request_manager=ListRM(400, drift=True), log=lambda _m: None).build_chapter_index(NET, **kw), 300, 320)
+    assert selection_.toc_gaps == [] and [int(m.index) for m in selection_.chapters] == list(range(300, 321))
+
+
+def test_numbers_between_the_list_pages_read_are_never_called_gaps(tmp_path):
+    numbers = [*range(1, 41), *range(261, 301)]
+    index = ChapterIndex([ChapterMeta(index=n, url=chapter_url(n), extra={"manifest_label": str(n)})
+                          for n in numbers], tail_confirmed=False, examined=((1, 40), (261, 300)))
+    with pytest.raises(ChapterListRefused, match="200-260"):
+        _resolve(tmp_path, lambda **_kw: index, 200, 280)
+
+
+def test_a_page_selector_without_ranges_is_estimated_and_never_vouches_for_the_end(tmp_path):
+    rm = ListRM(400, ranges=False, widget=False)
+    a = FreeWebNovelNetAdapter(request_manager=rm, log=lambda _m: None)
+    metas = a.build_chapter_index(NET, start_hint=1, end_hint=100)
+    assert set(range(1, 101)) <= {int(m.index) for m in metas} and metas.tail_confirmed is False
+    assert any("does not say which chapters each page holds" in w for w in a.warnings)
+
+    def discover(**kw):
+        return FreeWebNovelNetAdapter(request_manager=ListRM(400, ranges=False, widget=False),
+                                      log=lambda _m: None).build_chapter_index(NET, **kw)
+
+    assert _resolve(tmp_path / "a", discover, 1, 100).effective_range == (1, 100)   # not clamped to 40
+    with pytest.raises(ChapterListRefused, match="could not confirm"):
+        _resolve(tmp_path / "b", discover, 390, 500)                               # no End clamp
 
 
 def test_entries_off_the_novel_or_off_the_host_are_ignored_and_unnumbered_ones_reported():

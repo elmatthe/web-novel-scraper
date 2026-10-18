@@ -233,6 +233,7 @@ class RunReport:
     warnings: list[str] = field(default_factory=list)        # adapter + pipeline warnings
     cancelled: bool = False
     resumed: bool = False            # this session continued an earlier run folder (v0.3.0 03.3)
+    from_cache: int = 0              # chapter pages served by the saved-page cache (no request made)
     auto_slowdowns: int = 0          # how many times auto-slowdown raised the delay
     effective_delay: float = 0.0     # final inter-fetch delay; never exceeds the ceiling
     # ── 0.2.0 rescue-lane metrics (§3.16) ─────────────────────────────────────
@@ -265,6 +266,9 @@ class RunReport:
             f"  Skipped (already present): {len(self.skipped_existing)}",
             f"  Failed:  {len(self.failed)}",
         ]
+        if self.from_cache:
+            lines.append(f"  From the saved-page cache: {self.from_cache} chapter page(s), no request "
+                         "to the site")
         if self.rescued:
             lines.append(
                 f"  Rescued (hard chapters cleared by the rescue lane / sweep): "
@@ -752,7 +756,9 @@ class _RescueConductor:
         kind, payload = self._classify_primary(meta)
 
         if kind == "success":
-            if not self._from_cache():
+            if self._from_cache():
+                self.report.from_cache += 1
+            else:
                 self.breaker.record_network(is_challenge=False)
             self._store_content(meta, payload)
             return
@@ -828,7 +834,9 @@ class _RescueConductor:
                 raise ScrapeCancelled("cancelled during rate-limit retry")
             kind, payload = self._classify_primary(meta)
             if kind == "success":
-                if not self._from_cache():
+                if self._from_cache():
+                    self.report.from_cache += 1
+                else:
                     self.breaker.record_network(is_challenge=False)
                 self._store_content(meta, payload)
                 return
@@ -1718,7 +1726,14 @@ def _fetch_one(
     A non-permanent failure (a block/challenge, not a true 404) registers an
     auto-slowdown step on the pacer; a permanent 403/404 is tracked separately so
     the second-pass sweep skips it. Records each failed index at most once so a
-    sweep re-attempt does not double-count."""
+    sweep re-attempt does not double-count.
+
+    A chapter served by the saved-page cache made no request, so it is counted and the
+    inter-fetch delay is not slept after it (a repeat run of a cached novel would otherwise
+    wait the full delay per chapter for nothing)."""
+    rm = getattr(adapter, "_rm", None)
+    if rm is not None and hasattr(rm, "last_fetch_info"):
+        rm.last_fetch_info = None
     try:
         content = adapter.fetch_chapter(meta, spec)  # type: ignore[attr-defined]
     except ScrapeCancelled:
@@ -1758,7 +1773,10 @@ def _fetch_one(
         return None
     if reasons is not None:
         reasons.pop(meta.url, None)
-    if sleep_after and not _cancelled(cancel_event):
+    served = getattr(getattr(adapter, "_rm", None), "last_fetch_info", None)  # looked up again: built lazily
+    if getattr(served, "from_cache", False):
+        report.from_cache += 1
+    elif sleep_after and not _cancelled(cancel_event):
         pacer.sleep()
     return content
 

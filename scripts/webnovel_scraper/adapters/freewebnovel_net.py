@@ -57,6 +57,7 @@ class ListPage:
     urls: dict = field(default_factory=dict)              # page number -> absolute list-page url
     latest: list = field(default_factory=list)            # labels in the latest-chapters widget
     unnumbered: list = field(default_factory=list)        # entry texts without a chapter number
+    offered: set = field(default_factory=set)             # every page number the selector offers
 
 
 def _novel_path(spec: SiteSpec) -> str:
@@ -103,6 +104,7 @@ def parse_list_page(html: str, spec: SiteSpec, number: int) -> ListPage:
                 value = int(str(option.get("value", "")).strip())
             except ValueError:
                 continue
+            page.offered.add(value)
             match = _RANGE_RE.search(option.get_text(" ", strip=True))
             if match:
                 page.ranges[value] = (int(match.group(1)), int(match.group(2)))
@@ -118,6 +120,22 @@ def parse_list_page(html: str, spec: SiteSpec, number: int) -> ListPage:
 
 def _number(label: str) -> float:
     return float(label)
+
+
+def _read_spans(pages: dict) -> tuple[tuple[int, int], ...]:
+    """The chapter-number span of each unbroken run of list pages that was read (the pages between
+    two runs were not read, so nothing is known about the chapters they list)."""
+    spans: list[tuple[int, int]] = []
+    run: list[int] = []
+    for number in sorted(pages) + [None]:
+        if number is not None and (not run or number == run[-1] + 1):
+            run.append(number)
+            continue
+        values = [_number(e[0]) for n in run for e in pages[n].entries]
+        if values:
+            spans.append((int(min(values)), int(max(values))))
+        run = [number]
+    return tuple(spans)
 
 
 class FreeWebNovelNetAdapter(FreeWebNovelAdapter):
@@ -147,8 +165,18 @@ class FreeWebNovelNetAdapter(FreeWebNovelAdapter):
                 f"The chapter list page of {spec.novel_slug!r} ({spec.url}) lists no chapters; the "
                 "site's layout may have changed."
             )
-        ranges = dict(first.ranges) or {1: (1, len(first.entries))}
-        count = max(ranges)
+        count = max([1, *first.ranges, *first.urls, *first.offered])
+        # A page whose selector text gives no "C.a - C.b" range (a layout change) is placed by the
+        # first page's size; the window then widens to the real numbers, and the list's end is not
+        # vouched for.
+        size = max(1, len(first.entries) + len(first.unnumbered))
+        ranges = {n: first.ranges.get(n, ((n - 1) * size + 1, n * size)) for n in range(1, count + 1)}
+        guessed = len(first.ranges) < count if count > 1 else False
+        if guessed:
+            self._warn(
+                f"{spec.novel_slug!r}: the chapter-list page selector does not say which chapters each "
+                "page holds; pages are estimated and the list's end is not treated as the novel's end."
+            )
         urls = dict(first.urls)
         urls.setdefault(1, spec.url)
         pages: dict[int, ListPage] = {1: first}
@@ -174,13 +202,15 @@ class FreeWebNovelNetAdapter(FreeWebNovelAdapter):
 
         fetch(wanted)
         # Widen while the requested window's ends are not inside what was read (a list whose
-        # numbering drifts from its positions); bounded by the page count.
+        # numbering drifts from its positions); bounded by the page count. Only the window's own
+        # pages count: page 1 is always read, but says nothing about the chapters near Start.
+        window_low = min(wanted)
         for _ in range(count):
-            labels = [_number(e[0]) for p in pages.values() for e in p.entries]
+            labels = [_number(e[0]) for n, p in pages.items() if n >= window_low for e in p.entries]
             grow = set()
-            first_read = min(n for n in pages if n > 1) if len(pages) > 1 else 1
-            if start_hint is not None and labels and min(labels) > start_hint and first_read > 1:
-                grow.add(first_read - 1)
+            if start_hint is not None and labels and min(labels) > start_hint and window_low > 1:
+                window_low -= 1
+                grow.add(window_low)
             last_read = max(pages)
             if end_hint is not None and labels and max(labels) < end_hint and last_read < count:
                 grow.add(last_read + 1)
@@ -206,7 +236,8 @@ class FreeWebNovelNetAdapter(FreeWebNovelAdapter):
                 f"{spec.novel_slug!r}: {unnumbered} chapter-list entr{'y' if unnumbered == 1 else 'ies'} "
                 "without a chapter number were skipped."
             )
-        return ChapterIndex(metas, tail_confirmed=self._tail_confirmed(spec, pages, ranges, count))
+        tail = False if guessed else self._tail_confirmed(spec, pages, ranges, count)
+        return ChapterIndex(metas, tail_confirmed=tail, examined=_read_spans(pages))
 
     def _tail_confirmed(self, spec: SiteSpec, pages: dict, ranges: dict, count: int) -> bool:
         """The list reaches the novel's real last chapter only if its last page was read, holds as

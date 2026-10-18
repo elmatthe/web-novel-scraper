@@ -265,6 +265,16 @@ def replay_journal(path: Path) -> Replay:
 
 
 # ── the journal ──────────────────────────────────────────────────────────────
+# Binary mode on Windows: without it ``os.write`` turns each b"\n" into b"\r\n".
+_O_BINARY = getattr(os, "O_BINARY", 0)
+
+
+def _write_all(fd: int, data: bytes) -> None:
+    view = memoryview(data)
+    while view:
+        view = view[os.write(fd, view):]
+
+
 class RunJournal:
     """Writes one run folder's journal. Create a new run with :meth:`create`, continue one with
     :meth:`resume`. Not thread-safe by itself; the pipeline writes from one thread."""
@@ -274,6 +284,7 @@ class RunJournal:
         self.path = self.run_dir / JOURNAL_FILENAME
         self._seq = next_seq
         self._clock = clock
+        self._broken = False        # a failed write could not be cut back off the end of the file
 
     # -- creation -----------------------------------------------------------
     @classmethod
@@ -298,9 +309,9 @@ class RunJournal:
         })
         record = {"seq": 0, "type": "header", **header.to_json()}
         record["crc"] = record_crc(record)
-        fd = os.open(journal_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        fd = os.open(journal_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_BINARY, 0o644)
         try:
-            os.write(fd, _canonical(record) + b"\n")
+            _write_all(fd, _canonical(record) + b"\n")
             os.fsync(fd)
         finally:
             os.close(fd)
@@ -320,12 +331,27 @@ class RunJournal:
 
     # -- appending ----------------------------------------------------------
     def append(self, kind: str, **fields: object) -> dict:
+        if self._broken:
+            raise OSError("the run journal is not written to after a failed write it could not undo")
         record = {"seq": self._seq, "type": kind, "utc": self._clock(), **fields}
         record["crc"] = record_crc(record)
-        with open(self.path, "ab") as handle:
-            handle.write(_canonical(record) + b"\n")
-            handle.flush()
-            os.fsync(handle.fileno())
+        fd = os.open(self.path, os.O_WRONLY | os.O_APPEND | _O_BINARY)
+        try:
+            start = os.lseek(fd, 0, os.SEEK_END)
+            try:
+                _write_all(fd, _canonical(record) + b"\n")
+                os.fsync(fd)
+            except BaseException:
+                # A part-written line followed by another record would sit mid-file, where replay
+                # refuses it as damage; cut it off so the journal still ends at a whole record.
+                try:
+                    os.ftruncate(fd, start)
+                    os.fsync(fd)
+                except OSError:
+                    self._broken = True
+                raise
+        finally:
+            os.close(fd)
         self._seq += 1
         return record
 

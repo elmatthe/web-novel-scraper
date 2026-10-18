@@ -152,6 +152,55 @@ def test_a_torn_last_line_is_ignored_and_trimmed_before_the_next_record(tmp_path
     assert not again.torn_tail and again.last_end == "cancelled"
 
 
+def _half_then_fail(fd, data):
+    import os
+    os.write(fd, data[: len(data) // 2])
+    raise OSError(28, "No space left on device")
+
+
+def test_a_failed_append_is_cut_off_so_the_next_record_keeps_the_journal_usable(tmp_path, monkeypatch):
+    from webnovel_scraper import run_journal
+    chapters = _chapters()
+    journal = RunJournal.create(tmp_path, _header(chapters), chapters)
+    _publish(journal)
+    size = (tmp_path / JOURNAL_FILENAME).stat().st_size
+    with monkeypatch.context() as patch:
+        patch.setattr(run_journal, "_write_all", _half_then_fail)
+        with pytest.raises(OSError):
+            journal.failure(position=2, page_url=url(3), label="3", reason="HTTP 503")
+    assert (tmp_path / JOURNAL_FILENAME).stat().st_size == size        # the half line is gone
+    journal.end("failed")                                              # what _abort_run then does
+    replay = replay_journal(tmp_path / JOURNAL_FILENAME)
+    assert replay.last_end == "failed" and not replay.torn_tail and replay.failures == []
+
+
+def test_a_journal_that_cannot_undo_a_failed_write_refuses_further_records(tmp_path, monkeypatch):
+    import os
+
+    from webnovel_scraper import run_journal
+    chapters = _chapters()
+    journal = RunJournal.create(tmp_path, _header(chapters), chapters)
+
+    def no_truncate(_fd, _length):
+        raise OSError(13, "Permission denied")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(run_journal, "_write_all", _half_then_fail)
+        patch.setattr(os, "ftruncate", no_truncate)
+        with pytest.raises(OSError):
+            _publish(journal)
+    with pytest.raises(OSError, match="not written to after a failed write"):
+        journal.end("failed")
+    assert replay_journal(tmp_path / JOURNAL_FILENAME).torn_tail            # a resume trims it
+
+
+def test_journal_lines_end_with_a_bare_newline_on_every_platform(tmp_path):
+    chapters = _chapters()
+    journal = RunJournal.create(tmp_path, _header(chapters), chapters)
+    _publish(journal)
+    assert b"\r" not in (tmp_path / JOURNAL_FILENAME).read_bytes()
+
+
 @pytest.mark.parametrize("damage", ["crc", "seq", "garbage"])
 def test_a_damaged_line_before_the_end_makes_the_journal_unusable(tmp_path, damage):
     chapters = _chapters()

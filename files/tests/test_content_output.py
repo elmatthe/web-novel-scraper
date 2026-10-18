@@ -80,6 +80,24 @@ def test_credit_lines_go_only_at_the_edges():
     assert "Editor: hand me the report" in out[2]                         # mid-chapter: kept
 
 
+@pytest.mark.parametrize("line", [
+    "Editor-in-Chief Zhou frowned at the manuscript on his desk.",
+    "Ed—he was always the first to arrive.",
+    "Translation-wise, the scroll made no sense at all.",
+    "Proofreading-the dull task-fell to Lin Mo again.",
+])
+def test_prose_that_starts_like_a_credit_is_kept_even_at_the_edges(line):
+    assert not C.is_credit_line(line)
+    body = [line, "It was late.", "Story ends."]
+    assert C.clean_paragraphs(body, label=7, title="Deadline") == body
+
+
+@pytest.mark.parametrize("line", ["Translator: Atlas Studios", "TL - Foo", "Editor — Bar", "ED：Baz",
+                                  "Proofread by: Someone"])
+def test_credit_lines_need_a_colon_or_a_spaced_dash(line):
+    assert C.is_credit_line(line)
+
+
 @pytest.mark.parametrize("first,label,title", [
     ("1 Foreigners", 1, "Foreigners"),
     ("600 Correct Reaction", 600, "Correct Reaction"),

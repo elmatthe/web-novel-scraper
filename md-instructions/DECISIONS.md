@@ -5,6 +5,68 @@ See AI-WORKSPACE.md for how this fits alongside Briefing, Changelog, and Handoff
 
 ---
 
+## 017 — The Windows launcher trusts only real checks; it repairs what is missing and refuses what it cannot fix — 2026-10-18 — Claude (Opus 5.5)
+
+**Status:** Accepted (v0.3.0 Checkpoint 07)
+
+**Context:** The 0.2.x launcher accepted any `python --version` that answered (including 3.10, below
+what the code needs: `Path.is_junction` is 3.12+), judged the environment by `activate.bat` alone,
+and decided the browser engines were installed from marker files (`.venv\camoufox.fetched`,
+`.venv\playwright.fetched`) that outlive the files they describe. Camoufox's GeoIP database lives in
+the environment, so a rebuilt environment lacked it while the marker said otherwise. `pythonw` hid
+every start-up traceback. Running the new launcher from a deep scratch folder showed one more trap:
+Windows loads no `.pyd`/`.dll`/`.exe` from a path over 259 characters even with long paths enabled,
+so a fresh install there failed with "The filename or extension is too long".
+
+**Decision:**
+1. One small checker, `scripts\setup_check.py` (`python` / `deps` / `browsers`), run by the
+   interpreter being judged. No network, no downloads, nothing written. Exit codes are the contract.
+2. Python: only final 3.12 and 3.13 releases (the tested range; a newer Python counts as missing,
+   so 3.12 is offered instead of failing later on a package without a build for it). Candidates in
+   order `py -3.13`, `py -3.12`, the python.org install folders of 3.13 and 3.12, then `py -3` and
+   `python`. Each must run the checker's `base` mode (supported version, venv, ensurepip, tkinter,
+   sqlite3, ssl, and not itself a virtual environment); a Store redirect or a broken install fails
+   it. The environment is judged by its own interpreter and pip, and rebuilt when either fails.
+   With no candidate, and after the user agrees: WinGet when present, else (or after it fails) the
+   python.org 3.12.10 installer through `scripts\install_python.ps1`, downloaded into the ignored
+   `files\runtime-data\bootstrap`, run only if its SHA-256 (the value PDF-Splitter pins, re-checked
+   against a fresh download) and its Python Software Foundation signature verify, per-user, PATH
+   unchanged; then the candidates are searched again. `PSModulePath` is cleared first, because
+   Windows PowerShell cannot load its own modules when PowerShell 7 set it (seen in testing: the
+   signature check then fails closed).
+3. Packages: reinstalled when `requirements.txt` differs from the copy saved after the last good
+   install, or when any runtime package fails to import.
+4. Browsers: checked on disk at every start (Camoufox executable through
+   `camoufox_path(download_if_missing=False)`, the GeoIP file's size, Playwright's
+   `INSTALLATION_COMPLETE` markers for the exact Chromium revisions it expects). Only the missing
+   part is downloaded; if one is still missing, a plain warning names what will not work, and the
+   window repeats it at start-up.
+5. Refused up front, before anything is installed: a folder path over 140 characters (the deepest
+   program file sits 107 characters inside), a folder the program cannot write to, and a launcher
+   started from inside the ZIP (its program files are missing). `VIRTUAL_ENV`, `PYTHONHOME` and
+   `PYTHONPATH` are cleared for the launcher's window. Delayed expansion stays off so `&` and `!` in
+   folder names work.
+6. The program's stderr goes to `files\runtime-data\logs\last-launch-errors.log`, which is shown
+   when the program exits with an error.
+
+**Alternatives considered:** Keep marker files but also check them (still trusts a file over the
+thing it describes); check everything in PowerShell (slower start, a second language to maintain);
+let Python report a long path itself (it cannot load its own modules there, so the message would
+come too late and be unclear).
+
+**Consequences:** An everyday start takes about 2 seconds to the window (measured). Deleting `.venv`
+and double-clicking rebuilds everything except the per-user Camoufox browser, which is re-checked
+and kept. `test_setup_bootstrap.py` pins the checker's exit codes and the launcher's structure; the
+launcher itself was run end to end from a folder named `W N (1) & !` (fresh build, repair of the GeoIP
+file, a broken environment, a start-up crash, everyday start, a Python 3.12-only build, a folder it
+cannot write to, a too-long path, and no usable Python with the install declined). Installing Python
+itself was not exercised on this PC (it already has 3.12 and 3.13): the installer's download and
+verification were, and the no-Python install is an owner acceptance item. This follows the owner's
+bootstrap standard in PDF-Splitter's `.ai/BOOTSTRAP.md`, scaled down: one checker and one stage-0
+script rather than a full `bootstrap.py`, because this launcher's repair needs are small.
+
+---
+
 ## 016 — freewebnovel.net is its own adapter on plain HTTP; browser runs start headless and latch visible at the first challenge — 2026-10-18 — Claude (Opus 5.5)
 
 **Status:** Accepted (v0.3.0 Checkpoint 04; plan decision 5/6, §8 C9)
