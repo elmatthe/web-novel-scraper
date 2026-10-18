@@ -191,6 +191,10 @@ SUMMARY_PLACEHOLDER = (
 DETAILED_PLACEHOLDER = "Technical details (fetches, retries, cache, browser) will appear here.\n"
 # Lines kept in each displayed view; older lines scroll away (the session log keeps all).
 MAX_LOG_LINES = 5000
+# The scale an indeterminate (preparing) bar animates on. Tk advances it one unit of the bar's
+# ``maximum`` per tick (every 50 ms), so this fixes a smooth sweep (1% of the bar a tick)
+# whatever a fresh window or the last run's chapter total left in ``maximum``.
+INDETERMINATE_SPAN = 100.0
 
 # The longest final counter line (every counter present, large numbers) and the widest ETA,
 # used only to reserve room in the measured minimum window size.
@@ -1532,10 +1536,18 @@ class ScraperApp(tk.Tk):
         The outcome is read from the pipeline's RunReport (or the exception), never
         from the progress count, and it is always followed by the run-finished event."""
         processed: list[tuple[int, int]] = []
+        cached = [0]                  # chapters the saved-page cache served, as last reported
 
         def progress(done: int, total: int) -> None:
             processed[:] = [(done, total)]
-            self._thread_progress(done, total)
+            self._thread_progress(done, total, cached[0])
+
+        def phase(name: str, total: int, already_present: int, from_cache: int = 0) -> None:
+            # A new cached count alone needs no event: the next progress update carries it.
+            only_cache_moved = name == pipeline.PHASE_SCRAPING and from_cache != cached[0]
+            cached[0] = from_cache
+            if not only_cache_moved:
+                self._thread_phase(name, total, already_present)
 
         report = error = refused = None
         counts = None
@@ -1545,7 +1557,7 @@ class ScraperApp(tk.Tk):
                 log=self._thread_log,
                 cancel_event=self._cancel_event,
                 progress_cb=progress,
-                phase_cb=self._thread_phase,
+                phase_cb=phase,
             )
         except (AdapterDisabledError, ChapterListRefused, RunStorageError, JournalError) as exc:
             refused = exc
@@ -1607,10 +1619,10 @@ class ScraperApp(tk.Tk):
         except Exception:  # noqa: BLE001 - a log line must never break the scrape
             pass
 
-    def _thread_progress(self, done: int, total: int) -> None:
+    def _thread_progress(self, done: int, total: int, from_cache: int = 0) -> None:
         """The pipeline's ``progress_cb``; a pending update is replaced by a newer one."""
         try:
-            self._events.emit(run_activity.progress_event(done, total))
+            self._events.emit(run_activity.progress_event(done, total, from_cache=from_cache))
         except Exception:  # noqa: BLE001
             pass
 
@@ -1628,7 +1640,8 @@ class ScraperApp(tk.Tk):
         late routine update can never overwrite the final outcome."""
         payload = event.payload
         if isinstance(payload, run_activity.ProgressUpdate):
-            self._tracker.progress(payload.done, payload.total, payload.at)
+            self._tracker.progress(payload.done, payload.total, payload.at,
+                                   from_cache=payload.from_cache)
             self._render_run()
         elif isinstance(payload, run_activity.PhaseUpdate):
             self._tracker.phase(payload.phase, payload.total, payload.already_present,
@@ -1715,7 +1728,7 @@ class ScraperApp(tk.Tk):
         if view.indeterminate:
             # No chapter total yet (the chapter list is being prepared): no fake percentage.
             if str(bar.cget("mode")) != "indeterminate":
-                bar.configure(mode="indeterminate")
+                bar.configure(mode="indeterminate", maximum=INDETERMINATE_SPAN, value=0)
                 bar.start()
             return
         if str(bar.cget("mode")) == "indeterminate":

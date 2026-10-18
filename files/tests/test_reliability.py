@@ -232,9 +232,16 @@ def test_chapters_from_the_saved_page_cache_wait_no_delay_and_are_counted(tmp_pa
     the_job = ScrapeJob(novel_slug="shadow-slave", adapter_key="freewebnovel", start=1, end=4, delay=2.0,
                         output_mode=OutputMode.SEPARATE, use_cache=True, output_dir=tmp_path / "out",
                         allocate_run=True, formats=("txt",))
+    heard: list[tuple] = []
     report = pipeline.run_scrape(the_job, adapter=CachedSite(4, cached={1, 2}), log=logs.append,
-                                 sleep_fn=sleeps.append, manifest_store=store)
+                                 sleep_fn=sleeps.append, manifest_store=store,
+                                 progress_cb=lambda d, t: heard.append(("progress", d)),
+                                 phase_cb=lambda p, t, a, c: heard.append(("phase", c)))
     assert report.from_cache == 2 and len(report.written) == 4
+    # The observer hears each cached chapter before the tick that counts it (the window keeps
+    # them out of the ETA, since they cost no time).
+    assert heard == [("phase", 0), ("phase", 1), ("progress", 1), ("phase", 2), ("progress", 2),
+                     ("progress", 3), ("progress", 4)]
     assert sleeps == [2.0, 2.0]                                   # after chapters 3 and 4 only
     assert any("From the saved-page cache: 2 chapter page(s)" in line for line in logs)
 

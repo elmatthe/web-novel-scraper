@@ -9,6 +9,24 @@ versioning.
 candidate. The macOS launcher and portable code are kept, but macOS acceptance is deferred to a
 later branch; nothing here claims macOS readiness.
 
+### Fixed — owner acceptance, round 1 (2026-10-18)
+- **Free Web Novel (.net): Lord of the Mysteries chapter 1303 is no longer missing.** The site does
+  list it, but at a misspelt address (`/lord-of-the-mysteries/chaspter-1303-coming-to-life.html`),
+  and the chapter-list reader accepted only addresses starting `chapter-`. A link spelt differently
+  is now accepted only when it is a single page in the same novel's folder on the same site (HTTPS)
+  and the number in its address equals the chapter number its text shows. It is used exactly as the
+  site lists it (never corrected or guessed) and noted once in Detailed; the page itself passes the
+  usual checks (it shows chapter 1303). A saved chapter list without 1303 corrects itself the next
+  time a run reads that part of the list.
+- **The progress bar moves smoothly while the chapter list is prepared.** The moving block was drawn
+  on whatever scale the last draw left (1 in a new window, the last run's chapter count after a run),
+  so it flashed from end to end or jumped a fifth of the bar at a time. Every run now uses one fine
+  scale.
+- **The time estimate no longer treats chapters from saved pages as speed.** They finish at once, so
+  after a burst of them the ETA showed about a fifth of the real time and then rose for ten chapters.
+  They are now left out of the rate, like chapters a resume skips.
+- **Tests:** 1,476 total.
+
 ### Added / Fixed — Windows setup, repair and release readiness (Checkpoint 07)
 - **The setup file now checks what is really there and repairs only what is missing** (ADR 017):
   - Uses only the tested Python 3.13 or 3.12 (final releases) and actually runs each candidate: a
@@ -77,8 +95,8 @@ later branch; nothing here claims macOS readiness.
   (chapter lists, early/middle/late chapters, small end-to-end runs). The two websites are separate
   choices with separate chapter lists, saved pages and run folders; a run never mixes them.
 - **Free Web Novel (.net)** reads the site's paginated chapter list (only the pages a run needs) and
-  works over plain HTTP, with no browser window. Its list for Lord of the Mysteries skips chapter 1303
-  (reported as a gap; the .com list has it).
+  works over plain HTTP, with no browser window. (Its Lord of the Mysteries list was thought to skip
+  chapter 1303; it lists it at a misspelt address, read since the round-1 acceptance fix above.)
 - **Browser runs start hidden (headless) by default.** At the first Cloudflare check the app opens a
   visible browser for the rest of the run and retries that chapter there. A saved choice is kept.
 - The Website menu now says "Free Web Novel (.com)" and "Free Web Novel (.net)".

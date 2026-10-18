@@ -89,7 +89,7 @@ class _Run:
         event = ra.progress_event(done, total, at=self.clock)
         self.tracker.progress(event.payload.done, event.payload.total, event.payload.at)
 
-    def phase(self, phase, total, already_present) -> None:
+    def phase(self, phase, total, already_present, from_cache=0) -> None:
         self.calls.append(("phase", phase, total, already_present))
         self.clock += 1.0
         event = ra.phase_event(phase, total, already_present, at=self.clock)

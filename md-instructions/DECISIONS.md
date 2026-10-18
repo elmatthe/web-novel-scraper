@@ -98,8 +98,9 @@ run to visible only after 5 consecutive (or 9 of 20) challenges, rescuing each m
 browser-only rescue scope); using the site's AJAX list (rejected: robots.txt); keeping the 5/9 breaker
 (rejected: the approved policy is one bounded headless probe).
 
-**Consequences:** Both novels are available on both hosts. LOTM on `.net` lacks chapter 1303 in the
-site's own list (a reported TOC gap; `.com` has it). A few `.net` pages have no title (LOTM2 888,
+**Consequences:** Both novels are available on both hosts. LOTM on `.net` lists chapter 1303 at a
+misspelt address (`chaspter-1303-…`); since owner acceptance round 1 (plan §9.18) such an entry is
+used, verbatim, when its address number equals its chapter number. A few `.net` pages have no title (LOTM2 888,
 1069; LOTM 1180's list entry), which become `Chapter N: Untitled` with a warning.
 
 ---

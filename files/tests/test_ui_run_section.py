@@ -429,6 +429,95 @@ def test_a_new_run_starts_from_nothing(monkeypatch, tmp_path) -> None:
         win.destroy()
 
 
+def _bar(win) -> tuple[str, float, float]:
+    bar = win._progress
+    return str(bar.cget("mode")), float(str(bar.cget("maximum"))), float(str(bar.cget("value")))
+
+
+def test_the_preparing_bar_glides_on_every_run_instead_of_jumping(monkeypatch, tmp_path) -> None:
+    """Owner acceptance 2026-10-18: Tk moves an indeterminate bar one unit of ``maximum`` per
+    tick, so a ``maximum`` left at 1 (a fresh window) or at the last run's chapter total (3-5
+    for a small range) made the "preparing" block flash end to end or lurch a fifth of the bar
+    at a time. Every run's preparation now animates on the same fine scale, from the start."""
+    win = _make_app()
+    gate = threading.Event()
+    calls = []
+
+    def fake_run_scrape(job, *, log, cancel_event, progress_cb, phase_cb=None):
+        calls.append(1)
+        if len(calls) == 1:
+            gate.wait(5)
+            phase_cb("scraping", 5, 0)
+            progress_cb(5, 5)
+            return pipeline.RunReport(output_dir=job.output_dir, written=[Path("a.pdf")])
+        cancel_event.wait(5)
+        return pipeline.RunReport(output_dir=job.output_dir, cancelled=True)
+
+    monkeypatch.setattr(app.pipeline, "run_scrape", fake_run_scrape)
+    try:
+        win._output_parent = tmp_path
+        win._on_start()                                            # a fresh window: maximum was 1
+        mode, maximum, value = _bar(win)
+        assert (mode, maximum) == ("indeterminate", app.INDETERMINATE_SPAN) and value <= 1.0
+        gate.set()
+        win._worker.join(5)
+        win.flush_activity()
+        assert _bar(win) == ("determinate", 5.0, 5.0)              # 5 / 5 · 100%
+        win._on_start()                                            # the next run, right after
+        assert _bar(win)[:2] == ("indeterminate", app.INDETERMINATE_SPAN)
+        assert _bar(win)[2] <= 1.0                                 # not continuing from the old fill
+        assert win._counts_var.get() == "—"
+        win._cancel_event.set()
+        win._worker.join(5)
+        win.flush_activity()
+        assert _bar(win)[0] == "determinate"
+    finally:
+        gate.set()
+        if win._cancel_event is not None:
+            win._cancel_event.set()
+        win.destroy()
+
+
+def test_cached_chapters_reach_the_estimate_without_an_event_each(monkeypatch, tmp_path) -> None:
+    win = _make_app()
+    heard: list[tuple[int, int]] = []
+    phases: list[str] = []
+
+    def fake_run_scrape(job, *, log, cancel_event, progress_cb, phase_cb=None):
+        phase_cb("scraping", 41, 0, 0)
+        for n in range(1, 41):                              # the pipeline's order: count, then tick
+            phase_cb("scraping", 41, 0, n)
+            progress_cb(n, 41)
+        progress_cb(41, 41)                                 # a fetched chapter
+        phase_cb("building", 41, 0, 40)
+        return pipeline.RunReport(output_dir=job.output_dir, written=[Path("a.pdf")], from_cache=40)
+
+    real_progress, real_phase = win._tracker.progress, win._tracker.phase
+
+    def spy_progress(done, total, at=None, *, from_cache=0):
+        heard.append((done, from_cache))
+        real_progress(done, total, at, from_cache=from_cache)
+
+    def spy_phase(phase, *args, **kwargs):
+        phases.append(phase)
+        real_phase(phase, *args, **kwargs)
+
+    monkeypatch.setattr(app.pipeline, "run_scrape", fake_run_scrape)
+    monkeypatch.setattr(win._tracker, "progress", spy_progress)
+    monkeypatch.setattr(win._tracker, "phase", spy_phase)
+    try:
+        win._output_parent = tmp_path
+        win._on_start()
+        win._worker.join(5)
+        win.flush_activity()
+        assert phases == ["scraping", "building"]             # no event per cached chapter
+        assert heard and heard[-1] == (41, 40)               # each update carries its cached count
+        assert all(cached == min(done, 40) for done, cached in heard)
+        assert _view(win)[:2] == ("Complete", "41 / 41 · 100%")
+    finally:
+        win.destroy()
+
+
 def test_destroying_the_window_while_the_bar_is_indeterminate_is_clean(monkeypatch, tmp_path) -> None:
     win = _make_app()
     reached = threading.Event()

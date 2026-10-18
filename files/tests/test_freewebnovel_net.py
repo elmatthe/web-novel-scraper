@@ -274,3 +274,95 @@ def test_the_standard_path_paces_list_pages_like_chapters(tmp_path):
     assert pipeline._legacy_limiter(
         ScrapeJob(novel_slug="x", adapter_key="y", start=1, end=1, delay=0.0, output_mode=OutputMode.SEPARATE,
                   use_cache=False, output_dir=tmp_path), time.monotonic, lambda _s: None) is None
+
+
+# ── irregular chapter addresses (owner acceptance, 2026-10-18) ─────────────────
+LOTM = catalog.get_spec("lord-of-the-mysteries", "freewebnovel_net")
+# The five list entries for Lord of the Mysteries 1301-1305 exactly as freewebnovel.net served them
+# on 2026-10-18 (links and titles only): the site spells chapter 1303's address "chaspter-".
+REAL_1301_1305 = (
+    '<li><a href="/lord-of-the-mysteries/chapter-1301-new-life.html" class="con" '
+    'title="Chapter 1301 - New Life\u201c"><span class="chapter-text">Chapter 1301 - New Life</span></a></li>'
+    '<li><a href="/lord-of-the-mysteries/chapter-1302-the-scene-in-the-prophecy.html" class="con" '
+    'title="Chapter 1302 - The Scene in the Prophecy\xa0"><span>Chapter 1302</span></a></li>'
+    '<li><a href="/lord-of-the-mysteries/chaspter-1303-coming-to-life.html" class="con" '
+    'title="Chapter 1303 - Coming to Life"><span class="chapter-text">Chapter 1303 - Coming to Life</span></a></li>'
+    '<li><a href="/lord-of-the-mysteries/chapter-1304-the-importance-of-ideas.html" class="con" '
+    'title="Chapter 1304 -  The Importance of Ideas"><span>Chapter 1304</span></a></li>'
+    '<li><a href="/lord-of-the-mysteries/chapter-1305-that-black-shadow.html" class="con" '
+    'title="Chapter 1305  - That Black Shadow"><span>Chapter 1305</span></a></li>'
+)
+REAL_1303 = "https://freewebnovel.net/lord-of-the-mysteries/chaspter-1303-coming-to-life.html"
+
+
+def _lotm_page(entries: str) -> str:
+    return (f"<html><body><ul id='idData'>{entries}</ul><select id='indexselect'>"
+            "<option data-url='/lord-of-the-mysteries.html' value='1'>C.1301 - C.1305</option>"
+            "</select></body></html>")
+
+
+def test_the_real_irregular_1303_address_is_listed_as_the_site_spells_it():
+    page = parse_list_page(_lotm_page(REAL_1301_1305), LOTM, 1)
+    assert [e[0] for e in page.entries] == ["1301", "1302", "1303", "1304", "1305"]
+    assert page.entries[2] == ("1303", "Coming to Life", REAL_1303)          # not autocorrected
+    assert page.irregular == [("1303", "/lord-of-the-mysteries/chaspter-1303-coming-to-life.html")]
+    assert page.unnumbered == []
+
+
+@pytest.mark.parametrize("href, title", [
+    ("/lord-of-the-mysteries/chaspter-1304-coming-to-life.html", "Chapter 1303 - Coming to Life"),  # numbers differ
+    ("/lord-of-the-mysteries/chaspter-coming-to-life.html", "Chapter 1303 - Coming to Life"),       # no number
+    ("/lord-of-the-mysteries/chaspter-1303-coming-to-life.html", "Coming to Life"),                 # no label
+    ("/lord-of-the-mysteries/x/chaspter-1303-coming.html", "Chapter 1303 - Coming"),                # deeper path
+    ("/lord-of-the-mysteries/chaspter-1303-coming.php", "Chapter 1303 - Coming"),                   # not a page
+    ("/lord-of-the-mysteries/chaspter-1303.5-coming.html", "Chapter 1303.5 - Coming"),              # not whole
+    ("/another-novel/chaspter-1303-coming.html", "Chapter 1303 - Coming"),                          # other novel
+    ("/lord-of-the-mysteries-2/chaspter-1303-coming.html", "Chapter 1303 - Coming"),                # prefix novel
+    ("http://freewebnovel.net/lord-of-the-mysteries/chaspter-1303-c.html", "Chapter 1303 - C"),     # not https
+    ("https://evil.example/lord-of-the-mysteries/chaspter-1303-c.html", "Chapter 1303 - C"),        # other host
+    ("https://freewebnovel.net.evil.example/lord-of-the-mysteries/chaspter-1303-c.html", "Chapter 1303 - C"),
+    ("javascript:alert(1303)//lord-of-the-mysteries/chaspter-1303-c.html", "Chapter 1303 - C"),
+    ("/lord-of-the-mysteries/chaspter-1303-c%2F..%2F..%2Fx.html", "Chapter 1303 - C"),              # encoded path
+    ("/lord-of-the-mysteries.html?page=33", "Chapter 1303 - C"),                                    # list page
+])
+def test_irregular_or_unsafe_links_are_never_taken_as_chapters(href, title):
+    page = parse_list_page(_lotm_page(f'<li><a href="{href}" title="{title}">x</a></li>'), LOTM, 1)
+    assert page.entries == [] and page.irregular == []
+
+
+class IrregularRM(FakeRM):
+    """Lord of the Mysteries list pages (40 a page) whose entry for chapter 1303 has the site's
+    "chaspter-" address; chapter pages are served for any address carrying their number."""
+
+    def __init__(self, total):
+        super().__init__(total)
+        self.path = "/lord-of-the-mysteries"
+
+    def fetch(self, url, *, use_browser=False, use_cache=None, fast_path=False):
+        self.fetched.append((url, use_cache))
+        if url.startswith(f"{BASE}{self.path}.html"):
+            page = int(url.split("page=")[1]) if "page=" in url else 1
+            html = list_page(self.total, page).replace(NOVEL_PATH, self.path)
+            return html.replace(f"{self.path}/chapter-1303-", f"{self.path}/chaspter-1303-")
+        n = int(url.rsplit("/", 1)[1].split("-")[1])
+        return chapter_page(n)
+
+
+def test_lotm_1301_to_1305_selects_and_saves_all_five_chapters_including_1303(tmp_path):
+    rm = IrregularRM(1432)
+    logs: list[str] = []
+    a = FreeWebNovelNetAdapter(request_manager=rm, log=logs.append)
+    store = ChapterManifestStore(tmp_path / "b", tmp_path / "r")
+    job = ScrapeJob(novel_slug=LOTM.novel_slug, adapter_key="freewebnovel_net", start=1301, end=1305,
+                    delay=0.0, output_mode=OutputMode.SEPARATE, use_cache=False, output_dir=tmp_path / "out",
+                    allocate_run=True, formats=("txt",))
+    report = pipeline.run_scrape(job, adapter=a, request_manager=rm, log=logs.append,
+                                 sleep_fn=lambda _s: None, manifest_store=store)
+    assert report.effective_range == (1301, 1305) and not report.failed
+    assert sorted(p.name for p in (report.output_dir / "TXT").glob("*.txt"))[2].startswith("Chapter 1303_")
+    assert len(list((report.output_dir / "TXT").glob("*.txt"))) == 5
+    assert f"{BASE}/lord-of-the-mysteries/chaspter-1303-1303-title-1303.html" in [u for u, _ in rm.fetched]
+    assert sorted({int(u.split("page=")[1]) if "page=" in u else 1 for u, _ in rm.fetched
+                   if ".html?page=" in u or u.endswith("mysteries.html")}) == [1, 32, 33, 34]
+    assert sum("irregular address" in line for line in logs) == 1
+    assert not any("not on the site's list" in line or "gap" in line.lower() for line in logs)

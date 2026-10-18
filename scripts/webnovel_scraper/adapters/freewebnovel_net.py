@@ -8,7 +8,10 @@ addresses (live evidence 2026-10-18, recorded in the plan §9.15):
   position range ("C.41 - C.80") and a "Latest Chapters" widget (``.m-newest1``).
 * Chapter addresses are descriptive and cannot be generated from a number
   (``/lord-of-the-mysteries/chapter-1-crimson.html``), so the list pages are the only source of
-  addresses. The site's own ``/ajax-chapter-list`` endpoint is never used (``robots.txt`` disallows
+  addresses. A few are misspelt by the site and are used exactly as listed (Lord of the Mysteries
+  1303 is ``/lord-of-the-mysteries/chaspter-1303-coming-to-life.html``); such an entry is taken only
+  when its address is a single ``word-N-….html`` page of the same novel whose N equals the entry's
+  chapter number. The site's own ``/ajax-chapter-list`` endpoint is never used (``robots.txt`` disallows
   ``/ajax-``).
 * A chapter page has the same reader structure as ``.com`` closely enough for the shared FreeWebNovel
   extraction: heading ``h1.chapter``, body ``#chapter-content`` (the reader's text-to-speech widget
@@ -46,6 +49,8 @@ logger = logging.getLogger(__name__)
 PAGE_SIZE = 40                  # chapters per list page (observed; the selector is authoritative)
 _PAGE_MARGIN = 1                # extra list pages read on each side of the requested window
 _RANGE_RE = re.compile(r"C\.\s*(\d+)\s*-\s*C\.\s*(\d+)", re.IGNORECASE)
+# A chapter page under the novel's folder whose prefix is not spelt "chapter" ("chaspter-1303-…").
+_IRREGULAR_RE = re.compile(r"[a-z]+-(\d+)(?:-[a-z0-9-]*)?\.html")
 _LABEL_KEY = "manifest_label"
 
 
@@ -58,6 +63,7 @@ class ListPage:
     latest: list = field(default_factory=list)            # labels in the latest-chapters widget
     unnumbered: list = field(default_factory=list)        # entry texts without a chapter number
     offered: set = field(default_factory=set)             # every page number the selector offers
+    irregular: list = field(default_factory=list)         # (label, path) entries at misspelt addresses
 
 
 def _novel_path(spec: SiteSpec) -> str:
@@ -67,17 +73,25 @@ def _novel_path(spec: SiteSpec) -> str:
 
 
 def _entry(anchor, base: str, novel_path: str):
+    """``(label, raw text, url, irregular)`` for a chapter link of this novel, else None. A link
+    whose address is not ``<novel>/chapter-….html`` counts only when it is one ``word-N-….html`` page
+    in the novel's folder and N is the whole chapter number its text shows; nothing is corrected."""
     href = anchor.get("href") or ""
     absolute = urljoin(base, href)
     parts = urlsplit(absolute)
     if parts.scheme != "https" or (parts.hostname or "") != urlsplit(base).hostname:
         return None
-    if not parts.path.startswith(novel_path + "/chapter-") or not parts.path.endswith(".html"):
-        return None
     raw = anchor.get("title") or anchor.get_text(" ", strip=True)
     raw = normalize_text(html_lib.unescape(raw))
     label, _rest = parse_heading(raw)
-    return label, raw, f"https://{parts.hostname}{parts.path}"
+    url = f"https://{parts.hostname}{parts.path}"
+    if parts.path.startswith(novel_path + "/chapter-") and parts.path.endswith(".html"):
+        return label, raw, url, False
+    folder, _, name = parts.path.rpartition("/")
+    match = _IRREGULAR_RE.fullmatch(name)
+    if folder != novel_path or match is None or label is None or label != match.group(1):
+        return None
+    return label, raw, url, True
 
 
 def parse_list_page(html: str, spec: SiteSpec, number: int) -> ListPage:
@@ -92,10 +106,12 @@ def parse_list_page(html: str, spec: SiteSpec, number: int) -> ListPage:
         parsed = _entry(anchor, base, novel_path)
         if parsed is None:
             continue
-        label, raw, url = parsed
+        label, raw, url, irregular = parsed
         if label is None:
             page.unnumbered.append(raw)
             continue
+        if irregular:
+            page.irregular.append((label, urlsplit(url).path))
         page.entries.append((label, clean_title(raw, label), url))
     select = soup.select_one("#indexselect")
     if select is not None:
@@ -224,6 +240,9 @@ class FreeWebNovelNetAdapter(FreeWebNovelAdapter):
         unnumbered = 0
         for number in sorted(pages):
             unnumbered += len(pages[number].unnumbered)
+            for label, path in pages[number].irregular:
+                self._log(f"{spec.novel_slug!r}: chapter {label} is listed at an irregular address "
+                          f"({path}); it is used exactly as the site lists it.")
             for label, title, url in pages[number].entries:
                 if url in seen:
                     continue

@@ -384,6 +384,33 @@ def test_chapters_that_resume_skipped_do_not_speed_up_the_estimate() -> None:
     assert tracker.eta_seconds(now=30.0) == pytest.approx(47 * 10.0)
 
 
+def test_chapters_from_the_saved_page_cache_do_not_speed_up_the_estimate() -> None:
+    """Owner acceptance 2026-10-18: cached chapters finish at once (no request, no delay), so a
+    burst of them before the first fetched chapter made the ETA show 41 s for 203 s of work and
+    then climb for ten chapters. Like resume skips, they are left out of the rate."""
+    tracker, _ = _scraping(total=100, at=0.0)
+    t = 0.0
+    for n in range(1, 41):                               # 40 chapters from the saved-page cache
+        t += 0.01
+        tracker.progress(n, 100, at=t, from_cache=n)
+    assert tracker.eta_seconds(now=t) is None
+    shown = []
+    for n in range(41, 61):                              # then fetched at the 3.5 s delay
+        t += 3.5
+        tracker.progress(n, 100, at=t, from_cache=40)
+        shown.append((tracker.eta_seconds(now=t), (100 - n) * 3.5))
+    assert shown[0][0] is None and shown[1][0] is None   # two fetched chapters are not evidence
+    for eta, real in shown[2:]:
+        assert eta == pytest.approx(real, rel=0.05)     # never the 5x under-estimate
+
+
+def test_the_cached_count_never_goes_backwards() -> None:
+    tracker, _ = _scraping(total=10, at=0.0)
+    tracker.progress(4, 10, at=0.1, from_cache=4)
+    tracker.progress(5, 10, at=10.0, from_cache=0)       # an older snapshot cannot undo the 4
+    assert tracker._eta._fetched == 1
+
+
 def test_skips_that_arrive_between_fetched_chapters_stay_out_of_the_rate() -> None:
     tracker, _ = _scraping(total=20, at=0.0)
     done = 0

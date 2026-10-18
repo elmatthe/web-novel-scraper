@@ -477,7 +477,7 @@ requests in total; metadata only kept, in the session scratch area, nothing comm
 | Novel | Website | Index / TOC | Chapters listed | Sampled live (adapter) | E2E run | Result |
 |---|---|---|---|---|---|---|
 | Lord of the Mysteries | `.com` | `/novel/lord-of-the-mysteries` (identity) | 1-1432 | 1, 700, 1303, 1432 (HTTP), 2 headless + 3 visible Camoufox | 1-3 PDF+TXT, headless | **Enabled** |
-| Lord of the Mysteries | `.net` | `/lord-of-the-mysteries.html?page=1..36` | 1431 entries, 1-1432, **1303 not listed** | 1, 700, 1180, 1302, 1304, 1432 | 1-3; 1301-1305 (gap 1303 reported) | **Enabled** |
+| Lord of the Mysteries | `.net` | `/lord-of-the-mysteries.html?page=1..36` | 1432 entries, 1-1432 (1303 at a misspelt `chaspter-` address; dropped until §9.18) | 1, 700, 1180, 1302, 1303, 1304, 1432 | 1-3; 1301-1305 (all five since §9.18) | **Enabled** |
 | LOTM 2: Circle of Inevitability | `.com` | `/novel/lord-of-mysteries-2-circle-of-inevitability` | 1-1181 | 1, 600, 888, 1181 | 1-3 single file, headless | **Enabled** |
 | LOTM 2: Circle of Inevitability | `.net` | `/lord-of-mysteries-2-circle-of-inevitability.html?page=1..30` | 1-1181 | 1, 600, 888, 1069, 1180, 1181 | 1-3 chunked; 1180-5000 clamped to 1181 | **Enabled** |
 
@@ -485,7 +485,7 @@ Also smoke-tested live after the 05 cleanup changes: Shadow Slave, Reverend Insa
 Immortal, Supreme Magus (offset reconciliation, chapters 4-5) on `.com` headless, and The Noble Queen
 on WebNovel (HTTP): all saved. `.com`/`.net` sampled chapters agree in paragraph count (LOTM2 888:
 52 vs 53) and are byte-identical for late chapters. Known source irregularities: `.net` LOTM list
-omits 1303; `.net` pages without titles (LOTM2 888, 1069; LOTM 1180 list entry) -> `Untitled` with a
+gives 1303 a misspelt address (`chaspter-1303-…`; dropped until §9.18); `.net` pages without titles (LOTM2 888, 1069; LOTM 1180 list entry) -> `Untitled` with a
 warning; `.net` titles repeat the number ("1 Foreigners") and double-escape quotes (handled); a stray
 quote in one source title ("New Life“") is kept as published. Not run: any full-novel download.
 
@@ -558,6 +558,36 @@ Acceptance aid: `files/audit_run.py` checks a finished run folder against its se
 (order, repeats, gaps, checksums, TXT/PDF headings, failures) without printing chapter text.
 
 Verification: 1,456 tests pass on Python 3.13.12 and 3.12.10; `scripts/verify.py` PASS.
+
+### 9.18 Owner acceptance round 1: fixes (2026-10-18)
+
+The owner's nine small GUI runs (29 PDFs, no chapter failures) found two problems.
+
+1. **.net LOTM 1301-1305 saved four chapters.** Confirmed with two requests (list page 33, chapter
+   1303): the site lists 1303 at `/lord-of-the-mysteries/chaspter-1303-coming-to-life.html`, and the
+   page is real (heading "Chapter 1303", full text). Root cause: `_entry()` accepted only
+   `<novel>/chapter-*.html`. A URL-prefix defect, not a label or discovery one. Fix: another spelling
+   is accepted only when the address is one `word-N[-slug].html` page directly in the novel's folder,
+   HTTPS on the same host, and N equals the whole chapter number the entry's text shows; it is kept
+   verbatim and noted once in the log. Nothing is fabricated. Discovery stays bounded (pages 1 and
+   32-34 for this window), and the chapter page's displayed-number check still applies. Live re-run
+   (scratch copy of the owner's saved list): all five saved, the saved list corrected itself from
+   159 to 160 entries, `audit_run.py` passes.
+2. **Progress bar jerky across runs.** Confirmed on screen with `identify()`: in indeterminate mode
+   Tk advances the bar one unit of `maximum` per 50 ms tick, and `_render_run` left `maximum` at 1 (a
+   fresh window: the block flipped end to end every tick) or at the last run's total (3-5 for a small
+   range: fifth-of-the-bar jumps). Fix: indeterminate mode always uses `maximum=100`, starting from 0.
+   Also confirmed, by simulation: cached chapters (instant since 07) were counted in the ETA's rate,
+   so after 40 cached chapters the ETA read 41 s for 203 s of work and climbed for ten chapters.
+   Fix: `phase_cb` gains a fourth argument, `from_cache` (the report's count, sent before the tick
+   that includes it); the window attaches it to each progress update, and the tracker leaves those
+   chapters out of the rate as it does resume skips.
+   Checked and found sound: counts never go backwards or past the total, each run starts from a
+   clean state, events of one run cannot reach the next, Stop/failure/refusal states, and Tk access
+   only on the Tk thread.
+
+Verification: 1,476 tests pass on Python 3.13.12 and 3.12.10; `scripts/verify.py` PASS; each fix
+mutation-checked.
 
 ## 10. Owner overrides and autonomous completion mandate (2026-10-18)
 

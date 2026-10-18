@@ -134,15 +134,18 @@ class ChapterIndexUnavailable(RuntimeError):
 LogFn = Callable[[str], None]
 ProgressFn = Callable[[int, int], None]
 
-# Observability only (v0.3.0 Checkpoint 02.2): ``phase_cb(phase, total, already_present)``.
-# It tells a front end where the run is, which ``progress_cb(done, total)`` cannot, and
-# changes nothing the pipeline does. ``total`` is the number of selected chapters (source
-# pages, however many PDFs they make), ``already_present`` how many of them resume has
-# skipped so far. Calls: PHASE_SCRAPING once the selected chapters are known (before the
-# first fetch) and again whenever resume skips more of them; PHASE_BUILDING just before
-# CHUNKED/SINGLE output is assembled (SEPARATE writes each PDF as its chapter lands, so it
-# has no build step). A raising observer is ignored: it can never fail or alter a run.
-PhaseFn = Callable[[str, int, int], None]
+# Observability only (v0.3.0 Checkpoint 02.2):
+# ``phase_cb(phase, total, already_present, from_cache)``. It tells a front end where the run
+# is, which ``progress_cb(done, total)`` cannot, and changes nothing the pipeline does.
+# ``total`` is the number of selected chapters (source pages, however many PDFs they make),
+# ``already_present`` how many of them resume has skipped so far and ``from_cache`` how many
+# of the processed ones the saved-page cache served (no request, no delay; a front end keeps
+# both out of its time estimate). Calls: PHASE_SCRAPING once the selected chapters are known
+# (before the first fetch) and again, before the tick that counts it, whenever resume skips
+# more of them or the cache serves another; PHASE_BUILDING just before CHUNKED/SINGLE output
+# is assembled (SEPARATE writes each PDF as its chapter lands, so it has no build step). A
+# raising observer is ignored: it can never fail or alter a run.
+PhaseFn = Callable[[str, int, int, int], None]
 PHASE_SCRAPING = "scraping"
 PHASE_BUILDING = "building"
 
@@ -1501,7 +1504,8 @@ def _prepare_run(
         if job.output_mode is OutputMode.SEPARATE:
             _record_duplicate_output_numbers(metas, report, log)
         fetch_list = outputs.plan_fetch()
-        state = _Progress(total=len(metas), cb=progress_cb, phase_cb=phase_cb)
+        state = _Progress(total=len(metas), cb=progress_cb, phase_cb=phase_cb,
+                          cached=lambda: report.from_cache)
         state.phase(PHASE_SCRAPING)
         done = outputs.resumed_positions
         if done:
@@ -1668,21 +1672,28 @@ class _Progress:
     """Tiny done/total tracker that forwards to the GUI progress callback.
 
     ``done`` counts selected chapters that reached an end state (saved, failed or already
-    present), each exactly once. ``skipped`` is the already-present share of ``done``."""
+    present), each exactly once. ``skipped`` is the already-present share of ``done`` and
+    ``cached`` how many chapter pages the saved-page cache served (read from the report)."""
 
     def __init__(
-        self, total: int, cb: Optional[ProgressFn], phase_cb: Optional[PhaseFn] = None
+        self, total: int, cb: Optional[ProgressFn], phase_cb: Optional[PhaseFn] = None,
+        cached: Optional[Callable[[], int]] = None,
     ) -> None:
         self.total = total
         self.done = 0
         self.skipped = 0
+        self.cached = 0
         self._cb = cb
         self._phase_cb = phase_cb
+        self._cached = cached
 
     def tick(self, n: int = 1, *, skipped: bool = False) -> None:
         self.done += n
         if skipped:
             self.skipped += n
+        cached = self._cached() if self._cached is not None else self.cached
+        if skipped or cached != self.cached:
+            self.cached = cached
             self.phase(PHASE_SCRAPING)
         if self._cb is not None:
             self._cb(self.done, self.total)
@@ -1692,7 +1703,7 @@ class _Progress:
         if self._phase_cb is None:
             return
         try:
-            self._phase_cb(phase, self.total, self.skipped)
+            self._phase_cb(phase, self.total, self.skipped, self.cached)
         except Exception:  # noqa: BLE001 - an observer must never affect the run
             pass
 

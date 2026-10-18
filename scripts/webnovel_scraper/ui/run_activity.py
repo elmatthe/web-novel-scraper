@@ -88,11 +88,13 @@ OUTCOMES = ("completed", "completed_with_problems", "nothing_written", "stopped"
 class ProgressUpdate:
     """``progress_cb(done, total)``: chapters processed out of the selected range. ``at`` is
     when the worker made the call (``time.monotonic``), so the ETA measures the work, not
-    how long the update waited to be drawn."""
+    how long the update waited to be drawn. ``from_cache`` is how many of the ``done`` the
+    saved-page cache served, as the pipeline last said (``phase_cb``) before this call."""
 
     done: int
     total: int
     at: float | None = None
+    from_cache: int = 0
 
 
 @dataclass(frozen=True)
@@ -133,11 +135,12 @@ def pipeline_event(text: str) -> ActivityEvent:
     return ActivityEvent(ORIGIN_PIPELINE, text, severity, summary)
 
 
-def progress_event(done: int, total: int, at: float | None = None) -> ActivityEvent:
+def progress_event(done: int, total: int, at: float | None = None, *,
+                   from_cache: int = 0) -> ActivityEvent:
     """Routine progress: a pending update is replaced by a newer one, never queued twice."""
     stamp = time.monotonic() if at is None else at
     return ActivityEvent(ORIGIN_RUN, kind="job",
-                         payload=ProgressUpdate(int(done), int(total), stamp),
+                         payload=ProgressUpdate(int(done), int(total), stamp, int(from_cache)),
                          coalesce_key=PROGRESS_KEY)
 
 

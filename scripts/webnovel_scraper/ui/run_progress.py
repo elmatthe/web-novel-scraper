@@ -15,6 +15,8 @@ What the numbers mean
   run has got, never how much of it worked, so 100% processed is not 100% successful.
 * **Already present** is the share of ``done`` that resume skipped, reported by the pipeline's
   optional ``phase_cb``. It is also what keeps the ETA honest: skipped chapters cost no time.
+  Chapters the saved-page cache served cost none either (no request and no delay), so the
+  count of them each progress update carries is kept out of the ETA's rate the same way.
 * **PDFs written**, **failed**, **recovered** and anything else about results come only from
   the final ``RunReport`` (:class:`FinalCounts`). One PDF can hold many chapters.
 * **Phase** is what the pipeline said (``phase_cb``) and nothing is guessed: no chapter total
@@ -254,6 +256,7 @@ class RunTracker:
         self._done: int | None = None
         self._total: int | None = None
         self._already_present = 0
+        self._from_cache = 0
         self._outcome: str | None = None
         self._counts: FinalCounts | None = None
         self._eta = EtaEstimator()
@@ -296,7 +299,8 @@ class RunTracker:
         if phase == BUILDING:
             self._eta.reset()
 
-    def progress(self, done: int, total: int, at: float | None = None) -> None:
+    def progress(self, done: int, total: int, at: float | None = None, *,
+                 from_cache: int = 0) -> None:
         if not self.active:
             return
         at = self._clock() if at is None else at
@@ -308,8 +312,9 @@ class RunTracker:
             self._phase = self._state = SCRAPING
         self._total = total
         self._done = max(self._done or 0, min(done, total))
+        self._from_cache = max(self._from_cache, from_cache)
         if self._phase == SCRAPING:
-            self._eta.update(self._done, total, self._already_present, at)
+            self._eta.update(self._done, total, self._already_present + self._from_cache, at)
 
     def stop_requested(self) -> None:
         if self.active:
