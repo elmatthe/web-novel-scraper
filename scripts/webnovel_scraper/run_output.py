@@ -19,8 +19,11 @@ Both pipeline paths hand every chapter they obtain to one :class:`RunOutputs`. I
   groups are skipped without any network or cache read; everything else is fetched (the HTML cache
   makes repeats cheap) and rendered again. A group that was published with pages missing is
   re-rendered once they are obtained.
-* **Cancel.** Individual chapters are published as they arrive. A grouped file is published at the
-  end, or on Stop only if every page of the group was obtained (never a partial group on Stop).
+* **Cancel.** Individual chapters are published as they arrive (the chapter in progress when Stop
+  is pressed is finished). Grouped files are built at the end; after Stop none are built (their
+  pages are in the HTML cache, so Resume builds them), and Stop pressed while they are being built
+  ends the build at the next chapter of the file in progress (v0.3.0 06). Nothing partial is ever
+  published by a Stop.
 """
 
 from __future__ import annotations
@@ -38,7 +41,7 @@ from .run_journal import FORMATS, Replay, RunJournal, file_sha256
 FORMAT_DIRS = {"pdf": "PDF", "txt": "TXT"}
 _TEMP_SUFFIXES = (".part", ".tmp")
 
-Renderer = Callable[[str, list, Path, str], None]   # (format, contents, path, title)
+Renderer = Callable[..., None]   # (format, contents, path, title, *, cancel_event=None)
 
 
 @dataclass(frozen=True)
@@ -117,6 +120,7 @@ class RunOutputs:
         report: object,
         log: Callable[[str], None],
         replay: Optional[Replay] = None,
+        cancel_event: Optional[object] = None,
     ) -> None:
         if not formats or any(f not in FORMATS for f in formats):
             raise ValueError(f"unsupported output formats: {formats!r}")
@@ -133,7 +137,12 @@ class RunOutputs:
         self.groups = plan_groups(len(self.metas), mode, chunk_size)
         self._group_of = {p: g for g in self.groups for p in g.positions}
         self._position = {m.url: i for i, m in enumerate(self.metas)}
+        self.cancel_event = cancel_event
+        # Content waiting to be published (released once its file is written, so a long run does
+        # not keep the whole novel's text in memory), and what the audit needs afterwards.
         self.contents: dict[int, ChapterContent] = {}
+        self.obtained: set[int] = set()
+        self.titles: dict[int, str] = {}
         self.failed: dict[int, str] = {}
         self.pending: dict[str, set[str]] = {}         # group key -> formats still to publish
         self.resumed_positions: list[int] = []
@@ -184,6 +193,8 @@ class RunOutputs:
         """A page's content is ready; an individual-chapter file is published now."""
         position = self._position[meta.url]
         self.contents[position] = content
+        self.obtained.add(position)
+        self.titles[position] = content.title
         self.failed.pop(position, None)
         group = self._group_of[position]
         if self.mode is OutputMode.SEPARATE and group.key in self.pending:
@@ -191,19 +202,24 @@ class RunOutputs:
 
     def fail(self, meta: ChapterMeta, reason: str) -> None:
         position = self._position.get(meta.url)
-        if position is not None and position not in self.contents:
+        if position is not None and position not in self.obtained:
             self.failed[position] = str(reason)
 
     def finish(self, *, cancelled: bool) -> None:
-        """Publish the groups still pending (on Stop, only groups with every page obtained), then
-        record the pages that could not be saved."""
+        """Build the grouped files still pending (none after a Stop: Resume builds them), then
+        record the pages that could not be saved. Raises ``ScrapeCancelled`` when Stop is pressed
+        during the build; every file finished before it is kept and recorded."""
+        if cancelled:
+            return
         for group in self.groups:
             if group.key not in self.pending:
                 continue
+            if self.cancel_event is not None and self.cancel_event.is_set():
+                from .request_manager import ScrapeCancelled
+
+                raise ScrapeCancelled("stopped while the output files were being built")
             present = [p for p in group.positions if p in self.contents]
             if not present:
-                continue
-            if cancelled and len(present) < len(group.positions):
                 continue
             self._publish(group)
         if not cancelled:
@@ -236,7 +252,10 @@ class RunOutputs:
             relative = self._name(group, fmt, contents)
             path = self.run_dir / relative
             path.parent.mkdir(parents=True, exist_ok=True)
-            self._render(fmt, contents, path, self.title)
+            # A multi-chapter build can take minutes, so it stops at the next chapter on Stop; a
+            # single chapter's file is always finished.
+            self._render(fmt, contents, path, self.title,
+                         cancel_event=self.cancel_event if len(group.positions) > 1 else None)
             size, digest = file_sha256(path)
             record = self.journal.publish(key=group.key, fmt=fmt, path=relative, size=size,
                                           sha256=digest, pages=present, missing=missing)
@@ -249,6 +268,8 @@ class RunOutputs:
             self.log(f"  wrote {path.name}{detail}")
         if not missing:
             self.pending.pop(group.key, None)
+            for position in present:          # published for good: its text is no longer needed
+                self.contents.pop(position, None)
         else:
             # Published as far as it goes; still pending, so a resume re-renders it complete.
             self.pending[group.key] = set(self.formats)
@@ -270,11 +291,10 @@ class RunOutputs:
                 if record is not None:
                     outputs[fmt] = {"file": record["path"], "sha256": record["sha256"],
                                     "complete_file": not record["missing"]}
-            content = self.contents.get(position)
             if position in self.failed:
                 status = "failed"
             elif len(outputs) == len(self.formats):
-                status = "resumed" if position in resumed and content is None else "saved"
+                status = "resumed" if position in resumed and position not in self.obtained else "saved"
             else:
                 status = "not saved"
             rows.append({
@@ -282,7 +302,7 @@ class RunOutputs:
                 "label": self.labels[position],
                 "page_url": meta.url,
                 "slug": meta.slug,
-                "title": content.title if content is not None else meta.title,
+                "title": self.titles.get(position, meta.title),
                 "status": status,
                 "reason": self.failed.get(position),
                 "outputs": outputs,

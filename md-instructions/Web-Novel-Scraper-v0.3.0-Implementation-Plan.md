@@ -493,6 +493,29 @@ quote in one source title ("New Life“") is kept as published. Not run: any ful
 headless-first default and one-challenge breaker, standard-path limiter, website labels.
 **Tests:** `test_freewebnovel_net.py` (12) and updated catalog/headless/breaker tests.
 
+### 9.16 Checkpoint 06 result: reliability hardening (2026-10-18)
+
+Fixed (each with a regression in `test_reliability.py`, 10 tests):
+- **Stop during output building** was ignored until every grouped file was rendered (a whole-novel
+  PDF of 1,432 chapters measured 85 s, ~111 MB peak). Now a zero-size layout checkpoint per chapter
+  stops a multi-chapter PDF at the next chapter, a check between files stops TXT/PDF builds, and
+  after Stop no grouped file is built (Resume builds them from the HTML cache). The chapter in
+  progress when Stop is pressed is still saved.
+- **Cache-only operation:** an open-ended run whose saved list already covers Start..its last chapter
+  no longer fails when the site cannot be reached, or when another window holds the list lock; it uses
+  the saved list with a prominent WARNING and a range note, and never treats the failure as the end.
+  A finite range, or a saved list with a hole, still refuses.
+- **Memory on long runs:** chapter text is released once its file is published (titles kept for the
+  audit), so an individual-chapter run no longer holds the whole novel's text.
+- **Pacing on the standard path:** list pages are paced like chapters (Checkpoint 04).
+- Bounded stress: 300 chapters with intermittent and permanent failures — progress, failed/rescued
+  counts, journal records and resume all add up exactly.
+
+Reviewed and unchanged (evidence-backed behaviour retained): retry/rescue ladders, the headless ->
+visible latch (now one challenge), browser teardown (live: no Camoufox process left), rate limiter,
+worker-thread rules (no Tk off the Tk thread). Mutation check: 8 rules, all caught except one
+equivalent mutant (`finish(cancelled=True)` early return; the between-file check gives the same result).
+
 ## 10. Owner overrides and autonomous completion mandate (2026-10-18)
 
 The owner approved 03.2a and authorised autonomous completion of 03.2b through 07 for a **Windows-only

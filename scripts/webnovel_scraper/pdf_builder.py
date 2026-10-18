@@ -29,7 +29,7 @@ from reportlab.lib.enums import TA_JUSTIFY, TA_LEFT
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import inch
-from reportlab.platypus import PageBreak, Paragraph, SimpleDocTemplate
+from reportlab.platypus import Flowable, PageBreak, Paragraph, SimpleDocTemplate
 
 from .models import ChapterContent
 
@@ -356,12 +356,34 @@ def _styles() -> tuple[ParagraphStyle, ParagraphStyle]:
     return body, heading
 
 
-def build_story(chapters: list[ChapterContent]) -> list:
+class _CancelPoint(Flowable):
+    """A zero-size flowable that stops a long layout when Stop is pressed (v0.3.0 06). ReportLab
+    lays the story out in one call; checking here, once per chapter, keeps Stop responsive while a
+    whole-novel file (measured: about 85 s for 1,432 chapters) is being built."""
+
+    def __init__(self, cancel_event) -> None:
+        super().__init__()
+        self._cancel = cancel_event
+
+    def wrap(self, available_width, available_height):
+        if self._cancel is not None and self._cancel.is_set():
+            from .request_manager import ScrapeCancelled
+
+            raise ScrapeCancelled("stopped while the PDF was being built")
+        return 0, 0
+
+    def draw(self) -> None:
+        pass
+
+
+def build_story(chapters: list[ChapterContent], cancel_event=None) -> list:
     """The ReportLab flowables: per chapter a page break (after the first), its heading, its
     paragraphs, in the given order."""
     body_style, heading_style = _styles()
     story: list = []
     for i, chapter in enumerate(chapters):
+        if cancel_event is not None:
+            story.append(_CancelPoint(cancel_event))
         if i > 0:
             story.append(PageBreak())
         story.append(Paragraph(markup(chapter.heading), heading_style))
@@ -371,7 +393,7 @@ def build_story(chapters: list[ChapterContent]) -> list:
 
 
 def create_pdf(
-    chapters: list[ChapterContent], output_path: Path, title: str
+    chapters: list[ChapterContent], output_path: Path, title: str, *, cancel_event=None
 ) -> Path:
     """Render chapters into one PDF and publish it atomically. Returns the path.
 
@@ -396,7 +418,7 @@ def create_pdf(
         )
         if title:
             doc_kwargs["title"] = title
-        SimpleDocTemplate(str(tmp), **doc_kwargs).build(build_story(chapters))
+        SimpleDocTemplate(str(tmp), **doc_kwargs).build(build_story(chapters, cancel_event))
         with open(tmp, "r+b") as handle:   # on disk before it is published (v0.3.0 03.3)
             os.fsync(handle.fileno())
         os.replace(tmp, output_path)       # atomic publish

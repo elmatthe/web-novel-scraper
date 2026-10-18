@@ -435,16 +435,53 @@ class _Preflight:
         window = self._window(effective)
         examined: Optional[tuple[int, int]] = None
         if window is not None:
+            saved_end = self._saved_list_suffices(effective)
             if not self.writable:
+                if saved_end is not None:
+                    return self._select_saved(
+                        effective, saved_end, "another run is updating the saved chapter list"
+                    )
                 raise ChapterListRefused(
                     "The chapter list has to be checked against the site for this range, but another "
                     "run or program instance is updating the saved list. Wait for it to finish and "
                     "try again; nothing was fetched."
                 )
-            effective, examined, empty = self._discover(window, effective)
+            try:
+                effective, examined, empty = self._discover(window, effective)
+            except ScrapeCancelled:
+                raise
+            except Exception as exc:  # noqa: BLE001 - only an optional look for newer chapters
+                if saved_end is None:
+                    raise
+                return self._select_saved(effective, saved_end, f"the site could not be reached ({exc})")
             if empty:
                 return Selection(effective_range=(self.start, self.start), discovered=True, empty_index=True)
         return self._select(effective, examined, discovered=window is not None)
+
+    def _saved_list_suffices(self, effective: EffectiveManifest) -> Optional[int]:
+        """For an open-ended request, the last saved chapter when the saved list already covers
+        everything from Start to it (the network would only look for NEWER chapters); else None."""
+        if self.end is not None:
+            return None
+        wholes = [n for n in (whole_number(c.label) for c in effective.chapters) if n is not None]
+        known_hi = max(wholes, default=None)
+        if known_hi is None or self.start > known_hi or effective.uncovered_spans(self.start, known_hi):
+            return None
+        return known_hi
+
+    def _select_saved(self, effective: EffectiveManifest, saved_end: int, why: str) -> Selection:
+        """Cache-only operation (v0.3.0 06): use the saved list as it is, say so prominently, and
+        never take the failure as evidence of where the novel ends."""
+        self.log(
+            f"WARNING: newer chapters could not be looked for because {why}. This run uses the saved "
+            f"chapter list, which ends at chapter {saved_end}; chapters published since are not included."
+        )
+        selection = self._select(effective, None, discovered=True)
+        selection.range_notes.append(
+            f"the site was not checked for chapters after {saved_end} ({why.split(' (')[0]}); the saved "
+            "chapter list was used"
+        )
+        return selection
 
     def _select(
         self, effective: EffectiveManifest, examined: Optional[tuple[int, int]], *, discovered: bool

@@ -513,10 +513,12 @@ def _record_duplicate_output_numbers(
             log(f"WARNING: {warning}")
 
 
-def render_output(fmt: str, contents: list[ChapterContent], path: Path, title: str) -> None:
-    """Render one output file atomically (temp in the same folder, fsync, replace)."""
+def render_output(fmt: str, contents: list[ChapterContent], path: Path, title: str,
+                  cancel_event: Optional[threading.Event] = None) -> None:
+    """Render one output file atomically (temp in the same folder, fsync, replace). A PDF layout
+    stops at the next chapter when ``cancel_event`` is set (``ScrapeCancelled``)."""
     if fmt == "pdf":
-        pdf_builder.create_pdf(contents, path, title=title)
+        pdf_builder.create_pdf(contents, path, title=title, cancel_event=cancel_event)
     elif fmt == "txt":
         txt_builder.create_txt(contents, path)
     else:
@@ -1483,8 +1485,9 @@ def _prepare_run(
     outputs = RunOutputs(
         run_dir=run_dir, journal=journal, metas=metas, labels=labels, mode=job.output_mode,
         chunk_size=job.chunk_size, formats=tuple(job.formats), title=spec.novel_title,
-        stem=_stem_for(spec), render=render_output, report=report, log=log,
-        replay=replay if resumed else None,
+        stem=_stem_for(spec), report=report, log=log,
+        render=render_output,
+        replay=replay if resumed else None, cancel_event=cancel_event,
     )
     try:
         if job.output_mode is OutputMode.SEPARATE:
@@ -1528,7 +1531,14 @@ def _finish_run(run: _Run, report: RunReport, log: LogFn) -> None:
     """Publish what is pending, record failures and how the session ended, write the audit and
     release the folder."""
     try:
-        run.outputs.finish(cancelled=report.cancelled)
+        try:
+            run.outputs.finish(cancelled=report.cancelled)
+        except ScrapeCancelled:
+            # Stop pressed while files were being built: every finished file is kept and recorded;
+            # a resume builds the rest (nothing partial is published).
+            report.cancelled = True
+            log("Run cancelled: stopped while the output files were being built; the files already "
+                "finished are kept and Resume Existing Run builds the rest.")
         outputs = run.outputs
         if report.cancelled:
             state = "cancelled"

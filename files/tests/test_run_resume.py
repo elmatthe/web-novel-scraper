@@ -229,8 +229,8 @@ def test_a_stopped_run_resumes_only_what_is_missing(tmp_path, store, mode):
     assert first.cancelled
     folder = first.output_dir
     before = set(pdfs(folder))
-    if mode is OutputMode.SINGLE:
-        assert before == set()                                  # never a partial grouped file on Stop
+    if mode is not OutputMode.SEPARATE:
+        assert before == set()                                  # Stop builds no grouped file (06)
 
     second_site = Site(6)
     logs: list[str] = []
@@ -240,7 +240,7 @@ def test_a_stopped_run_resumes_only_what_is_missing(tmp_path, store, mode):
     assert len(pdfs(folder)) == expected
     assert before <= set(pdfs(folder))                          # nothing earlier was lost
     # pages already safely in a finished file were not fetched again
-    saved_first = {OutputMode.SEPARATE: {1, 2, 3, 4}, OutputMode.CHUNKED: {1, 2, 3, 4},
+    saved_first = {OutputMode.SEPARATE: {1, 2, 3, 4}, OutputMode.CHUNKED: set(),
                    OutputMode.SINGLE: set()}[mode]
     assert set(second_site.fetched) == set(range(1, 7)) - saved_first
     assert replay_journal(folder / JOURNAL_FILENAME).last_end == "complete"

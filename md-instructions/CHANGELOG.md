@@ -9,6 +9,18 @@ versioning.
 candidate. The macOS launcher and portable code are kept, but macOS acceptance is deferred to a
 later branch; nothing here claims macOS readiness.
 
+### Fixed — Stop, offline runs and memory on long runs (Checkpoint 06)
+- **Stop is prompt while files are being built.** A long "Whole selected range" or "Every X chapters"
+  file now stops at the next chapter when Stop is pressed (it used to finish every remaining file,
+  which could take minutes). Files already finished are kept; Resume builds the rest from the saved
+  pages. The chapter being fetched when Stop is pressed is still saved.
+- **Offline-friendly "through the last chapter" runs:** if the site cannot be reached (or another
+  window is updating the chapter list) and the saved list already covers the request, the run uses it
+  and says clearly that newer chapters were not looked for, instead of failing.
+- **Lower memory on long runs:** each chapter's text is released once its file is written.
+- **Tests:** 1,402 total (10 new in `test_reliability.py`, including a 300-chapter run with
+  intermittent and permanent failures whose counts, journal and resume must add up exactly).
+
 ### Added — Lord of the Mysteries 1 and 2 on Free Web Novel (.com) and (.net) (Checkpoint 04)
 - **Two new novels, each on two websites:** *Lord of the Mysteries* and *Lord of Mysteries 2: Circle
   of Inevitability* on **Free Web Novel (.com)** and **Free Web Novel (.net)**, each checked live

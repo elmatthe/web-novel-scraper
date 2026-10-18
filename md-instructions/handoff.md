@@ -13,14 +13,16 @@
 - **Owner data on disk (gitignored, never touch destructively):** the 1.2 GB pre-0.3.0 HTML cache in
   `files/cache/<novel>/` (copied on demand into `files/cache/<host>/<novel>/`), `files/runtime-data/`.
 - **Done in this session (newest first):**
+  - **06 (Stop during builds, cache-only open runs, memory, stress):** plan §9.16. Commit after `c1b03af`.
   - **04 (LOTM 1/2 on .com and .net, .net adapter, headless-first):** plan §9.15, ADR 016.
-    Commit after `7ce33ff`.
+    `c1b03af`.
   - **05 (canonical text, TXT, structured PDF, Unicode fallback):** plan §9.14, ADR 015. Gate PASS
     1376 (3.13.12 and 3.12.10). `7ce33ff`.
   - **03.3-03.4 (run folders, journal, Resume):** plan §9.13, ADR 014. Gate PASS 1306 (3.13.12 and
     3.12.10). `8926a30`.
   - **Overrides A + B, 03.2b (validated HTML cache):** plan §9.12, ADR 011/012. `12e83be`, 1272 passed.
-- **Next:** 06 (reliability hardening), then 07 (Windows bootstrap, acceptance checklist, Codex prompt).
+- **Next:** 07 (Windows bootstrap, acceptance checklist, Codex prompt); an independent review of the
+  branch runs in parallel.
 - **Live evidence gathered 2026-10-18 (rate-limited, ~20 requests, robots.txt checked: both hosts allow
   crawling; `.net` disallows only `/admin/` and `/ajax-`, which are never used):**
   - `.net` LOTM: index `/lord-of-the-mysteries.html`, TOC `?page=N` (40 per page, 36 pages, 1-1432),
