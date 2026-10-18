@@ -1,6 +1,6 @@
 # Web Novel Scraper — v0.3.0 Implementation Plan
 
-**Status:** Approved product requirements. Checkpoint 00 (planning/baseline) complete 2026-10-17 on `feature/v0.3.0-modernization`; Checkpoint 01 step 01.0 (flat `scripts/` layout) complete 2026-10-17; step 01.1 (Light/Dark UI foundation and three-section window shell) complete 2026-10-18; step 02.1 (Activity Summary/Detailed logging and thread-safe event bridge) complete 2026-10-18 (`d7116db`); step 02.2 (progress, ETA, counters and run-state accuracy) complete 2026-10-18 (`3269aa7`); step 02.3 (website-first selection, preferences, Resume placeholder and counter fix) complete 2026-10-18 and awaits owner review and the UI acceptance gate before Checkpoint 03. Technical clarifications from Checkpoint 00 are in §8 and do not change owner decisions.  
+**Status:** Approved product requirements. Checkpoint 00 (planning/baseline) complete 2026-10-17 on `feature/v0.3.0-modernization`; Checkpoint 01 step 01.0 (flat `scripts/` layout) complete 2026-10-17; step 01.1 (Light/Dark UI foundation and three-section window shell) complete 2026-10-18; step 02.1 (Activity Summary/Detailed logging and thread-safe event bridge) complete 2026-10-18 (`d7116db`); step 02.2 (progress, ETA, counters and run-state accuracy) complete 2026-10-18 (`3269aa7`); step 02.3 (website-first selection, preferences, Resume placeholder and counter fix) complete 2026-10-18 and approved by the owner for Windows (Light/Dark, minimum size, simulated 150%, Website menu), with launcher, native-scaling and macOS checks carried forward; step 03.0 (source identity, safe run allocation, manifest/journal contracts) complete 2026-10-18 and awaits owner review before 03.1. Technical clarifications from Checkpoint 00 are in §8 and do not change owner decisions.  
 **Created:** 2026-10-14  
 **Planning / review:** ChatGPT; **execution:** Claude Code in the local repository.  
 **Target repository:** `https://github.com/elmatthe/web-novel-scraper`  
@@ -143,6 +143,8 @@ Supersedes the read-only GitHub snapshot above wherever they differ.
 - Implement per-site tracked baseline manifests in `scripts/` and untracked mutable runtime overlays/cache, provenance, schema and migration, preflight coverage/extend/refresh, chapter identity/offset guards, and safe output allocation/resume journal. Existing site adapters and output behavior remain functional.
 - **Verify:** offline fixtures for empty/stale/corrupt/mismatched stores; sparse coverage; out-of-range automatic extension; fractional chapters; source URL identity, false success prevention; no duplicate fetches; reuse vs fresh folder; concurrent folder allocation; interrupted write/restart. Focus on regression preservation.
 
+- **03.0 Result (2026-10-18): COMPLETE, awaiting owner review.** Contracts and safe filesystem mechanisms only. No catalog, adapter, pipeline, GUI, `RequestManager`, PDF, cache, output-folder or dependency change; the Resume button is still disabled. New `source_identity.py`, `run_storage.py` and `atomic_io.py` (all unwired) and the full data contracts in §9. Tests: `test_source_identity.py` and `test_run_storage.py`. Next: 03.1 (§9.9).
+
 ### 04 — Two novel integrations, independently per domain
 - Verify both user-specified `.net` source paths and both `.com` catalogue candidates LIVE without presuming equivalent markup or numbered URL templates; inspect TOC/pagination, descriptive slug mapping, chapter display titles, paragraphs, and failure behavior. Add only validated site/novel catalogue combinations with source-specific fixtures and adapter branches as needed; keep unverified sources visibly unavailable.
 - For browser-needed cases implement bounded headless-first strategy and headed Playwright/manual fallback; retain working existing recovery. No mixed-host chapter sets in one run.
@@ -208,3 +210,103 @@ These clarify how to carry out the approved decisions above. They do not change 
 - **C13 — Python version risk.** Both launchers install Python **3.12** (winget `Python.Python.3.12` / python.org 3.12.8; Homebrew `python@3.12`), while the dev `.venv` and Briefing say 3.13. New and borrowed code must stay 3.12-compatible. 07 must prove a fresh 3.12 install, or the owner decides to move the launchers to 3.13.
 - **C14 — Docs debt (not fixed incidentally).** `Briefing.md` (76 lines) and `handoff.md` (24 lines) contain UTF-8 mojibake (`â€”`), and `handoff.md` is about 1,750 lines. Clean both in the 07 docs pass. Checkpoint 00 corrected only Briefing's stale "Current Version" status and added the missing `577b5db` CHANGELOG entries.
 - **C15 — Gate location.** After 01.0, the gate is again `.venv` Python running `scripts/verify.py` in place. Each checkpoint reports the exact pass count against the 292 baseline.
+
+## 9. Checkpoint 03 data contracts (finalized in 03.0, 2026-10-18)
+
+Design for 03.1–03.4. Only §9.1 is implemented; everything else is the contract those steps build to. Where this section and §8 C1/C7/C8 overlap, they agree.
+
+### 9.1 Implemented in 03.0 (not yet wired into the GUI or pipeline)
+
+- `scripts/webnovel_scraper/source_identity.py` (pure, no I/O):
+  - `SourceIdentity(novel_slug, adapter_key, origin, index_url, identifiers)`: frozen, validated, normalised. `origin` is `https://<host>` and the host must be in `SUPPORTED_HOSTS` with an adapter expected for it; `index_url` must be on that same host (no query, fragment, port, userinfo or `..`). `site_key` is the host (`freewebnovel.net` is not `freewebnovel.com`, though both use adapter `freewebnovel`). `fingerprint()` is 16 hex digits of SHA-256 over canonical JSON. `from_site_spec(spec)` builds one from a catalog row without changing the catalog. `to_json`/`from_json` are strict (exact key set).
+  - `ChapterLabel`: a displayed chapter number as canonical decimal **text** (`"627.2"`, `"627.10"`; up to 7 integer and 6 fractional digits; leading integer zeros dropped, fractional digits kept). Sorts by `Decimal`; `from_index`/`to_index` bridge to `ChapterMeta.index` (an integral float collapses to int, as `pipeline._index_number` does).
+  - `ChapterIdentity`: `page_url` (normalised, on the source's host, fragment dropped), `label`, `slug`, `source_id`, `title`. **Equality and hash use `page_url` only.** `duplicate_labels()` reports labels shown by more than one page (Supreme Magus 3664 on slugs 3678 and 3679); `ensure_distinct_pages()` rejects one URL listed twice.
+- `scripts/webnovel_scraper/run_storage.py`: `allocate_run_dir(root, novel_slug)` reserves `<root>/<slug>-N` (first free N >= 1, per novel, no website parameter) with an exclusive `os.mkdir`, then writes `run-reservation.json` (`schema_version` 1, `kind`, `novel_slug`, `number`, `created_utc`) atomically. A failed marker write removes the folder only if it is still empty; a non-empty leftover is kept and never reused. Existing folders, files and links (including an empty abandoned folder) are skipped, never reused. `preview_next_run_dir` only reads the listing. `open_existing_run(root, path, expected_novel_slug=None)` is the future Resume's read-only gate: a real directory directly inside `root`, named `<slug>-N`, with a matching marker. `default_output_root()` is `~/Downloads/Web-Novel-Scraper-Outputs` (the home folder if there is no Downloads).
+- `scripts/webnovel_scraper/atomic_io.py`: `write_json_atomic` (unique temp file in the target folder, fsync, `os.replace`; the old file survives any failure).
+
+### 9.2 Chapter manifest (03.1)
+
+One schema for both layers, `schema_version: 1`, `kind: "chapter-manifest"`:
+
+```json
+{"schema_version": 1, "kind": "chapter-manifest", "layer": "baseline | runtime",
+ "source": { "...SourceIdentity.to_json()..." },
+ "provenance": {"generated_utc": "...", "validated_utc": "...", "app_version": "0.3.0",
+                "method": "toc | walk | probe | legacy-migration", "legacy_index_sha256": null, "notes": ""},
+ "coverage": {"toc_complete": false, "spans": [["1", "3700"]]},
+ "chapters": [{"label": "627.2", "page_url": "...", "title": "...", "slug": 640, "source_id": null}],
+ "absent":   [{"label": "88", "evidence": "page 404 and neighbours present"}],
+ "content_sha256": "<over canonical chapters + absent + spans>"}
+```
+
+- **Locations.** Baseline (tracked, read-only at run time): `scripts/webnovel_scraper/chapter_lists/<site_key>/<novel_slug>.json`. Runtime overlay (ignored): `files/runtime-data/chapter-lists/<site_key>/<novel_slug>.json`. `<site_key>` is the host, so `.net` and `.com` never share a file. Only an explicit developer action edits a baseline; the scraper never writes one.
+- **Coverage is set membership.** A *span* `[a, b]` means every integer label in it is either in `chapters` or in `absent` (source-confirmed missing), and fractional labels exist only if listed. A request `[x, y]` is satisfied only if it lies inside the union of spans. A gap in a sparse TOC is *not covered* until examined; it is never assumed absent.
+- **Order and uniqueness.** `chapters` is sorted by `(label.sort_key, slug, page_url)`; `page_url` is unique; `slug` is unique when present; repeated labels are allowed for distinct pages (preserved and reported, never merged).
+- **Validation on load.** Any failure quarantines the file as `<name>.corrupt-<utc>` (never deleted) and falls to the next layer or rediscovery. Checks: schema, kind and layer; `source` equals the expected `SourceIdentity` exactly; every `page_url` is on the source host; labels are canonical; entries are sorted and unique; spans are sorted and non-overlapping with every integer inside accounted for; `content_sha256` matches; size cap 20 MB.
+- **Writes** are `write_json_atomic` only, after validation.
+- **Effective manifest** = baseline plus overlay, keyed by `page_url`. The same page with a different label, title or slug, or two pages claiming one slug, is a *contradiction*: nothing is silently merged; the affected labels become uncovered and are rediscovered, and the choice is logged.
+
+### 9.3 Preflight, refresh and extend (03.2)
+
+1. Load the effective manifest and compute the uncovered sub-spans of the requested range. A blank end means the discovered tail, re-checked every run from the index page's tail only.
+2. No uncovered span means no TOC network traffic. Otherwise discover only those spans through the existing adapter `build_chapter_index` (the 577b5db binary-search offset reconciliation and its `count + 64` ceiling are kept). Verified entries are preserved.
+3. Persist after each reconciled window: coverage grows only over spans actually examined, so an interrupted discovery keeps its partial progress. This absorbs today's `complete: false` checkpoints.
+4. A requested label with neither an entry nor `absent` evidence makes the run refuse, naming the missing labels; it never clamps to a smaller range and reports success. "Source lacks it" (evidence recorded) is reported as *skipped (reason)*, distinct from "the cache lacks it".
+5. **Refresh chapter list** (explicit) renames the overlay to `.bak-<utc>` and rediscovers; it never touches the baseline.
+
+### 9.4 Legacy `chapter_index.json` migration (03.1; the old file is only ever read)
+
+The output-scoped file (`INDEX_SCHEMA_VERSION` 2) is never modified, moved or deleted. It is imported **into the runtime overlay** only when all of these hold: a dict with `schema_version == 2`; an `identity` block (`novel_slug`, `adapter_key`, `source_url`, `base_url`) that yields a `SourceIdentity` equal to the current source (`source_url` as `index_url`, `base_url` as `origin`); `complete` is true; every row converts (`ChapterLabel.from_index`, URL on the host, unique pages). Otherwise it is ignored with a logged reason: bare lists, v1, missing identity, `complete: false`, host mismatch or any bad row. This deliberately **tightens** today's `_load_index`, which still trusts a v2 dict whose identity block is missing.
+
+Imported coverage is the maximal contiguous integer runs only: TOC gaps stay uncovered, because the old file never recorded evidence of absence, and the tail is not assumed to be the end. Provenance is `method: "legacy-migration"` plus the file's SHA-256 (no absolute paths). Import is idempotent and skipped where the overlay already covers. Pre-0.3.0 `<slug>-N` folders directly under `~/Downloads` are never moved, renamed or reserved against; with no reservation marker they are not resumable in v0.3.0 (the owner may reconsider).
+
+### 9.5 Run journal and Resume (03.3)
+
+`run-journal.jsonl` in the run folder: one header line, then append-only event lines, each `{"seq", "type", ..., "crc"}` with fsync per record. A crash costs at most a torn last line, which replay ignores. A damaged line anywhere else makes the journal invalid: Resume refuses and offers a new run.
+
+- **Header:** `run` (slug, number), `source` plus fingerprint, `selection` (hash of the ordered `page_url` list, first and last label), `formats`, `grouping` (`mode`, `chunk_size`), `manifest` (`content_sha256` of each layer used), `app_version`, `created_utc`.
+- **Events:** `publish` {output key, relative path, size, sha256, covered `page_url`s}, `skip` {page_url, reason}, `failure` {page_url, reason}, `end` {state}.
+- **Publication order:** render to a temp name in the destination folder, fsync, `os.replace`, then append `publish` (fsync). A file on disk without a `publish` record is *unverified* and is re-rendered over the same deterministic name; orphan temp files matching our pattern are removed on resume. A recorded output counts as complete only if the file exists and its size and SHA-256 match; filename presence alone is never trusted.
+- **Resume** requires, through `open_existing_run` plus the header: the same novel, the same source fingerprint (so `.net` is not `.com`), the same selection set, formats, grouping and chunk size. Any difference refuses, naming the differing field. Resumed outputs count as *already complete/resumed*.
+
+### 9.6 HTML cache boundaries (03.2; `RequestManager` is untouched in 03.0)
+
+Today: `files/cache/<novel_slug>/<sha256(url)[:24]>.html`, raw HTML only, written non-atomically, checked on read for undecodable text and Cloudflare challenges. The URL hash already keeps `.net` and `.com` files apart, but nothing records or checks provenance.
+
+- **Layout:** `files/cache/<site_key>/<novel_slug>/<hash>.html` plus a sidecar `<hash>.json` {`url`, `host`, `novel_slug`, `fetched_utc`, `byte_len`, `sha256`, `classification`, `strategy`}.
+- **Cross-host contamination:** a hit needs the sidecar host to equal the request host and the source host; a redirect to another host is not cached under the requested key.
+- **Wrong novel:** the directory and sidecar carry `novel_slug`; extraction checks the chapter label and title against the expected `ChapterIdentity` (the offset guard). One mismatch quarantines the entry and refetches once; a second fails the chapter rather than looping.
+- **Challenge pages:** the existing detection runs on read and again before write; a chapter page also needs a non-empty body container.
+- **Truncated or corrupt HTML:** a sidecar length or hash mismatch means refetch; writes become temp file plus `os.replace`.
+- **No needless refetch:** a valid hit is served with no network call; chapter pages never expire on their own; TOC/index pages re-check only their tail. An explicit invalidate marks the entry `.invalid`.
+- **Migration:** legacy entries are copied, never moved or deleted, into the new layout after the same validation, with `origin: "legacy-copy"`.
+
+### 9.7 Failure and interruption matrix
+
+| Interruption | Result |
+|---|---|
+| Crash between `mkdir` and the marker | The empty or partial folder remains, is skipped by every later allocation, and is never resumable |
+| Crash while writing a manifest or marker | Old file intact; a stray temp file is ignored |
+| Crash after `os.replace`, before the journal record | Output is unverified and is re-rendered atomically |
+| Torn last journal line | Ignored on replay |
+| Damaged earlier journal line, or manifest hash mismatch | Journal: refuse and offer a new run. Manifest: quarantine and rediscover |
+| Output edited or truncated after publication | Size or SHA-256 mismatch, so it is re-rendered |
+| Source identity or selection changed | Resume refused, naming the differing field |
+
+### 9.8 Compatibility risks found in 03.0 (each owned by the step named)
+
+1. `_load_index` trusts a v2 dict with **no** identity block (03.1 tightens it, §9.4).
+2. `ChapterMeta.index` is `int | float`, and a float cannot tell `627.1` from `627.10`. Manifests store label text; conversion happens only at the adapter boundary (03.1).
+3. The HTML cache is keyed by novel slug only, has no provenance, and is written non-atomically (§9.6, 03.2).
+4. The FWN adapter's URL logic (`_chapter_link_re`, `chapter_url_for`) assumes the `.com` `/novel/<slug>/chapter-N` shape, while `.net` pages are `/<slug>/chapter-1-crimson.html`. That is adapter work for Checkpoint 04; the identity layer already accepts both.
+5. `resolve_output_dir` probes with `.exists()` (race-prone) and supports a custom **Folder name** (a GUI field). Decision 4 names new runs `<slug>-N`, so 03.3 retires that field when it integrates the allocator (an owner-visible change). Today's behaviour is unchanged until then.
+6. `pipeline._chapter_identity` keys on `(index, slug, source_id, url)`; the new identity keys on the page URL. They agree for every real row, but 03.1 must not let the legacy tuple drive manifest identity.
+
+### 9.9 Next steps
+
+- **03.1** Manifest store: schema, validation, atomic I/O, baseline plus overlay merge, quarantine, legacy v2 import (§9.2, §9.4). No pipeline change.
+- **03.2** Coverage, discovery/extend/refresh and false-success prevention (§9.3); HTML cache layout, sidecars and validation (§9.6).
+- **03.3** Run journal, allocator integration (new output root, retire Folder name) and the real Resume button (§9.5).
+- **03.4** End-to-end regression and acceptance: interrupted write and restart, sparse coverage, fractional and duplicate labels, no duplicate fetches, fresh versus resumed folders.
+
+No owner decision blocks 03.0. Open for later review: whether pre-0.3.0 folders should ever be resumable (recommend no), and the retirement of the Folder name field in 03.3.

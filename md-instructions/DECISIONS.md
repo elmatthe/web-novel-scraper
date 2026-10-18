@@ -5,6 +5,46 @@ See AI-WORKSPACE.md for how this fits alongside Briefing, Changelog, and Handoff
 
 ---
 
+## 009 — Source identity is host-scoped, chapters are identified by page, labels are text — 2026-10-18 — Claude (Sonnet 5.5)
+
+**Status:** Accepted (v0.3.0 Checkpoint 03.0)
+
+**Context:** Checkpoint 03 adds manifests, a validated HTML cache, a run journal and
+Resume, and Checkpoint 04 adds `freewebnovel.net` beside `.com` under the same adapter.
+Keying any of these by `adapter_key`, by displayed chapter number, or by a float number would
+let one source's data pass for another's. Supreme Magus already has two pages that both
+display chapter 3664, and `627.1` and `627.10` cannot be told apart as floats.
+
+**Decision:**
+1. A source is `(canonical novel slug, adapter key, https origin, index URL, identifiers)`,
+   validated against a table of supported hosts and the adapters expected for each. The host
+   is the website identity (consistent with ADR 008); `site_key` is the host.
+2. A chapter is identified by its normalised source page URL on that host. The displayed
+   number, `slug`, `source_id` and title are evidence and never part of equality.
+3. A displayed number is canonical decimal text (`ChapterLabel`), converted to `int | float`
+   only at the existing `ChapterMeta.index` boundary.
+4. New runs reserve `<root>/<slug>-N` with an exclusive `mkdir`, and a `run-reservation.json`
+   marker. Any existing entry, including an empty abandoned folder, is skipped and never
+   reused. Resume may open only a folder whose name and marker agree (`open_existing_run`).
+   A preview reserves nothing.
+5. The contracts for the manifest, legacy migration, journal and cache are in plan §9. The
+   legacy output-scoped index is only read, and imported only when its identity matches.
+
+**Alternatives considered:**
+- Keep `_index_identity` (slug, adapter, URLs) and extend it: no host allow-list, no chapter
+  identity, and it keeps trusting an index with no identity block.
+- Key chapters by `(displayed number, slug)`: breaks when a site re-slugs, and cannot
+  represent a page whose number the source changes.
+- Reuse an empty abandoned run folder: simpler, but it cannot be told apart from a folder
+  another process is about to fill.
+
+**Consequences:** Adding a website means adding its host and adapter to `SUPPORTED_HOSTS`
+(Checkpoint 04), deliberately. The identity layer is not yet used by the pipeline, so nothing
+changes for users until 03.1 to 03.3 integrate it. The GUI's Folder name field is retired when
+03.3 adopts `<slug>-N`.
+
+---
+
 ## 008 — Website-first selection: a website is a host, not an adapter — 2026-10-18 — Claude (Sonnet 5.5)
 
 **Status:** Accepted (v0.3.0 Checkpoint 02.3)

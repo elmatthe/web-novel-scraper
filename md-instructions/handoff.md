@@ -1,6 +1,6 @@
 # webnovel-scraper - Handoff
 
-## Current Snapshot — v0.3.0 Checkpoint 02.3 complete (website-first selection, preferences, Resume placeholder, counter fix)
+## Current Snapshot — v0.3.0 Checkpoint 03.0 complete (source identity, safe run allocation, manifest/journal contracts)
 **2026-10-18 · HOME-PC (Windows 11) · Claude Code (Opus 5.5) · branch
 `feature/v0.3.0-modernization`**
 
@@ -10,9 +10,28 @@
 - **Base:** `577b5db` = `main` (`e7dc407`) plus the FWN offset/duplicate-output
   fix. Checkpoint 00 = `1ab1747`; 01.0 (flat `scripts/`) = `f169565`; 01.1
   (Light/Dark UI foundation, three-section shell) = `e93c21a`; 02.1 =
-  `d7116db`; 02.2 = `3269aa7`; 02.3 is the commit after it. `fix/freewebnovel-offset-and-output-collisions` stays local.
+  `d7116db`; 02.2 = `3269aa7`; 02.3 = `1da9eac`; 03.0 is the commit after it. `fix/freewebnovel-offset-and-output-collisions` stays local.
 - **Release state:** v0.2.0 is the latest release and tag (2026-06-30). 0.2.1 is
   merged to `main` via PR #4 but untagged. v0.3.0 supersedes it (plan §8 C3).
+- **03.0 recap (contracts and safe filesystem mechanisms only; nothing is wired in).**
+  No catalog, adapter, pipeline, GUI, `RequestManager`, PDF, cache, output-folder or
+  dependency change. The Resume button is still disabled; `pipeline.resolve_output_dir`
+  and today's output naming are unchanged.
+  - `source_identity.py`: `SourceIdentity` (slug, adapter, https origin on an allow-listed
+    host, index URL on that host, identifiers), `ChapterLabel` (displayed number as
+    lossless decimal text) and `ChapterIdentity` (the source page URL, never the displayed
+    number). `.net` and `.com` are different sources that may share an adapter (ADR 009).
+  - `run_storage.py`: `allocate_run_dir` (exclusive `mkdir`, per-novel numbering, marker
+    `run-reservation.json`), `preview_next_run_dir` (reserves nothing), `open_existing_run`
+    (read-only gate for the future Resume), `default_output_root`. `atomic_io.py`:
+    `write_json_atomic`.
+  - Plan §9 holds the finalized manifest, legacy-migration, journal, cache and
+    interruption contracts, the compatibility risks found, and the order 03.1 to 03.4.
+  - Tests: 201 added (`test_source_identity.py`, `test_run_storage.py`); mutation checks
+    caught every non-equivalent mutant.
+  - **Owner questions, none blocking:** retire the GUI **Folder name** field when 03.3
+    adopts `<slug>-N` (decision 4), and whether pre-0.3.0 `<slug>-N` folders should ever be
+    resumable (recommended: no).
 - **01.1 recap:**
   - `ui/appearance.py` and `ui/settings.py` were adapted from PDF-Splitter.
   - Three bordered sections on the left (1. Web Novel Selection, 2. Output Options,
@@ -267,10 +286,10 @@
     `RunReport` counts duplicate displayed numbers once; the legacy single/chunked path
     announces "building" late; Resume Existing Run is a placeholder; the output root is
     unchanged; macOS menu look unverified.
-  - **Next:** owner review of 02.3 and the UI acceptance gate. Then Checkpoint 03
-    (manifest-first cache and resume; output root `Downloads/Web-Novel-Scraper-Outputs/
-    <novel>-N`). Do not start it before approval. Delete the reference folder only after
-    the final UI approval.
+  - **Next:** owner review of 03.0. Then 03.1 (manifest store, schema and legacy v2
+    migration; plan §9.2, §9.4). Do not start it before approval. The remaining launcher,
+    native-scaling and macOS checks from Checkpoints 01–02 are still open. Delete the
+    reference folder only after the final UI approval.
 
 ### Uncommitted local state (deliberately NOT committed)
 - `md-instructions/0.2.1_release_plan.md`, `0.2.1_bug-hunt.md` and
@@ -295,6 +314,9 @@
   Briefing/handoff and handoff length are docs debt for 07 (C14).
 
 ### Log (newest first)
+- 2026-10-18 — Checkpoint 03.0: source identity, safe run-folder allocator, atomic JSON
+  helper and the finalized manifest/journal/cache contracts (plan §9, ADR 009). 201 tests
+  added; nothing wired into the GUI or pipeline.
 - 2026-10-18 — Checkpoint 02.3: website-first selection (a website is a host; ADR 008),
   disabled Resume Existing Run placeholder, schema-2 preferences, counters wrap instead of
   clipping, legible "coming soon" entries in the Dark Windows menu. 125 tests added.

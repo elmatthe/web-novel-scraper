@@ -5,6 +5,28 @@ versioning.
 
 ## [Unreleased] — v0.3.0 (in progress on `feature/v0.3.0-modernization`)
 
+### Added — Source identity, safe run allocation and manifest/journal contracts (Checkpoint 03.0, no behaviour change)
+- **Nothing in the app changes yet.** Three new modules are tested and unwired: the GUI, pipeline,
+  catalog, adapters, `RequestManager`, PDF output and Resume button are untouched, and runs are
+  still named by `pipeline.resolve_output_dir`.
+- **`webnovel_scraper/source_identity.py`:** a validated source identity (canonical novel slug,
+  adapter, https origin on a supported host, index URL on that host, source identifiers). `.net`
+  and `.com` are different sources even though they share an adapter. A chapter is identified by
+  its source page URL, so two pages that both display chapter 3664 stay distinct. Displayed numbers
+  are stored as canonical text, so `627.2` and `627.10` survive serialization.
+- **`webnovel_scraper/run_storage.py`:** an allocator for `<root>/<novel-slug>-N`
+  (default root `~/Downloads/Web-Novel-Scraper-Outputs`). It reserves each new run with an
+  exclusive `mkdir`, so concurrent runs cannot claim the same folder. Existing and abandoned
+  folders are skipped, never overwritten or reused. A preview reserves nothing, and
+  `open_existing_run` is the read-only validation gate for the later Resume.
+- **`webnovel_scraper/atomic_io.py`:** an atomic JSON write (temp file, fsync, replace).
+- **Contracts:** plan §9 defines the baseline and runtime chapter manifests, coverage as set
+  membership, the legacy `chapter_index.json` import policy (read-only, identity-matched,
+  tightening the current trust of identity-less files), the run journal, the HTML cache
+  boundaries and the interruption matrix. ADR 009 records the identity decisions.
+- **Tests:** 201 added (`test_source_identity.py`, `test_run_storage.py`), offline and
+  deterministic; they include concurrent threads and processes.
+
 ### Added / Changed — Website-first selection, preferences, Resume placeholder and counter fix (Checkpoint 02.3)
 - **Section 1 is now Website, Novel, Start chapter, End chapter**
   (`scripts/app.py`, new `scripts/webnovel_scraper/ui/selection.py`, no Tk).
