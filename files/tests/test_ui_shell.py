@@ -108,7 +108,7 @@ def test_three_numbered_sections_on_the_left_and_activity_on_the_right() -> None
         assert _inside(_entry_for(win, win._start_var), selection)
         assert _inside(_entry_for(win, win._end_var), selection)
         assert _inside(_entry_for(win, win._output_target_var), run)
-        assert _inside(_entry_for(win, win._folder_name_var), run)
+        assert _inside(win._resume_btn, run) and not hasattr(win, "_folder_name_var")
     finally:
         win.destroy()
 
@@ -233,7 +233,6 @@ def test_switch_preserves_values_selection_focus_and_widgets(tmp_path) -> None:
         win._on_website_change()
         win._start_var.set("5")
         win._end_var.set("9")
-        win._folder_name_var.set("my-run")
         win._mode_var.set(OutputMode.CHUNKED.value)
         win._on_mode_change()
         win._chunk_var.set("25")
@@ -249,7 +248,7 @@ def test_switch_preserves_values_selection_focus_and_widgets(tmp_path) -> None:
         def snapshot():
             return (
                 win._novel_combo.current(), win._website_var.get(), win._start_var.get(),
-                win._end_var.get(), win._folder_name_var.get(), win._mode_var.get(),
+                win._end_var.get(), win._mode_var.get(),
                 win._chunk_var.get(), win._delay_var.get(), win._timeout_var.get(),
                 win._headless_var.get(), win._browser_var.get(), win._cache_var.get(),
                 win._output_target_var.get(), str(win._chunk_entry.cget("state")),
@@ -466,7 +465,6 @@ def test_long_names_and_paths_do_not_enlarge_the_window() -> None:
         win._site_menubtn.configure(text="Free Web Novel (.net) unusually long site name " * 4)
         win._output_target_var.set(
             "C:/" + "a-very-long-folder-name/" * 30 + "lord-of-mysteries-2-1")
-        win._folder_name_var.set("x" * 300)
         win._run_status_var.set("Stopping after the current chapter… " * 10)
         win._set_status("A long status message " * 30)
         win.update_idletasks()

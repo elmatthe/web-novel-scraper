@@ -123,12 +123,12 @@ def test_keyboard_order_follows_the_visual_order() -> None:
         assert order[1] is win._novel_combo
         assert str(order[2].cget("textvariable")) == str(win._start_var)
         assert str(order[3].cget("textvariable")) == str(win._end_var)
-        # The Resume placeholder is disabled, so keyboard traversal never stops on it.
+        # Resume Existing Run is a real control now (03.3): reachable by keyboard, after Start.
         seen, widget = [], win._site_menubtn
-        for _ in range(40):
+        for _ in range(60):
             widget = win.nametowidget(win.tk.call("tk_focusNext", str(widget)))
             seen.append(widget)
-        assert win._resume_btn not in seen
+        assert win._resume_btn in seen and seen.index(win._start_btn) < seen.index(win._resume_btn)
     finally:
         win.destroy()
 
@@ -334,7 +334,7 @@ def test_selection_is_locked_during_a_run_and_restored_after(monkeypatch, tmp_pa
         win.flush_activity()
         assert str(win._site_menubtn.cget("state")) == "normal"
         assert str(win._novel_combo.cget("state")) == "readonly"
-        assert str(win._resume_btn.cget("state")) == "disabled"
+        assert str(win._resume_btn.cget("state")) == "normal"
         assert (win._website_var.get(), win._current_slug()) == (
             "freewebnovel.com", "reverend-insanity")
     finally:
@@ -453,59 +453,114 @@ def test_coming_soon_entries_stay_dim_and_inert_in_dark_mode() -> None:
         win.destroy()
 
 
-# ── Resume Existing Run: visible, disabled, inert ────────────────────────────
-def test_resume_existing_run_is_shown_in_the_run_section_and_disabled() -> None:
+# ── Resume Existing Run (v0.3.0 03.3) ────────────────────────────────────────
+def _real_run_folder(tmp_path, mode=None):
+    """A real, finished-but-resumable run folder made by the pipeline with a fake site."""
+    from webnovel_scraper.chapter_store import ChapterManifestStore
+    from webnovel_scraper.models import ChapterContent, ChapterMeta, OutputMode, ScrapeJob
+
+    spec = catalog.get_spec("shadow-slave", "freewebnovel")
+
+    class Site:
+        warnings: list = []
+
+        def build_chapter_index(self, spec, **_kw):
+            return [ChapterMeta(index=n, url=f"{spec.url}/chapter-{n}", slug=n) for n in (1, 2, 3)]
+
+        def fetch_chapter(self, meta, spec, **_kw):
+            if meta.index == 3:
+                raise RuntimeError("HTTP 503")
+            return ChapterContent(meta.index, f"T{meta.index}", ["Body text of the chapter."])
+
+    report = pipeline.run_scrape(
+        ScrapeJob(novel_slug="shadow-slave", adapter_key="freewebnovel", start=1, end=3, delay=0.0,
+                  output_mode=mode or OutputMode.CHUNKED, chunk_size=2, use_cache=False,
+                  output_dir=tmp_path, allocate_run=True),
+        adapter=Site(), log=lambda _m: None, sleep_fn=lambda _s: None,
+        manifest_store=ChapterManifestStore(tmp_path / "b", tmp_path / "r"))
+    return report.output_dir
+
+
+def test_resume_existing_run_is_shown_in_the_run_section_and_enabled_when_idle() -> None:
     win = _make_app()
     try:
         run = win._sections[2]
         assert str(win._resume_btn.cget("text")) == "Resume Existing Run"
-        assert str(win._resume_btn.cget("state")) == "disabled"
-        assert str(win._resume_btn.cget("command")) == ""  # wired to nothing
-        assert str(win._resume_note.cget("text")) == "Available after resume support is implemented."
+        assert str(win._resume_btn.cget("state")) == "normal"
+        assert str(win._resume_note.cget("text")) == app.RESUME_NOTE
         for widget in (win._resume_btn, win._resume_note):
             assert str(widget).startswith(str(run) + ".")
-        # Below the run's own status and counters, never above Start.
         win.update()
         assert win._resume_btn.winfo_rooty() > win._start_btn.winfo_rooty()
         assert win._resume_btn.winfo_rooty() > win._run_status_label.winfo_rooty()
-        # It is not one of the inputs the run lock re-enables.
-        assert all(widget is not win._resume_btn for widget, _ in win._locked_inputs)
+        # Locked with the other inputs while a run is in progress.
+        assert any(widget is win._resume_btn for widget, _ in win._locked_inputs)
     finally:
         win.destroy()
 
 
-def test_resume_never_starts_a_scrape_or_touches_a_folder(monkeypatch, tmp_path) -> None:
+def test_resume_with_nothing_to_resume_starts_nothing_and_touches_no_folder(monkeypatch, tmp_path) -> None:
     win = _make_app()
     try:
-        called = []
+        called, asked = [], []
         monkeypatch.setattr(app.pipeline, "run_scrape", lambda *a, **k: called.append(1))
+        monkeypatch.setattr(app.messagebox, "askyesno", lambda *a, **k: asked.append(a) or False)
         out = tmp_path / "out"
         out.mkdir()
         win._output_parent = out
-        win._resume_btn.invoke()  # a disabled button's invoke does nothing
-        win._resume_btn.event_generate("<Button-1>")
-        win._resume_btn.event_generate("<ButtonRelease-1>")
-        win._resume_btn.event_generate("<space>")
+        win._resume_btn.invoke()
         win.update()
+        assert asked and "There is no unfinished run" in asked[0][1]
         assert not called and win._worker is None and not win._running
-        assert list(out.iterdir()) == []  # no output folder was created or reused
-        # Still disabled after everything that re-evaluates the controls.
-        _pick_website(win, "dynamic.webnovel.com")
-        win.toggle_appearance()
-        win._set_running(True)
-        win._set_running(False)
-        win.close_advanced_settings()
-        assert str(win._resume_btn.cget("state")) == "disabled"
+        assert list(out.iterdir()) == []
     finally:
         win.destroy()
 
 
-def test_resume_stays_disabled_through_a_full_run(monkeypatch, tmp_path) -> None:
+def test_resume_continues_the_chosen_run_exactly_as_it_was_set_up(monkeypatch, tmp_path) -> None:
+    folder = _real_run_folder(tmp_path)
     win = _make_app()
+    jobs = []
+
+    def fake(job, **_kw):
+        jobs.append(job)
+        return pipeline.RunReport(output_dir=job.output_dir)
+
+    monkeypatch.setattr(app.pipeline, "run_scrape", fake)
+    offered = []
+    monkeypatch.setattr(win, "_choose_run_to_resume", lambda runs: offered.append(runs) or runs[0].path)
     try:
-        _run_fake(win, monkeypatch, tmp_path)
-        assert str(win._resume_btn.cget("state")) == "disabled"
-        assert win._run_status_var.get() in ("Complete", "Finished — no PDFs written")
+        win._output_parent = tmp_path
+        win._mode_var.set("separate")                      # the window's own choices do not matter
+        win._resume_btn.invoke()
+        win._worker.join(5)
+        win.flush_activity()
+        assert [s.path for s in offered[0]] == [folder]
+        job = jobs[-1]
+        assert job.resume is True and not job.allocate_run and job.output_dir == folder
+        assert (job.novel_slug, job.adapter_key) == ("shadow-slave", "freewebnovel")
+        assert (job.output_mode.value, job.chunk_size, job.formats) == ("chunked", 2, ("pdf",))
+        assert (job.start, job.end) == (1, 3)
+        summary = win._log_texts[app.SUMMARY_TAB].get("1.0", "end-1c")
+        assert "Run resumed: Shadow Slave" in summary and "1 of 2 files already saved" in summary
+        assert str(win._resume_btn.cget("state")) == "normal"
+    finally:
+        win.destroy()
+
+
+def test_resume_explains_an_unusable_folder_and_changes_nothing(monkeypatch, tmp_path) -> None:
+    old = tmp_path / "shadow-slave-1"
+    old.mkdir()
+    (old / "Chapter 1_ Old.pdf").write_bytes(b"pre-0.3.0")
+    win = _make_app()
+    errors, called = [], []
+    monkeypatch.setattr(app.messagebox, "showerror", lambda *a, **k: errors.append(a))
+    monkeypatch.setattr(app.pipeline, "run_scrape", lambda *a, **k: called.append(1))
+    try:
+        assert win.start_resume(old) is False
+        assert errors and "reservation marker" in errors[0][1]
+        assert not called and not win._running
+        assert sorted(p.name for p in old.iterdir()) == ["Chapter 1_ Old.pdf"]
     finally:
         win.destroy()
 
@@ -707,5 +762,43 @@ def test_the_new_minimum_width_is_no_larger_than_before_the_resume_row() -> None
         assert min_w <= 635 * win.geometry_info["scale_percent"] // 100 + 8
         assert min_h <= 680
         assert win.geometry_info["controls_width"] <= 300
+    finally:
+        win.destroy()
+
+
+def _press_in_dialog(win, label, *, title="Resume Existing Run"):
+    """Click *label* in the open dialog once it exists (the dialog is modal)."""
+    import tkinter as tk
+    from tkinter import ttk
+
+    def walk(widget):
+        for child in widget.winfo_children():
+            yield child
+            yield from walk(child)
+
+    def attempt():
+        for top in win.winfo_children():
+            if isinstance(top, tk.Toplevel) and top.title() == title and top.winfo_exists():
+                for widget in walk(top):
+                    if isinstance(widget, ttk.Button) and str(widget.cget("text")) == label:
+                        widget.invoke()
+                        return
+        win.after(30, attempt)
+
+    win.after(60, attempt)
+
+
+def test_the_resume_list_offers_unfinished_runs_and_returns_the_choice(tmp_path) -> None:
+    from webnovel_scraper import run_index
+
+    folder = _real_run_folder(tmp_path)
+    win = _make_app()
+    try:
+        runs = run_index.list_runs(tmp_path)
+        assert [s.path for s in runs] == [folder]
+        _press_in_dialog(win, "Resume")
+        assert win._choose_run_to_resume(runs) == folder
+        _press_in_dialog(win, "Cancel")
+        assert win._choose_run_to_resume(runs) is None
     finally:
         win.destroy()

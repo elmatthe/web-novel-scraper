@@ -40,6 +40,24 @@ def _isolated_gui_settings(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_unexpected_modal_dialogs(monkeypatch):
+    """A modal dialog nobody answers would hang the whole suite (v0.3.0 03.3 added the Resume
+    dialogs). Any dialog a test did not patch for itself fails that test at once instead."""
+    from tkinter import filedialog, messagebox
+
+    def refuse(name):
+        def _raise(*args, **_kw):
+            raise AssertionError(f"unexpected modal dialog in a test: {name}{args[:2]!r}")
+        return _raise
+
+    for name in ("showerror", "showinfo", "showwarning", "askyesno", "askokcancel",
+                 "askyesnocancel", "askquestion", "askretrycancel"):
+        monkeypatch.setattr(messagebox, name, refuse(f"messagebox.{name}"))
+    for name in ("askdirectory", "askopenfilename", "asksaveasfilename"):
+        monkeypatch.setattr(filedialog, name, refuse(f"filedialog.{name}"))
+
+
+@pytest.fixture(autouse=True)
 def _isolated_chapter_lists(tmp_path, monkeypatch):
     """Give every pipeline run its own empty chapter manifest store (v0.3.0 03.2a), so a test never
     reads or writes the real ``files/runtime-data/chapter-lists/`` and never sees another test's

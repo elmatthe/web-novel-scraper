@@ -48,8 +48,8 @@ def test_headless_checkbox_initialises_off() -> None:
 
 
 def test_output_location_defaults() -> None:
-    """The output-folder controls default to the ~/Downloads parent with a blank
-    custom name (so the pipeline falls back to the novel slug)."""
+    """The output root defaults to ~/Downloads/Web-Novel-Scraper-Outputs (plan decision 4,
+    v0.3.0 03.3); the Folder name field is retired: every run is "<novel-slug>-N"."""
     tk = pytest.importorskip("tkinter")
     try:
         win = app.ScraperApp()
@@ -58,8 +58,10 @@ def test_output_location_defaults() -> None:
     try:
         # The chosen PARENT is the Downloads base, not a prior output path.
         assert win._output_parent == app.DEFAULT_OUTPUT_PARENT
-        assert win._output_parent == Path.home() / "Downloads"
-        assert win._folder_name_var.get() == ""
+        downloads = Path.home() / "Downloads"
+        base = downloads if downloads.is_dir() else Path.home()
+        assert win._output_parent == base / "Web-Novel-Scraper-Outputs"
+        assert not hasattr(win, "_folder_name_var")
         assert callable(win._on_browse)
     finally:
         win.destroy()

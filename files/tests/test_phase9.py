@@ -120,7 +120,7 @@ def _job(tmp_path, mode=OutputMode.SEPARATE, *, start=1, end=5, chunk_size=10):
 
 
 def _pdfs(tmp_path):
-    return sorted(p.name for p in tmp_path.glob("*.pdf"))
+    return sorted(p.name for p in tmp_path.rglob("*.pdf"))
 
 
 # ── 9A — GUI inter-fetch delay control ───────────────────────────────────────
@@ -252,7 +252,7 @@ def test_sweep_rescues_in_single_mode_before_pdf_written(tmp_path) -> None:
     assert report.rescued == [2]
     assert report.failed == []
     # One combined PDF containing all four chapters (the rescued one included).
-    assert _pdfs(tmp_path) == ["Shadow_Slave_All_Chapters.pdf"]
+    assert _pdfs(tmp_path) == ["Shadow_Slave_Chapters_1-4.pdf"]
 
 
 def test_more_generous_default_retries() -> None:

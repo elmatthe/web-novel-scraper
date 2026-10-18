@@ -190,7 +190,7 @@ def test_create_pdf_success_produces_valid_final_and_no_part(tmp_path) -> None:
 
     assert out.is_file() and out.stat().st_size > 0
     assert len(PdfReader(str(out)).pages) >= 1
-    assert list(tmp_path.glob("*.part")) == []   # nothing left staged
+    assert list(tmp_path.rglob("*.part")) == []   # nothing left staged
 
 
 def test_create_pdf_failure_at_replace_leaves_no_corrupt_final(tmp_path, monkeypatch) -> None:
@@ -206,7 +206,7 @@ def test_create_pdf_failure_at_replace_leaves_no_corrupt_final(tmp_path, monkeyp
         pdf_builder.create_pdf([_chapter(1)], out, title="Novel")
 
     assert not out.exists()                       # no partial/corrupt final
-    assert list(tmp_path.glob("*.part")) == []    # temp cleaned up
+    assert list(tmp_path.rglob("*.part")) == []    # temp cleaned up
 
 
 def test_create_pdf_failure_does_not_clobber_existing_final(tmp_path, monkeypatch) -> None:
@@ -224,7 +224,7 @@ def test_create_pdf_failure_does_not_clobber_existing_final(tmp_path, monkeypatc
         pdf_builder.create_pdf([_chapter(1)], out, title="Novel")
 
     assert out.read_bytes() == original           # untouched
-    assert list(tmp_path.glob("*.part")) == []
+    assert list(tmp_path.rglob("*.part")) == []
 
 
 # ── all three output modes still produce final PDFs, no .part leftovers ───────
@@ -262,10 +262,10 @@ def test_all_output_modes_write_finals_with_no_part_leftovers(tmp_path, mode) ->
     )
     assert report.failed == []
     assert len(report.written) >= 1
-    pdfs = list(tmp_path.glob("*.pdf"))
+    pdfs = list(tmp_path.rglob("*.pdf"))
     assert pdfs, "expected at least one final PDF"
     assert all(p.stat().st_size > 0 for p in pdfs)
-    assert list(tmp_path.glob("*.part")) == []   # nothing left staged in any mode
+    assert list(tmp_path.rglob("*.part")) == []   # nothing left staged in any mode
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -331,5 +331,5 @@ def test_fwn_healthy_run_writes_all_no_part_and_scope_gate_intact(tmp_path) -> N
     assert report.failed == []
     assert report.rescued == []
     assert len(report.written) == 5
-    assert len(list(tmp_path.glob("*.pdf"))) == 5
-    assert list(tmp_path.glob("*.part")) == []   # atomic write left nothing staged
+    assert len(list(tmp_path.rglob("*.pdf"))) == 5
+    assert list(tmp_path.rglob("*.part")) == []   # atomic write left nothing staged

@@ -264,6 +264,8 @@ def create_pdf(
     try:
         create_pdf_from_text(text, tmp, title=title)
         remove_single_heading_pages(tmp)  # atomic rewrite of the temp itself
+        with open(tmp, "r+b") as handle:   # on disk before it is published (v0.3.0 03.3)
+            os.fsync(handle.fileno())
         os.replace(tmp, output_path)       # atomic publish
     except BaseException:
         try:

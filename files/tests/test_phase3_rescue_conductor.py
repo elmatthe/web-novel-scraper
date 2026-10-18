@@ -180,7 +180,7 @@ def _run(job, *, behave, build, rescue_fetch, clock=None, cancel=None, limiter=N
 
 
 def _pdfs(tmp_path):
-    return sorted(p.name for p in tmp_path.glob("*.pdf"))
+    return sorted(p.name for p in tmp_path.rglob("*.pdf"))
 
 
 # common behaviours
@@ -353,7 +353,7 @@ def test_single_mode_folds_rescued(tmp_path) -> None:
     report = _run(_job(tmp_path, mode=OutputMode.SINGLE, end=4, headless=False),
                   behave=_behave_hard({1, 4}), build=_build_ok(4), rescue_fetch=_rescue_ok)
     assert sorted(report.rescued) == [1, 4]
-    assert _pdfs(tmp_path) == ["Shadow_Slave_All_Chapters.pdf"]
+    assert _pdfs(tmp_path) == ["Shadow_Slave_Chapters_1-4.pdf"]
     assert report.failed == []
 
 

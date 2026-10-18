@@ -9,6 +9,8 @@ phase, the count and the final state are checked against a real run, not a hand-
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import threading
 
 import pytest
@@ -162,7 +164,7 @@ def test_the_observer_changes_nothing_the_run_does(tmp_path) -> None:
     def execute(observe: bool, folder):
         folder.mkdir()
         run = _Run(observe).run(_job(folder, OutputMode.CHUNKED), adapter=_Adapter(5, fail_once=[3]))
-        return run, sorted(p.name for p in folder.glob("*.pdf"))
+        return run, sorted(p.name for p in folder.rglob("*.pdf"))
 
     watched, files_a = execute(True, tmp_path / "a")
     plain, files_b = execute(False, tmp_path / "b")
@@ -218,11 +220,12 @@ def test_a_chapter_that_stays_failed_still_counts_as_processed(tmp_path) -> None
 
 
 def test_chapters_already_present_are_counted_and_reported_as_skipped(tmp_path) -> None:
-    pipeline.run_scrape(_job(tmp_path), adapter=_Adapter(5), log=lambda _m: None)
-    for pdf in sorted(tmp_path.glob("*.pdf"))[:2]:
+    made = pipeline.run_scrape(replace(_job(tmp_path), allocate_run=True), adapter=_Adapter(5),
+                               log=lambda _m: None)
+    for pdf in sorted(made.output_dir.rglob("*.pdf"))[:2]:
         pdf.unlink()                                   # two chapters will be fetched again
     adapter = _Adapter(5)
-    run = _Run().run(_job(tmp_path), adapter=adapter)
+    run = _Run().run(replace(_job(made.output_dir), resume=True), adapter=adapter)
     assert adapter.fetched == [1, 2]
     assert run.progress_calls[-1] == ("progress", 5, 5)
     assert run.phases[-1] == ("phase", "scraping", 5, 3)
@@ -234,9 +237,10 @@ def test_chapters_already_present_are_counted_and_reported_as_skipped(tmp_path) 
 
 
 def test_a_whole_run_already_present_reports_no_new_pdfs(tmp_path) -> None:
-    pipeline.run_scrape(_job(tmp_path, OutputMode.SINGLE, end=4), adapter=_Adapter(4),
-                        log=lambda _m: None)
-    run = _Run().run(_job(tmp_path, OutputMode.SINGLE, end=4), adapter=_Adapter(4))
+    made = pipeline.run_scrape(replace(_job(tmp_path, OutputMode.SINGLE, end=4), allocate_run=True),
+                               adapter=_Adapter(4), log=lambda _m: None)
+    run = _Run().run(replace(_job(made.output_dir, OutputMode.SINGLE, end=4), resume=True),
+                     adapter=_Adapter(4))
     assert run.phases[0] == ("phase", "scraping", 4, 0) and run.phases[-1][3] == 4
     assert [c for c in run.phases if c[1] == "building"] == []
     view = run.finish()
@@ -337,13 +341,13 @@ def _content(i: int) -> ChapterContent:
 
 
 def _conductor(tmp_path, mode, *, hard=(), rescue_ok=True, run=None, chunk_size=2,
-               stopped=False):
+               stopped=False, **job_kw):
     clock, cancel = _Clock(), threading.Event()
     if stopped:
         cancel.set()
     job = ScrapeJob(novel_slug=NOVEL, adapter_key=KEY, start=1, end=6, delay=3.0,
                     output_mode=mode, use_cache=False, output_dir=tmp_path,
-                    chunk_size=chunk_size, use_browser=True, headless=True)
+                    chunk_size=chunk_size, use_browser=True, headless=True, **job_kw)
     limiter = HostRateLimiter(max(pipeline.HOST_MIN_INTERVAL, job.delay),
                               monotonic=clock.now, sleep=clock.sleep)
 
@@ -383,8 +387,10 @@ def test_the_conductor_reports_scraping_then_building_and_ticks_each_chapter_onc
 
 def test_the_conductor_reports_resume_skips_before_the_first_fetch(tmp_path) -> None:
     stem = pipeline._stem_for(catalog.get_spec(NOVEL, KEY))
-    (tmp_path / f"{stem}_Chapters_1-2.pdf").write_bytes(b"%PDF-1.4 already here")
-    run = _conductor(tmp_path, OutputMode.CHUNKED)
+    made = _conductor(tmp_path, OutputMode.CHUNKED, allocate_run=True).report
+    for later in ("3-4", "5-6"):                         # only the first chunk stays saved
+        (made.output_dir / "PDF" / f"{stem}_Chapters_{later}.pdf").unlink()
+    run = _conductor(made.output_dir, OutputMode.CHUNKED, resume=True)
     assert run.phases[0] == ("phase", "scraping", 6, 0)
     assert run.phases[1] == ("phase", "scraping", 6, 2)
     assert run.progress_calls[0] == ("progress", 2, 6)         # the skipped chunk, in one step

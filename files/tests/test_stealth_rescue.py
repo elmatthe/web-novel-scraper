@@ -222,7 +222,7 @@ def test_sweep_reaches_stealth_and_rescues_in_all_modes(tmp_path, monkeypatch, m
     assert report.rescued == [1]
     assert report.failed == []
     assert len(report.written) == 1
-    assert len(list(tmp_path.glob("*.pdf"))) == 1
+    assert len(list(tmp_path.rglob("*.pdf"))) == 1
     # The main pass reached both stealth rungs (2 hits) and the sweep reached a
     # stealth rung again (3rd hit) — proving the sweep re-walks the FULL ladder.
     assert recorded.count(STEALTH) + recorded.count(STEALTH_FRESH) >= 3
@@ -255,6 +255,6 @@ def test_chapter_failing_every_rung_stays_failed_and_in_summary(tmp_path, monkey
     # The chapter is clearly surfaced for the user to re-run.
     summary = report.summary()
     assert "failed chapters: 1" in summary
-    assert "re-run with the SAME output folder" in summary
+    assert "Resume Existing Run" in summary
     # Both the main pass and the sweep walked the full ladder, reaching stealth.
     assert STEALTH in recorded and STEALTH_FRESH in recorded

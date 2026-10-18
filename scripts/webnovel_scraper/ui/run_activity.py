@@ -178,18 +178,24 @@ def final_counts(report: object | None) -> FinalCounts | None:
 # ----------------------------------------------------------------------------- run start
 
 def run_started_events(*, novel: str, site: str, start: int, end: int | None, grouping: str,
-                       output_dir: Path, settings: str) -> list[ActivityEvent]:
-    """The lines a Start press reports: Summary gets the run, the range and the output;
-    Detailed also gets the effective fetch settings. ``end=None`` means through the last
-    available chapter."""
+                       output_dir: Path, settings: str, resuming: str = "",
+                       formats: tuple = ("pdf",)) -> list[ActivityEvent]:
+    """The lines a Start (or Resume) press reports: Summary gets the run, the range and the
+    output; Detailed also gets the effective fetch settings. ``end=None`` means through the last
+    available chapter. ``resuming`` (non-empty for a resume) says how far the run had got."""
     chapters = (f"Chapters: {start} to the last available chapter." if end is None
                 else f"Chapters: {start} to {end}.")
+    started = (f"Run resumed: {novel} from {site} ({resuming})." if resuming
+               else f"Run started: {novel} from {site}.")
+    where = (f"Continuing in: {output_dir}" if resuming
+             else f"Saving to: {output_dir} (a new folder for this run)")
+    kinds = " and ".join(f.upper() for f in formats) or "PDF"
     return [
         ActivityEvent(ORIGIN_RUN, SEPARATOR, kind="separator"),
-        ActivityEvent(ORIGIN_RUN, f"Run started: {novel} from {site}.", summary=True),
+        ActivityEvent(ORIGIN_RUN, started, summary=True),
         ActivityEvent(ORIGIN_RUN, chapters, summary=True),
-        ActivityEvent(ORIGIN_RUN, f"Output: PDF, {grouping}.", summary=True),
-        ActivityEvent(ORIGIN_RUN, f"Saving to: {output_dir}", summary=True),
+        ActivityEvent(ORIGIN_RUN, f"Output: {kinds}, {grouping}.", summary=True),
+        ActivityEvent(ORIGIN_RUN, where, summary=True),
         ActivityEvent(ORIGIN_RUN, f"Settings: {settings}"),
     ]
 

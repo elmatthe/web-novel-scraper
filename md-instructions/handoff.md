@@ -12,15 +12,15 @@
   `scripts/scripts-to-use-from-my-other-repo's-GUIs/`. Never `git add -A`.
 - **Owner data on disk (gitignored, never touch destructively):** the 1.2 GB pre-0.3.0 HTML cache in
   `files/cache/<novel>/` (copied on demand into `files/cache/<host>/<novel>/`), `files/runtime-data/`.
-- **Done in this session:**
-  - **Overrides A + B, 03.2b (validated HTML cache):** see plan §9.12, ADR 011/012, CHANGELOG.
-    Gate: `scripts/verify.py` PASS (see the log line below for the count).
-- **Next:** 03.3-03.4 (run journal, `<slug>-N` allocator in the GUI/pipeline, retire Folder name,
-  real Resume), then 04 (Lord of the Mysteries 1/2 on `.net`/`.com`), 05 (canonical text, TXT/PDF),
+- **Done in this session (newest first):**
+  - **03.3-03.4 (run folders, journal, Resume):** plan §9.13, ADR 014. Gate PASS 1306 (3.13.12 and
+    3.12.10). Commit after `12e83be`.
+  - **Overrides A + B, 03.2b (validated HTML cache):** plan §9.12, ADR 011/012. `12e83be`, 1272 passed.
+- **Next:** 04 (Lord of the Mysteries 1/2 on `.net`/`.com`: live investigation, catalog rows need a
+  site key because `.net`/`.com` share adapter `freewebnovel`), 05 (canonical text, TXT/PDF),
   06 (hardening), 07 (Windows bootstrap, acceptance checklist, Codex prompt).
-- **Open issues carried:** en-dash title separators ("Chapter 714: – Title", 05); the CHUNKED/SINGLE
-  paths key collected content by displayed number, so two pages sharing a number (Supreme Magus 3664)
-  collide there (fix in 05 with the output refactor); docs mojibake in Briefing/handoff (07, C14).
+- **Open issues carried:** en-dash title separators ("Chapter 714: – Title", 05); docs mojibake in
+  Briefing/handoff (07, C14). Fixed in 03.3: grouped content keyed by displayed number (now by page).
 
 ## Earlier Snapshot — v0.3.0 Checkpoint 03.2a complete (manifest preflight, discovery, both pipeline paths)
 **2026-10-18 · HOME-PC (Windows 11) · Claude Code (Sonnet 5.5) · branch

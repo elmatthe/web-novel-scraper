@@ -417,6 +417,41 @@ file without a sidecar is now a miss by design). Mutation check: 15/15 caught.
 costs a refetch); legacy pages are copied on demand, so both layouts coexist until the owner deletes
 the old folders.
 
+### 9.13 Checkpoints 03.3-03.4 result: run folders, journal and Resume (2026-10-18)
+
+**Implemented (ADR 014).** New `run_journal.py` (`RunHeader`, `RunJournal.create/resume`,
+`replay_journal`, `load_selection`, CRC-32 records), `run_output.py` (`plan_groups`, `RunOutputs`:
+groups, names, render-then-record publication, checksum-verified skips, audit) and `run_index.py`
+(`describe_run`, `list_runs` for the GUI). `pipeline._prepare_run` is the one start-of-run step for
+both paths (new run: preflight, then reserve `<slug>-N`, selection + header; resume: validate the
+folder, journal, selection, source, formats, grouping, chapter-list consistency, lock).
+`pipeline._finish_run` publishes what is pending, records failures and the end state, writes
+`run-audit.json` and releases `run.lock`. The legacy driver is one fetch loop plus one sweep for all
+three modes; the rescue conductor hands content and failures to `RunOutputs` keyed by page.
+`ScrapeJob` gains `formats`, `allocate_run`, `resume`. `pdf_builder.create_pdf` now `fsync`s before
+publishing.
+
+**GUI.** Folder name retired; the Output folder field previews the next `<slug>-N` under the root
+(default `~/Downloads/Web-Novel-Scraper-Outputs`, Browse changes the root). Resume Existing Run lists
+the unfinished runs in the root (newest first, with progress) or accepts another run folder, and
+resumes the chosen run from its journal. Refusals (`RunStorageError`, `JournalError`) end as "Run
+refused" with the reason. A test-suite safety net fails any unexpected modal dialog instead of
+hanging.
+
+**Interruption matrix (§9.7) as tested:** crash after `os.replace` before the record → file re-rendered;
+torn last journal line → ignored and trimmed; damaged earlier line → refused, nothing changed; edited or
+truncated output → re-rendered; orphan `*.part` → removed on resume; source, formats, grouping or chunk
+size changed → refused naming the field; manifest now contradicting a selected page → refused; two
+windows on one folder → refused; new run into a folder that holds a run → refused.
+
+**Tests:** `test_run_resume.py` (32, both pipeline paths, all three groupings), GUI Resume tests in
+`test_ui_selection_window.py`; earlier tests moved to journal-based resume and `PDF/` paths. Mutation
+check: 16/16 caught. Gate: see the CHANGELOG entry.
+
+**Known limits:** grouped files are written at the end of a run (a crash mid-run re-renders them from
+the HTML cache); `pipeline.resolve_output_dir` remains only for its old tests and is unused by the app;
+the Resume list reads journals only (checksums are verified when the resume starts).
+
 ## 10. Owner overrides and autonomous completion mandate (2026-10-18)
 
 The owner approved 03.2a and authorised autonomous completion of 03.2b through 07 for a **Windows-only

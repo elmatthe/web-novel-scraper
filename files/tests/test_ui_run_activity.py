@@ -141,8 +141,14 @@ def test_run_start_names_the_novel_site_range_and_output(tmp_path) -> None:
         "Run started: Shadow Slave from Free Web Novel.",
         "Chapters: 5 to the last available chapter.",
         "Output: PDF, one PDF per chapter.",
-        f"Saving to: {tmp_path / 'shadow-slave-1'}",
+        f"Saving to: {tmp_path / 'shadow-slave-1'} (a new folder for this run)",
     ]
+    resumed = ra.run_started_events(novel="N", site="S", start=1, end=40, grouping="g",
+                                    output_dir=tmp_path, settings="", formats=("pdf", "txt"),
+                                    resuming="2 of 5 files already saved")
+    assert _summary(resumed)[1] == "Run resumed: N from S (2 of 5 files already saved)."
+    assert "Output: PDF and TXT, g." in _summary(resumed)
+    assert f"Continuing in: {tmp_path}" in _summary(resumed)
     assert _detailed(events)[-1] == "Settings: delay 3 s, timeout 30 s."
     bounded = ra.run_started_events(novel="N", site="S", start=1, end=40, grouping="g",
                                     output_dir=tmp_path, settings="")

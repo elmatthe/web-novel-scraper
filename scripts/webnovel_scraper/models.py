@@ -187,8 +187,24 @@ class ScrapeJob:
     # One-shot, explicit: fetch every selected chapter page from the site again instead of
     # serving it from the HTML cache; the fresh valid pages replace the cached ones.
     refresh_html_cache: bool = False
+    # ── 0.3.0 03.3 ───────────────────────────────────────────────────────────
+    # Output formats, in render order ("pdf", "txt"); at least one. Both share one set of groups.
+    formats: tuple = ("pdf",)
+    # True: ``output_dir`` is the output ROOT and the pipeline reserves a fresh
+    # ``<novel-slug>-N`` run folder inside it once the chapter list is settled (a refused run
+    # reserves nothing). False: ``output_dir`` is the run folder itself.
+    allocate_run: bool = False
+    # True: ``output_dir`` is an earlier run folder to continue. Its journal, not this job's
+    # range, decides which pages are fetched; formats and grouping must match the journal.
+    resume: bool = False
 
     def __post_init__(self) -> None:
+        formats = tuple(self.formats)
+        if not formats or any(f not in ("pdf", "txt") for f in formats) or len(set(formats)) != len(formats):
+            raise ValueError(f"formats must be one or both of 'pdf' and 'txt' (got {self.formats!r}).")
+        self.formats = formats
+        if self.allocate_run and self.resume:
+            raise ValueError("a job either starts a new run or resumes one, not both.")
         # 0.2.0 invariant #1: strictly single-lane rescue. Reject any other count
         # here so a stray value can never spin up a second worker (the multi-worker
         # design is 0.2.1, plan §9).

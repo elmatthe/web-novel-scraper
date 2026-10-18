@@ -31,7 +31,9 @@ network.
 from __future__ import annotations
 
 import collections
+import hashlib
 import inspect
+import json
 import logging
 import re
 import threading
@@ -42,6 +44,7 @@ from typing import Callable, Iterable, Optional
 
 from . import catalog
 from . import chapter_preflight
+from .atomic_io import write_json_atomic
 from . import pdf_builder
 from . import rescue_pool as rp
 from .adapters.base import BaseAdapter
@@ -57,7 +60,25 @@ from .models import (
     SiteSpec,
     runtime_site_spec,
 )
+from .file_lock import FileLock, LockBusy
 from .registry import REGISTRY, AdapterDisabledError
+from .run_journal import (
+    LOCK_FILENAME,
+    JournalError,
+    RunHeader,
+    RunJournal,
+    load_selection,
+    replay_journal,
+    selection_sha256,
+)
+from .run_output import (
+    RunOutputs,
+    duplicate_suffix,
+    novel_stem,
+    remove_orphan_temps,
+    separate_stem,
+)
+from .run_storage import RunStorageError, allocate_run_dir, open_existing_run
 from .source_identity import SourceIdentity, SourceIdentityError
 from .request_manager import (
     HOST_MIN_INTERVAL,
@@ -71,6 +92,10 @@ from .request_manager import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Written to every run folder at the end of each session: page-by-page expected versus saved,
+# with output files and checksums, and no chapter text (v0.3.0 03.3).
+AUDIT_FILENAME = "run-audit.json"
 
 # The pre-0.3.0 output-scoped chapter index. It is never written any more and never trusted
 # directly: ``ChapterManifestStore.import_legacy_index`` validates it strictly and, only when it
@@ -199,6 +224,7 @@ class RunReport:
     rescued: list[int] = field(default_factory=list)         # ch. saved by rescue (or 2nd-pass sweep)
     warnings: list[str] = field(default_factory=list)        # adapter + pipeline warnings
     cancelled: bool = False
+    resumed: bool = False            # this session continued an earlier run folder (v0.3.0 03.3)
     auto_slowdowns: int = 0          # how many times auto-slowdown raised the delay
     effective_delay: float = 0.0     # final inter-fetch delay; never exceeds the ceiling
     # ── 0.2.0 rescue-lane metrics (§3.16) ─────────────────────────────────────
@@ -273,8 +299,8 @@ class RunReport:
             more = " …" if len(self.failed) > 20 else ""
             lines.append(f"    failed chapters: {preview}{more}")
             lines.append(
-                "    Tip: re-run with the SAME output folder to retry only the "
-                "missing chapters — already-written PDFs are skipped."
+                "    Tip: use Resume Existing Run on this run folder to retry only the "
+                "missing chapters; files already saved and verified are skipped."
             )
         if self.warnings:
             lines.append(f"  Warnings: {len(self.warnings)}")
@@ -428,90 +454,16 @@ def _build_chapter_index(
 
 # ── Filename helpers ─────────────────────────────────────────────────────────
 def _stem_for(spec: SiteSpec) -> str:
-    """A safe, space-free filename stem for chunked/single output (e.g.
-    ``Shadow_Slave``), derived from the display title with the slug as fallback."""
-    safe = BaseAdapter.safe_filename(spec.novel_title)
-    return re.sub(r"\s+", "_", safe).strip("_") or spec.novel_slug
+    """A safe, space-free filename stem for grouped output (e.g. ``Shadow_Slave``), derived
+    from the display title with the slug as fallback."""
+    return novel_stem(spec.novel_title, spec.novel_slug)
 
 
-def _chapter_identity(meta: ChapterMeta) -> tuple:
-    """Stable identity for one TOC row, including its source-space location."""
-    return (meta.index, meta.slug, meta.source_id, meta.url)
-
-
-def _separate_occurrences(
-    metas: list[ChapterMeta],
-) -> dict[tuple, tuple[int, int]]:
-    """Map each TOC row to its 1-based occurrence and displayed-number count."""
-    grouped: dict[int | float, list[ChapterMeta]] = {}
-    for meta in metas:
-        grouped.setdefault(meta.index, []).append(meta)
-
-    occurrences: dict[tuple, tuple[int, int]] = {}
-    for group in grouped.values():
-        count = len(group)
-        for ordinal, meta in enumerate(group, start=1):
-            occurrences[_chapter_identity(meta)] = (ordinal, count)
-    return occurrences
-
-
-def _duplicate_pdf_suffix(meta: ChapterMeta, occurrence: tuple[int, int]) -> str:
-    """Return a readable suffix for later rows sharing a displayed number."""
-    ordinal, count = occurrence
-    if count <= 1 or ordinal == 1:
-        return ""
-    if meta.slug is not None:
-        return f" [slug {meta.slug}]"
-    return f" [occurrence {ordinal}]"
-
-
-def _separate_pdf_name(
-    content: ChapterContent,
-    meta: ChapterMeta | None = None,
-    occurrence: tuple[int, int] = (1, 1),
-) -> str:
-    """Build a SEPARATE filename, disambiguating repeated displayed numbers."""
-    stem = BaseAdapter.safe_filename(content.heading).rstrip(".") or "untitled"
-    suffix = _duplicate_pdf_suffix(meta, occurrence) if meta is not None else ""
-    return stem + suffix + ".pdf"
-
-
-def _existing_separate_pdf(
-    output_dir: Path,
-    meta: ChapterMeta | int | float,
-    occurrence: tuple[int, int] = (1, 1),
-) -> Optional[Path]:
-    """Find an already-written SEPARATE PDF for one TOC row without
-    fetching. Every heading begins with ``Chapter N`` followed by a non-digit
-    (``:`` → ``_`` after ``safe_filename``, or ``.`` when degraded), so the index
-    can be matched off the filename alone — that is what makes resume skip the
-    network for chapters already on disk.
-
-    The ``(?!\\.\\d)`` guard stops an integer lookup (627) from matching a
-    FRACTIONAL side-chapter's file (``Chapter 627.2_ ....pdf``) — without it the
-    two would collide, since "627" is a valid prefix of "627.2\""""
-    if not output_dir.is_dir():
-        return None
-    index = meta.index if isinstance(meta, ChapterMeta) else meta
-    num = re.escape(str(index))
-    pat = re.compile(rf"^Chapter\s+{num}(?!\.\d)(?:[^0-9].*)?\.pdf$", re.IGNORECASE)
-    suffix = (
-        _duplicate_pdf_suffix(meta, occurrence)
-        if isinstance(meta, ChapterMeta)
-        else ""
-    )
-    duplicate_suffix = re.compile(r" \[(?:slug \d+|occurrence \d+)\]$", re.IGNORECASE)
-    for p in sorted(output_dir.glob("*.pdf")):
-        if not pat.match(p.name):
-            continue
-        if suffix:
-            if p.stem.endswith(suffix):
-                return p
-            continue
-        if occurrence[1] > 1 and duplicate_suffix.search(p.stem):
-            continue
-        return p
-    return None
+def _separate_pdf_name(content: ChapterContent, meta: ChapterMeta | None = None,
+                       occurrence: tuple[int, int] = (1, 1)) -> str:
+    """The individual-chapter PDF filename (the naming rule ``run_output`` publishes with)."""
+    suffix = duplicate_suffix(meta, *occurrence) if meta is not None else ""
+    return separate_stem(content) + suffix + ".pdf"
 
 
 def _record_duplicate_output_numbers(
@@ -527,36 +479,19 @@ def _record_duplicate_output_numbers(
             continue
         warning = (
             f"displayed chapter {index} occurs {count} times in the chapter list; "
-            "later source pages use slug-suffixed filenames so every PDF remains distinct."
+            "later source pages use slug-suffixed filenames so every file remains distinct."
         )
         if warning not in report.warnings:
             report.warnings.append(warning)
             log(f"WARNING: {warning}")
 
 
-def _write_separate_pdf(
-    content: ChapterContent,
-    meta: ChapterMeta,
-    occurrence: tuple[int, int],
-    output_dir: Path,
-    spec: SiteSpec,
-    report: RunReport,
-    log: LogFn,
-) -> None:
-    path = output_dir / _separate_pdf_name(content, meta, occurrence)
-    if path in report.written:
-        raise RuntimeError(
-            f"refusing to overwrite duplicate SEPARATE output path: {path.name}"
-        )
-    pdf_builder.create_pdf([content], path, title=spec.novel_title)
-    report.written.append(path)
-    log(f"  wrote {path.name}")
-
-
-def _chunks(metas: list[ChapterMeta], size: int) -> Iterable[list[ChapterMeta]]:
-    size = max(1, int(size))
-    for i in range(0, len(metas), size):
-        yield metas[i : i + size]
+def render_output(fmt: str, contents: list[ChapterContent], path: Path, title: str) -> None:
+    """Render one output file atomically (temp in the same folder, fsync, replace)."""
+    if fmt == "pdf":
+        pdf_builder.create_pdf(contents, path, title=title)
+    else:  # pragma: no cover - TXT arrives with Checkpoint 05
+        raise ValueError(f"unsupported output format {fmt!r}")
 
 
 # ── 0.2.0 fast-primary + single-lane rescue conductor (§3.9–3.16) ─────────────
@@ -701,8 +636,7 @@ class _RescueConductor:
         log: LogFn,
         run_cancel: threading.Event,
         state: "_Progress",
-        on_content: Callable[[ChapterMeta, ChapterContent], None],
-        contents: dict,
+        outputs: RunOutputs,
     ) -> None:
         self.job = job
         self.spec = spec
@@ -716,8 +650,10 @@ class _RescueConductor:
         self.log = log
         self.run_cancel = run_cancel
         self.state = state
-        self.on_content = on_content
-        self.contents = contents
+        self.outputs = outputs
+        # Pages (by URL) currently recorded as failed: two pages can share a displayed number, so
+        # clearing one page's failure must not clear its twin's (report lists are by number).
+        self._failed_pages: dict[str, int | float] = {}
         self.pool: Optional[object] = None
 
     # ── pool lifecycle (lazy) ─────────────────────────────────────────────────
@@ -791,17 +727,17 @@ class _RescueConductor:
             return
         if kind == "not_found":
             self.breaker.record_network(is_challenge=False)
-            self._fail(meta.index, permanent=True)
+            self._fail(meta, permanent=True, reason=f"not found ({payload})")
             self.log(f"  chapter {meta.index} permanently unavailable (not found).")
             return
         if kind == "extraction":
             self.breaker.record_network(is_challenge=False)
-            self._fail(meta.index, extraction=True)
-            self.log(f"  chapter {meta.index} fetched but had no extractable body.")
+            self._fail(meta, extraction=True, reason=str(payload))
+            self.log(f"  chapter {meta.index} fetched but had no extractable body ({payload}).")
             return
         if kind == "error":
             # Not a fetch-layer signal — record a plain failure (resumeable), no rescue.
-            self._fail(meta.index)
+            self._fail(meta, reason=str(payload))
             self.log(f"  chapter {meta.index} FAILED: {payload}")
             return
         if kind == "rate_limited":
@@ -869,14 +805,14 @@ class _RescueConductor:
                 continue  # still limited — the next nav waits the (re-applied) cooldown
             if kind == "not_found":
                 self.breaker.record_network(is_challenge=False)
-                self._fail(meta.index, permanent=True)
+                self._fail(meta, permanent=True, reason=f"not found ({payload})")
                 return
             if kind == "extraction":
                 self.breaker.record_network(is_challenge=False)
-                self._fail(meta.index, extraction=True)
+                self._fail(meta, extraction=True, reason=str(payload))
                 return
             if kind == "error":
-                self._fail(meta.index)
+                self._fail(meta, reason=str(payload))
                 return
             # A challenge/transient surfaced once the rate limit cleared → rescue it.
             if kind == "challenge":
@@ -893,7 +829,7 @@ class _RescueConductor:
             f"  chapter {meta.index} still rate-limited after {RATE_LIMIT_RETRY_BUDGET} "
             "retries; recording a transient failure for resume."
         )
-        self._fail(meta.index)  # plain failed — not permanent, not rescued, not a block
+        self._fail(meta, reason="still rate-limited")  # plain failed — not permanent, not rescued, not a block
 
     def _submit_rescue(self, meta: ChapterMeta, kind: str) -> None:
         pool = self._ensure_pool()
@@ -909,15 +845,24 @@ class _RescueConductor:
     # ── terminal helpers ──────────────────────────────────────────────────────
     def _store_content(self, meta: ChapterMeta, content: ChapterContent) -> None:
         index = meta.index
-        self.contents[index] = content
-        if index in self.report.failed:
+        self._failed_pages.pop(meta.url, None)
+        if index in self.report.failed and index not in self._failed_pages.values():
             self.report.failed.remove(index)  # a prior transient now cleared
-        self.on_content(meta, content)  # SEPARATE writes promptly; others store
+        self.outputs.add(meta, content)  # individual chapters are published at once
         self.state.tick()
 
-    def _fail(self, index: int, *, permanent: bool = False, extraction: bool = False) -> None:
-        if index not in self.report.failed:
-            self.report.failed.append(index)
+    def _mark_failed(self, meta: ChapterMeta, reason: str) -> None:
+        self._failed_pages[meta.url] = meta.index
+        if meta.index not in self.report.failed:
+            self.report.failed.append(meta.index)
+        self.outputs.fail(meta, reason)
+
+    def _fail(
+        self, meta: ChapterMeta, *, permanent: bool = False, extraction: bool = False,
+        reason: str = "failed",
+    ) -> None:
+        index = meta.index
+        self._mark_failed(meta, reason)
         if permanent and index not in self.report.permanent_failed:
             self.report.permanent_failed.append(index)
         if extraction and index not in self.report.extraction_failed:
@@ -935,21 +880,19 @@ class _RescueConductor:
             self._store_content(res.meta, res.content)  # ticks + writes SEPARATE
             self.log(f"  chapter {idx} rescued ({res.strategy}).")
         elif res.status == rp.RESCUE_EXHAUSTED:
-            if idx not in self.report.failed:
-                self.report.failed.append(idx)
+            self._mark_failed(res.meta, "failed after every recovery method")
             if idx not in self.report.rescue_exhausted:
                 self.report.rescue_exhausted.append(idx)
             self.state.tick()
             self.log(f"  chapter {idx} failed after all methods.")
         elif res.status == rp.NOT_FOUND:
-            self._fail(idx, permanent=True)
+            self._fail(res.meta, permanent=True, reason="not found (via rescue)")
             self.log(f"  chapter {idx} permanently unavailable (not found, via rescue).")
         elif res.status == rp.EXTRACTION_FAILED:
-            self._fail(idx, extraction=True)
+            self._fail(res.meta, extraction=True, reason=f"no usable chapter text ({res.error})")
             self.log(f"  chapter {idx} fetched but had no extractable body (via rescue).")
         elif res.status == rp.POOL_FAILED:
-            if idx not in self.report.failed:
-                self.report.failed.append(idx)
+            self._mark_failed(res.meta, f"rescue pool error: {res.error}")
             self.state.tick()
             self.log(f"  chapter {idx} failed (rescue pool error: {res.error}).")
         elif res.status == rp.CANCELLED:
@@ -1031,10 +974,10 @@ def run_scrape(
             "(not yet available in this release); the pipeline will not run it."
         )
 
-    output_dir = Path(job.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    # The run folder is created (or reserved, or reopened for a resume) only once the chapter
+    # list is settled, so a refused run leaves nothing behind (v0.3.0 03.3).
     report = RunReport(
-        output_dir=output_dir,
+        output_dir=Path(job.output_dir),
         requested_range=(job.start, job.end),
         effective_range=(job.start, job.end),
     )
@@ -1046,7 +989,7 @@ def run_scrape(
     #     a breaker switch (§3.10/§3.15).
     if _rescue_enabled(job) and adapter is None:
         return _run_with_rescue(
-            job, spec, output_dir, report, log, cancel_event, progress_cb,
+            job, spec, report, log, cancel_event, progress_cb,
             phase_cb=phase_cb, sleep_fn=sleep_fn, monotonic_fn=monotonic_fn, host_limiter=host_limiter,
             store=store,
             request_manager_factory=request_manager_factory,
@@ -1098,10 +1041,11 @@ def run_scrape(
     pacer = _Pacer(job.delay, log=log, sleep_fn=sleep_fn)
     try:
         return _drive(
-            job, drive_spec, adapter, output_dir, report, log, cancel_event,
+            job, drive_spec, adapter, report, log, cancel_event,
             progress_cb, pacer, phase_cb, store=store,
         )
     except ScrapeCancelled as exc:
+        # Cancelled while the chapter list was being settled (nothing was started yet).
         log(f"Run cancelled: {exc}")
         report.cancelled = True
         _collect_warnings(adapter, report)
@@ -1114,7 +1058,6 @@ def run_scrape(
 def _run_with_rescue(
     job: ScrapeJob,
     spec: SiteSpec,
-    output_dir: Path,
     report: RunReport,
     log: LogFn,
     cancel_event: Optional[threading.Event],
@@ -1204,55 +1147,50 @@ def _run_with_rescue(
             return _bootstrap_toc(primary, spec, report, log, run_cancel, **window)
 
         try:
-            in_range = _resolve_chapters(
-                job, spec, store, output_dir, discover, report, log, run_cancel
+            run = _prepare_run(
+                job, spec, store, discover, report, log, run_cancel, progress_cb, phase_cb
             )
         except ScrapeCancelled as exc:
             log(f"Run cancelled: {exc}")
             report.cancelled = True
             _collect_warnings(primary.adapter, report)
             return report
-        if in_range is None:
+        if run is None:
             _collect_warnings(primary.adapter, report)
             return report
 
-        # 4. Drive the fast primary pass + rescue lane, then assemble output.
-        contents: dict[int, ChapterContent] = {}
-        state = _Progress(total=len(in_range), cb=progress_cb, phase_cb=phase_cb)
-        state.phase(PHASE_SCRAPING)
-        on_content = _make_on_content(
-            job, spec, output_dir, in_range, report, log, contents
-        )
+        # 4. Drive the fast primary pass + rescue lane; outputs are published as groups fill.
         conductor = _RescueConductor(
             job=job, spec=spec, runtime_spec=runtime_spec, primary=primary,
             breaker=breaker, pacer=pacer, limiter=limiter, pool_factory=pool_factory,
-            report=report, log=log, run_cancel=run_cancel, state=state,
-            on_content=on_content, contents=contents,
+            report=report, log=log, run_cancel=run_cancel, state=run.state,
+            outputs=run.outputs,
         )
-
-        fetch_list = _plan_fetch_list(job, spec, output_dir, in_range, report, state)
         try:
-            for meta in fetch_list:
-                if _cancelled(run_cancel):
-                    report.cancelled = True
-                    break
-                conductor.drain()             # continuous result processing (§3.12)
-                conductor.handle(meta, allow_breaker=True)
-        except ScrapeCancelled as exc:
-            log(f"Run cancelled: {exc}")
-            report.cancelled = True
+            try:
+                for meta in run.fetch_list:
+                    if _cancelled(run_cancel):
+                        report.cancelled = True
+                        break
+                    conductor.drain()             # continuous result processing (§3.12)
+                    conductor.handle(meta, allow_breaker=True)
+            except ScrapeCancelled as exc:
+                log(f"Run cancelled: {exc}")
+                report.cancelled = True
 
-        # 5. Final blocking drain (§3.12): every accepted job terminalizes exactly once.
-        conductor.final_drain(cancelled=report.cancelled or _cancelled(run_cancel))
-        conductor.record_metrics()
+            # 5. Final blocking drain (§3.12): every accepted job terminalizes exactly once.
+            conductor.final_drain(cancelled=report.cancelled or _cancelled(run_cancel))
+            conductor.record_metrics()
+            if _cancelled(run_cancel):
+                report.cancelled = True
 
-        # 6. Assemble chunked/single output (folding rescued content in index order).
-        #    SEPARATE PDFs were written promptly by ``on_content``. No partial
-        #    chunked/single PDF is written on cancel (re-fetched cleanly on resume).
-        if not report.cancelled:
-            if job.output_mode is not OutputMode.SEPARATE:
-                state.phase(PHASE_BUILDING)
-            _assemble_output(job, spec, output_dir, in_range, contents, report, log)
+            # 6. Publish the grouped files (rescued content folded in, in selection order).
+            if not report.cancelled and job.output_mode is not OutputMode.SEPARATE:
+                run.state.phase(PHASE_BUILDING)
+            _finish_run(run, report, log)
+        except BaseException:
+            _abort_run(run, log)
+            raise
 
         report.auto_slowdowns = pacer.slowdowns
         report.effective_delay = pacer.current
@@ -1337,154 +1275,252 @@ def _bootstrap_toc(
         ) from exc
 
 
-def _resolve_chapters(
+@dataclass
+class _Run:
+    """One run folder in use: its journal, its outputs, the pages still to fetch, its lock."""
+
+    run_dir: Path
+    journal: RunJournal
+    outputs: RunOutputs
+    fetch_list: list
+    state: "_Progress"
+    lock: FileLock
+
+
+def _lock_run(run_dir: Path) -> FileLock:
+    lock = FileLock(run_dir / LOCK_FILENAME)
+    try:
+        lock.acquire()
+    except LockBusy:
+        raise RunStorageError(
+            f"The run folder {run_dir.name} is already being used by another run or window. "
+            "Nothing was changed."
+        ) from None
+    return lock
+
+
+def _new_run_folder(job: ScrapeJob, spec: SiteSpec) -> tuple[Path, int]:
+    """Reserve ``<root>/<slug>-N`` (``allocate_run``) or create the given folder."""
+    if job.allocate_run:
+        reserved = allocate_run_dir(job.output_dir, spec.novel_slug)
+        return reserved.path, reserved.number
+    folder = Path(job.output_dir)
+    folder.mkdir(parents=True, exist_ok=True)
+    match = re.fullmatch(re.escape(spec.novel_slug) + r"-([1-9][0-9]*)", folder.name)
+    return folder, int(match.group(1)) if match else 0
+
+
+def _differing_source_fields(saved: SourceIdentity, current: SourceIdentity) -> list[str]:
+    a, b = saved.to_json(), current.to_json()
+    return [name for name in a if a[name] != b.get(name)]
+
+
+def _open_resume(job: ScrapeJob, spec: SiteSpec, store: ChapterManifestStore, log: LogFn):
+    """Validate an earlier run folder for Resume (read-only checks first, then the lock).
+
+    Refuses, naming the reason, a folder this version did not create, a damaged journal or
+    selection, another novel or source, other output formats or grouping, or a chapter list that
+    now contradicts the run's pages. Returns ``(run_dir, lock, replay, chapters)``."""
+    run_dir = Path(job.output_dir)
+    found = open_existing_run(run_dir.parent, run_dir, expected_novel_slug=spec.novel_slug)
+    lock = _lock_run(found.path)
+    try:
+        replay = replay_journal(found.path / "run-journal.jsonl")
+        header = replay.header
+        if header.novel_slug != found.novel_slug or header.run_number != found.number:
+            raise JournalError("The run journal describes another run folder.")
+        current = SourceIdentity.from_site_spec(spec)
+        if header.source != current:
+            fields = ", ".join(_differing_source_fields(header.source, current)) or "identity"
+            raise JournalError(
+                f"This run was made from a different source than the selected website "
+                f"({fields} differ). Choose the same website, or start a new run."
+            )
+        if tuple(job.formats) != header.formats:
+            raise JournalError(
+                f"This run saves {'/'.join(header.formats).upper()}, not "
+                f"{'/'.join(job.formats).upper()} (output formats differ)."
+            )
+        if job.output_mode.value != header.grouping_mode or (
+            header.grouping_mode == "chunked" and job.chunk_size != header.chunk_size
+        ):
+            raise JournalError("This run used a different grouping (or chunk size).")
+        chapters = load_selection(found.path, header)
+        loaded = store.load_effective(current, quarantine=False)
+        known = {c.page_url: c for c in loaded.effective.chapters}
+        for chapter in chapters:
+            now = known.get(chapter.page_url)
+            if now is not None and (
+                now.label != chapter.label
+                or (now.slug is not None and chapter.slug is not None and now.slug != chapter.slug)
+            ):
+                raise JournalError(
+                    f"The site's chapter list changed since this run began: {chapter.page_url} was "
+                    f"chapter {chapter.label} and is now chapter {now.label}. Start a new run."
+                )
+    except BaseException:
+        lock.release()
+        raise
+    return found.path, lock, replay, chapters
+
+
+def _prepare_run(
     job: ScrapeJob,
     spec: SiteSpec,
     store: ChapterManifestStore,
-    output_dir: Path,
     discover: Callable[..., list],
     report: RunReport,
     log: LogFn,
     cancel_event: Optional[threading.Event],
-) -> Optional[list[ChapterMeta]]:
-    """The one chapter-selection step both execution paths share (v0.3.0 03.2a).
+    progress_cb: Optional[ProgressFn],
+    phase_cb: Optional[PhaseFn],
+) -> Optional[_Run]:
+    """The one start-of-run step both execution paths share (v0.3.0 03.2a + 03.3).
 
-    Returns the selected chapters, or ``None`` when the site returned no chapter list at all
-    (the report then carries the warning, as before). Refuses with
-    :class:`ChapterListRefused` rather than clamping a range the list cannot satisfy."""
-    selection = chapter_preflight.resolve_chapters(
-        spec,
-        start=job.start,
-        end=_end_hint_for(job),
-        store=store,
-        discover=discover,
-        log=log,
-        legacy_index=output_dir / INDEX_FILENAME,
-        refresh=job.refresh_chapter_list,
-        cancel_event=cancel_event,
-    )
-    if selection.empty_index:
-        report.warnings.append("The chapter index came back empty; nothing to do.")
-        return None
-    _record_selection(selection, report, log)
-    return selection.chapters
-
-
-def _make_on_content(
-    job: ScrapeJob,
-    spec: SiteSpec,
-    output_dir: Path,
-    in_range: list[ChapterMeta],
-    report: RunReport,
-    log: LogFn,
-    contents: dict,
-) -> Callable[[ChapterMeta, ChapterContent], None]:
-    """For SEPARATE, write each chapter's PDF promptly as its content lands (§3.12);
-    for CHUNKED/SINGLE the content is folded into the file at the end (it is already
-    held in ``contents``), so the callback is a no-op there."""
-    if job.output_mode is not OutputMode.SEPARATE:
-        return lambda _meta, _content: None
-
-    occurrences = _separate_occurrences(in_range)
-    _record_duplicate_output_numbers(in_range, report, log)
-
-    def _write(meta: ChapterMeta, content: ChapterContent) -> None:
-        _write_separate_pdf(
-            content,
-            meta,
-            occurrences[_chapter_identity(meta)],
-            output_dir,
-            spec,
-            report,
-            log,
+    A new run settles its chapters from the validated manifest (refusing what cannot be
+    confirmed, clamping an oversized End), then reserves its folder and writes the selection and
+    journal header. A resume validates the earlier folder and uses the run's own fixed selection,
+    with no table-of-contents request. Either way, complete outputs are skipped (verified by
+    checksum) and the rest is returned to fetch. ``None``: nothing to do (an empty chapter list)."""
+    resumed = bool(job.resume)
+    if resumed:
+        run_dir, lock, replay, chapters = _open_resume(job, spec, store, log)
+        header = replay.header
+        try:
+            journal = RunJournal.resume(run_dir, replay)
+            journal.resumed()
+            for orphan in remove_orphan_temps(run_dir):
+                log(f"  removed an interrupted temporary file: {orphan.name}")
+        except BaseException:
+            lock.release()
+            raise
+        metas = [chapter_preflight.meta_from_identity(c) for c in chapters]
+        report.requested_range = header.requested
+        report.effective_range = header.effective
+        report.range_notes = list(header.notes)
+        report.resumed = True
+        log(
+            f"Resuming {run_dir.name}: {len(chapters)} chapters ({header.first_label} to "
+            f"{header.last_label}) exactly as the run selected them; no chapter-list request."
         )
+    else:
+        selection = chapter_preflight.resolve_chapters(
+            spec,
+            start=job.start,
+            end=_end_hint_for(job),
+            store=store,
+            discover=discover,
+            log=log,
+            legacy_index=None if job.allocate_run else Path(job.output_dir) / INDEX_FILENAME,
+            refresh=job.refresh_chapter_list,
+            cancel_event=cancel_event,
+        )
+        if selection.empty_index:
+            report.warnings.append("The chapter index came back empty; nothing to do.")
+            return None
+        _record_selection(selection, report, log)
+        metas = selection.chapters
+        if not metas:
+            report.warnings.append("No chapter in the selected range can be saved; nothing to do.")
+            return None
+        source = SourceIdentity.from_site_spec(spec)
+        chapters = [chapter_preflight.identity_from_meta(source, m) for m in metas]
+        run_dir, number = _new_run_folder(job, spec)
+        lock = _lock_run(run_dir)
+        try:
+            effective = store.load_effective(source, quarantine=False).effective
+            notes = list(selection.range_notes)
+            if selection.toc_gaps:
+                notes.append(f"{len(selection.toc_gaps)} chapter number(s) inside the range are not "
+                             "on the site's chapter list")
+            header = RunHeader(
+                novel_slug=spec.novel_slug, run_number=number, source=source,
+                selection_sha256=selection_sha256(chapters), selection_count=len(chapters),
+                first_label=chapters[0].label.text, last_label=chapters[-1].label.text,
+                requested=(job.start, job.end), effective=tuple(selection.effective_range),
+                formats=tuple(job.formats), grouping_mode=job.output_mode.value,
+                chunk_size=int(job.chunk_size), manifest_sha256=_manifest_digest(effective),
+                notes=tuple(notes), created_utc=store.now_utc(),
+            )
+            journal = RunJournal.create(run_dir, header, chapters)
+        except BaseException:
+            lock.release()
+            raise
 
-    return _write
+    report.output_dir = run_dir
+    labels = [c.label.text for c in chapters]
+    outputs = RunOutputs(
+        run_dir=run_dir, journal=journal, metas=metas, labels=labels, mode=job.output_mode,
+        chunk_size=job.chunk_size, formats=tuple(job.formats), title=spec.novel_title,
+        stem=_stem_for(spec), render=render_output, report=report, log=log,
+        replay=replay if resumed else None,
+    )
+    try:
+        if job.output_mode is OutputMode.SEPARATE:
+            _record_duplicate_output_numbers(metas, report, log)
+        fetch_list = outputs.plan_fetch()
+        state = _Progress(total=len(metas), cb=progress_cb, phase_cb=phase_cb)
+        state.phase(PHASE_SCRAPING)
+        done = outputs.resumed_positions
+        if done:
+            report.skipped_existing.extend(metas[p].index for p in done)
+            state.tick(len(done), skipped=True)
+            log(f"  {len(done)} chapter(s) already saved and verified by checksum; skipping them.")
+    except BaseException:
+        _end_journal(journal, "failed", log)
+        lock.release()
+        raise
+    return _Run(run_dir=run_dir, journal=journal, outputs=outputs, fetch_list=fetch_list,
+                state=state, lock=lock)
 
 
-def _plan_fetch_list(
-    job: ScrapeJob,
-    spec: SiteSpec,
-    output_dir: Path,
-    in_range: list[ChapterMeta],
-    report: RunReport,
-    state: "_Progress",
-) -> list[ChapterMeta]:
-    """Apply resume-skips per output mode and return the chapters that still need
-    fetching. Skipped chapters are recorded + ticked here (their terminal state is
-    'already present'), exactly as the legacy modes resume."""
-    if job.output_mode is OutputMode.SEPARATE:
-        occurrences = _separate_occurrences(in_range)
-        out: list[ChapterMeta] = []
-        for meta in in_range:
-            occurrence = occurrences[_chapter_identity(meta)]
-            if _existing_separate_pdf(output_dir, meta, occurrence) is not None:
-                report.skipped_existing.append(meta.index)
-                state.tick(skipped=True)
-            else:
-                out.append(meta)
-        return out
+def _manifest_digest(effective: object) -> Optional[str]:
+    """Which chapter list the run was selected from (provenance only, never checked on resume:
+    the run's own selection file is what a resume uses)."""
+    try:
+        rows = [c.to_json() for c in effective.chapters]
+        spans = [list(span) for span in effective.spans]
+    except Exception:  # noqa: BLE001 - provenance only; never blocks a run
+        return None
+    payload = json.dumps({"chapters": rows, "spans": spans}, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
-    stem = _stem_for(spec)
-    if job.output_mode is OutputMode.SINGLE:
-        if (output_dir / f"{stem}_All_Chapters.pdf").exists():
-            report.skipped_existing.extend(m.index for m in in_range)
-            state.tick(len(in_range), skipped=True)
-            return []
-        return list(in_range)
 
-    # CHUNKED — skip whole chunks whose PDF already exists (resume).
-    out = []
-    for group in _chunks(in_range, job.chunk_size):
-        a, b = group[0].index, group[-1].index
-        if (output_dir / f"{stem}_Chapters_{a}-{b}.pdf").exists():
-            report.skipped_existing.extend(m.index for m in group)
-            state.tick(len(group), skipped=True)
+def _end_journal(journal: RunJournal, state: str, log: LogFn, **counts: object) -> None:
+    try:
+        journal.end(state, **counts)
+    except OSError as exc:
+        log(f"WARNING: the run journal could not be updated ({exc}); a resume re-checks every file.")
+
+
+def _finish_run(run: _Run, report: RunReport, log: LogFn) -> None:
+    """Publish what is pending, record failures and how the session ended, write the audit and
+    release the folder."""
+    try:
+        run.outputs.finish(cancelled=report.cancelled)
+        outputs = run.outputs
+        if report.cancelled:
+            state = "cancelled"
+        elif outputs.failed or outputs.pending:
+            state = "complete_with_problems"
         else:
-            out.extend(group)
-    return out
+            state = "complete"
+        _end_journal(run.journal, state, log, files=len(report.written),
+                     failed=len(outputs.failed), incomplete_groups=len(outputs.pending))
+        try:
+            write_json_atomic(run.run_dir / AUDIT_FILENAME, outputs.audit())
+        except OSError as exc:
+            log(f"WARNING: the run audit could not be written ({exc}).")
+    finally:
+        run.lock.release()
 
 
-def _assemble_output(
-    job: ScrapeJob,
-    spec: SiteSpec,
-    output_dir: Path,
-    in_range: list[ChapterMeta],
-    contents: dict,
-    report: RunReport,
-    log: LogFn,
-) -> None:
-    """Write CHUNKED/SINGLE PDFs after the final rescue drain, folding rescued
-    content into the correct file in index order (§3.12). SEPARATE was written
-    promptly by ``on_content`` and needs nothing here. Only chapters whose content
-    was collected (primary success or rescued) are included; resume-skipped chunks
-    were already excluded from ``in_range`` fetching and are not rewritten."""
-    if job.output_mode is OutputMode.SEPARATE:
-        return
-
-    stem = _stem_for(spec)
-    if job.output_mode is OutputMode.SINGLE:
-        if (output_dir / f"{stem}_All_Chapters.pdf").exists():
-            return
-        ordered = [contents[i] for i in sorted(contents)]
-        if ordered:
-            path = output_dir / f"{stem}_All_Chapters.pdf"
-            pdf_builder.create_pdf(ordered, path, title=spec.novel_title)
-            report.written.append(path)
-            log(f"  wrote {path.name} ({len(ordered)} chapters)")
-        return
-
-    # CHUNKED — one PDF per chunk, each sorted by chapter index.
-    for group in _chunks(in_range, job.chunk_size):
-        a, b = group[0].index, group[-1].index
-        path = output_dir / f"{stem}_Chapters_{a}-{b}.pdf"
-        if path.exists():
-            continue  # resume-skipped chunk
-        present = [contents[m.index] for m in group if m.index in contents]
-        if present:
-            pdf_builder.create_pdf(present, path, title=spec.novel_title)
-            report.written.append(path)
-            log(f"  wrote {path.name} ({len(present)} chapters)")
+def _abort_run(run: _Run, log: LogFn) -> None:
+    """An unexpected error ended the run: record it (best effort) and release the folder."""
+    try:
+        _end_journal(run.journal, "failed", log)
+    finally:
+        run.lock.release()
 
 
 def _cancelled(cancel_event: Optional[threading.Event]) -> bool:
@@ -1503,7 +1539,6 @@ def _drive(
     job: ScrapeJob,
     spec: SiteSpec,
     adapter: object,
-    output_dir: Path,
     report: RunReport,
     log: LogFn,
     cancel_event: Optional[threading.Event],
@@ -1517,27 +1552,61 @@ def _drive(
     def discover(**window) -> list[ChapterMeta]:
         return _build_chapter_index(adapter, spec, **window)
 
-    in_range = _resolve_chapters(
-        job, spec, store, output_dir, discover, report, log, cancel_event
-    )
-    if in_range is None:
+    run = _prepare_run(job, spec, store, discover, report, log, cancel_event, progress_cb, phase_cb)
+    if run is None:
         _collect_warnings(adapter, report)
         return report
 
-    # 5. Emit per the output mode.
-    stem = _stem_for(spec)
-    state = _Progress(total=len(in_range), cb=progress_cb, phase_cb=phase_cb)
-    state.phase(PHASE_SCRAPING)
+    reasons: dict[str, str] = {}
+    try:
+        obtained: set[str] = set()
+        try:
+            # 4. One pass over the pages still needed, then ONE second-pass sweep over the
+            #    non-permanent failures (Phase 9C): a chapter that clears minutes later is still
+            #    saved, into its own group, before any grouped file is written.
+            for meta in run.fetch_list:
+                if _cancelled(cancel_event):
+                    report.cancelled = True
+                    break
+                content = _fetch_one(adapter, meta, spec, report, log, job, cancel_event, pacer,
+                                     sleep_after=True, reasons=reasons)
+                if content is not None:
+                    obtained.add(meta.url)
+                    run.outputs.add(meta, content)
+                run.state.tick()
 
-    if job.output_mode is OutputMode.SEPARATE:
-        _run_separate(job, spec, adapter, output_dir, in_range, report, log,
-                      cancel_event, state, pacer)
-    elif job.output_mode is OutputMode.CHUNKED:
-        _run_chunked(job, spec, adapter, output_dir, in_range, stem, report, log,
-                     cancel_event, state, pacer)
-    else:  # SINGLE
-        _run_single(job, spec, adapter, output_dir, in_range, stem, report, log,
-                    cancel_event, state, pacer)
+            sweep = [m for m in run.fetch_list if m.url not in obtained and m.url in reasons
+                     and m.index not in report.permanent_failed
+                     and m.index not in report.extraction_failed]
+            if sweep and not report.cancelled and not _cancelled(cancel_event):
+                log(f"Second-pass sweep: re-attempting {len(sweep)} failed chapter(s)…")
+                for meta in sweep:
+                    if _cancelled(cancel_event):
+                        report.cancelled = True
+                        break
+                    content = _fetch_one(adapter, meta, spec, report, log, job, cancel_event,
+                                         pacer, sleep_after=True, reasons=reasons)
+                    if content is not None:
+                        obtained.add(meta.url)
+                        if meta.index in report.failed:
+                            report.failed.remove(meta.index)
+                        report.rescued.append(meta.index)
+                        run.outputs.add(meta, content)
+        except ScrapeCancelled as exc:
+            log(f"Run cancelled: {exc}")
+            report.cancelled = True
+        if _cancelled(cancel_event):
+            report.cancelled = True
+
+        for meta in run.fetch_list:
+            if meta.url not in obtained and meta.url in reasons:
+                run.outputs.fail(meta, reasons[meta.url])
+        if not report.cancelled and job.output_mode is not OutputMode.SEPARATE and run.outputs.pending:
+            run.state.phase(PHASE_BUILDING)
+        _finish_run(run, report, log)
+    except BaseException:
+        _abort_run(run, log)
+        raise
 
     report.auto_slowdowns = pacer.slowdowns
     report.effective_delay = pacer.current
@@ -1600,6 +1669,7 @@ def _fetch_one(
     pacer: _Pacer,
     *,
     sleep_after: bool,
+    reasons: Optional[dict] = None,
 ) -> Optional[ChapterContent]:
     """Fetch one chapter. A failure is recorded and returns None (never fatal);
     ``ScrapeCancelled`` is allowed to propagate so the run ends cleanly.
@@ -1618,6 +1688,8 @@ def _fetch_one(
         # as a plain failure, but do NOT register an auto-slowdown step and do NOT
         # mark it sweepable (re-fetching the same page yields the same empty body).
         log(f"  chapter {meta.index} FAILED (extraction, not a block): {exc}")
+        if reasons is not None:
+            reasons[meta.url] = f"no usable chapter text ({exc})"
         if meta.index not in report.failed:
             report.failed.append(meta.index)
         if meta.index not in report.extraction_failed:
@@ -1628,6 +1700,8 @@ def _fetch_one(
         return None
     except Exception as exc:  # one bad chapter must never kill the run
         log(f"  chapter {meta.index} FAILED: {exc}")
+        if reasons is not None:
+            reasons[meta.url] = str(exc)
         if meta.index not in report.failed:
             report.failed.append(meta.index)
         if _is_permanent_failure(exc):
@@ -1641,6 +1715,8 @@ def _fetch_one(
             if sleep_after and not _cancelled(cancel_event):
                 pacer.sleep()
         return None
+    if reasons is not None:
+        reasons.pop(meta.url, None)
     if sleep_after and not _cancelled(cancel_event):
         pacer.sleep()
     return content
@@ -1655,211 +1731,3 @@ def _sweepable(report: RunReport) -> list[int]:
         for i in report.failed
         if i not in report.permanent_failed and i not in report.extraction_failed
     ]
-
-
-def _run_separate(job, spec, adapter, output_dir, in_range, report, log,
-                  cancel_event, state, pacer) -> None:
-    by_index = {m.index: m for m in in_range}
-    occurrences = _separate_occurrences(in_range)
-    _record_duplicate_output_numbers(in_range, report, log)
-
-    def _write(meta: ChapterMeta, content: ChapterContent) -> None:
-        _write_separate_pdf(
-            content,
-            meta,
-            occurrences[_chapter_identity(meta)],
-            output_dir,
-            spec,
-            report,
-            log,
-        )
-
-    for meta in in_range:
-        if _cancelled(cancel_event):
-            report.cancelled = True
-            return
-        occurrence = occurrences[_chapter_identity(meta)]
-        existing = _existing_separate_pdf(output_dir, meta, occurrence)
-        if existing is not None:
-            report.skipped_existing.append(meta.index)
-            state.tick(skipped=True)
-            continue
-        content = _fetch_one(
-            adapter, meta, spec, report, log, job, cancel_event, pacer,
-            sleep_after=True,
-        )
-        if content is not None:
-            _write(meta, content)
-        state.tick()
-
-    # Second-pass sweep (Phase 9C): re-attempt every non-permanent failed chapter
-    # once more, at the (possibly auto-slowed) delay — intermittent Cloudflare
-    # often clears minutes later. A rescued chapter is written and removed from
-    # the failed list; permanent 404s were excluded and stay failed.
-    to_sweep = _sweepable(report)
-    if to_sweep and not _cancelled(cancel_event):
-        log(f"Second-pass sweep: re-attempting {len(to_sweep)} failed chapter(s)…")
-        for index in to_sweep:
-            if _cancelled(cancel_event):
-                report.cancelled = True
-                return
-            content = _fetch_one(
-                adapter, by_index[index], spec, report, log, job, cancel_event,
-                pacer, sleep_after=True,
-            )
-            if content is not None:
-                report.failed.remove(index)
-                report.rescued.append(index)
-                _write(by_index[index], content)
-
-
-def _fetch_block_with_sweep(
-    job, spec, adapter, metas, report, log, cancel_event, state, pacer
-) -> Optional[list[ChapterContent]]:
-    """Fetch a group of chapters for chunked/single output, then run the
-    second-pass sweep over that group's non-permanent failures *before* the PDF is
-    built, so a rescued chapter is included in the file. Returns the collected
-    contents (index-ordered), or None when the run was cancelled mid-group (so the
-    caller writes no partial PDF)."""
-    contents: dict[int, ChapterContent] = {}
-    failed_metas: list[ChapterMeta] = []
-    for meta in metas:
-        if _cancelled(cancel_event):
-            report.cancelled = True
-            return None
-        content = _fetch_one(
-            adapter, meta, spec, report, log, job, cancel_event, pacer,
-            sleep_after=True,
-        )
-        if content is not None:
-            contents[meta.index] = content
-        elif (
-            meta.index not in report.permanent_failed
-            and meta.index not in report.extraction_failed
-        ):
-            failed_metas.append(meta)
-        state.tick()
-
-    if failed_metas and not _cancelled(cancel_event):
-        log(f"Second-pass sweep: re-attempting {len(failed_metas)} failed chapter(s)…")
-        for meta in failed_metas:
-            if _cancelled(cancel_event):
-                report.cancelled = True
-                return None
-            content = _fetch_one(
-                adapter, meta, spec, report, log, job, cancel_event, pacer,
-                sleep_after=True,
-            )
-            if content is not None:
-                contents[meta.index] = content
-                if meta.index in report.failed:
-                    report.failed.remove(meta.index)
-                report.rescued.append(meta.index)
-
-    return [contents[i] for i in sorted(contents)]
-
-
-def _run_chunked(job, spec, adapter, output_dir, in_range, stem, report, log,
-                 cancel_event, state, pacer) -> None:
-    """Chunked output with ONE second-pass sweep over the whole run.
-
-    The first pass fetches every chunk and records its content; non-permanent
-    failures from every chunk are collected globally. After the main loop a single
-    sweep re-attempts them all once (permanent 403/404 excluded) and slots each
-    rescued chapter back into its own chunk. Only then are the chunk PDFs written —
-    same filenames/order as before, each sorted by chapter index. Doing the sweep
-    once (instead of once per chunk) means a chapter that only clears minutes later
-    is still rescued into the correct file."""
-    # Each pending entry owns one chunk's output: its PDF path and its
-    # index -> content map (filled in the main pass, topped up by the sweep).
-    pending: list[dict] = []
-    failed_metas: list[ChapterMeta] = []
-    entry_for_index: dict[int, dict] = {}
-
-    for group in _chunks(in_range, job.chunk_size):
-        if _cancelled(cancel_event):
-            report.cancelled = True
-            break
-        a, b = group[0].index, group[-1].index
-        path = output_dir / f"{stem}_Chapters_{a}-{b}.pdf"
-        if path.exists():
-            report.skipped_existing.extend(m.index for m in group)
-            state.tick(len(group), skipped=True)
-            continue
-        contents: dict[int, ChapterContent] = {}
-        entry = {"path": path, "contents": contents}
-        cancelled_mid_group = False
-        for meta in group:
-            if _cancelled(cancel_event):
-                report.cancelled = True
-                cancelled_mid_group = True
-                break
-            content = _fetch_one(
-                adapter, meta, spec, report, log, job, cancel_event, pacer,
-                sleep_after=True,
-            )
-            if content is not None:
-                contents[meta.index] = content
-            elif (
-                meta.index not in report.permanent_failed
-                and meta.index not in report.extraction_failed
-            ):
-                failed_metas.append(meta)
-                entry_for_index[meta.index] = entry
-            state.tick()
-        if cancelled_mid_group:
-            break
-        pending.append(entry)
-
-    # One second-pass sweep over ALL non-permanent failures collected above
-    # (permanent 403/404 were never added, so they are not re-attempted).
-    if failed_metas and not report.cancelled and not _cancelled(cancel_event):
-        log(f"Second-pass sweep: re-attempting {len(failed_metas)} failed chapter(s)…")
-        for meta in failed_metas:
-            if _cancelled(cancel_event):
-                report.cancelled = True
-                break
-            content = _fetch_one(
-                adapter, meta, spec, report, log, job, cancel_event, pacer,
-                sleep_after=True,
-            )
-            if content is not None:
-                entry_for_index[meta.index]["contents"][meta.index] = content
-                if meta.index in report.failed:
-                    report.failed.remove(meta.index)
-                report.rescued.append(meta.index)
-
-    # Do not write any partial output on cancel — a half-fetched run is re-fetched
-    # cleanly on resume into the same output dir.
-    if report.cancelled:
-        return
-
-    if any(entry["contents"] for entry in pending):
-        state.phase(PHASE_BUILDING)
-    for entry in pending:
-        contents = entry["contents"]
-        if contents:
-            ordered = [contents[i] for i in sorted(contents)]
-            pdf_builder.create_pdf(ordered, entry["path"], title=spec.novel_title)
-            report.written.append(entry["path"])
-            log(f"  wrote {entry['path'].name} ({len(ordered)} chapters)")
-
-
-def _run_single(job, spec, adapter, output_dir, in_range, stem, report, log,
-                cancel_event, state, pacer) -> None:
-    path = output_dir / f"{stem}_All_Chapters.pdf"
-    if path.exists():
-        report.skipped_existing.extend(m.index for m in in_range)
-        state.tick(len(in_range), skipped=True)
-        log(f"  {path.name} already present; skipping (resume).")
-        return
-    contents = _fetch_block_with_sweep(
-        job, spec, adapter, in_range, report, log, cancel_event, state, pacer
-    )
-    if report.cancelled:
-        return  # no partial single PDF
-    if contents:
-        state.phase(PHASE_BUILDING)
-        pdf_builder.create_pdf(contents, path, title=spec.novel_title)
-        report.written.append(path)
-        log(f"  wrote {path.name} ({len(contents)} chapters)")

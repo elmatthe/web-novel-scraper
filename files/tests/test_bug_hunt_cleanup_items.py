@@ -21,11 +21,31 @@ def test_degraded_separate_filename_has_single_dot_pdf_suffix() -> None:
     assert pipeline._separate_pdf_name(content) == "Chapter 7.pdf"
 
 
-def test_existing_double_dot_degraded_pdf_still_matches_resume(tmp_path) -> None:
-    old_name = tmp_path / "Chapter 7..pdf"
-    old_name.write_bytes(b"old pdf")
+def test_a_stray_pdf_with_a_matching_name_is_never_taken_as_already_saved(tmp_path) -> None:
+    """v0.3.0 03.3 (plan §9.5): only a journal record whose checksum matches counts. The
+    pre-0.3.0 filename scan (which matched "Chapter 7..pdf" for chapter 7) is gone."""
+    assert not hasattr(pipeline, "_existing_separate_pdf")
+    from webnovel_scraper.models import ChapterMeta, OutputMode
+    from webnovel_scraper.run_journal import RunHeader, RunJournal, selection_sha256
+    from webnovel_scraper.run_output import RunOutputs
+    from webnovel_scraper.source_identity import SourceIdentity
+    from webnovel_scraper import catalog, chapter_preflight
 
-    assert pipeline._existing_separate_pdf(tmp_path, 7) == old_name
+    spec = catalog.get_spec("shadow-slave", "freewebnovel")
+    source = SourceIdentity.from_site_spec(spec)
+    meta = ChapterMeta(index=7, url=f"{spec.url}/chapter-7", slug=7)
+    chapters = [chapter_preflight.identity_from_meta(source, meta)]
+    header = RunHeader(novel_slug="shadow-slave", run_number=0, source=source,
+                       selection_sha256=selection_sha256(chapters), selection_count=1,
+                       first_label="7", last_label="7", requested=(7, 7), effective=(7, 7),
+                       formats=("pdf",), grouping_mode="separate", chunk_size=10)
+    journal = RunJournal.create(tmp_path, header, chapters)
+    (tmp_path / "PDF").mkdir()
+    (tmp_path / "PDF" / "Chapter 7.pdf").write_bytes(b"old pdf")
+    outputs = RunOutputs(run_dir=tmp_path, journal=journal, metas=[meta], labels=["7"],
+                         mode=OutputMode.SEPARATE, chunk_size=10, formats=("pdf",), title="SS",
+                         stem="SS", render=lambda *a: None, report=None, log=lambda _m: None)
+    assert outputs.plan_fetch() == [meta]       # still needed: the file proves nothing
 
 
 def test_rescue_pool_start_is_idempotent_under_concurrent_callers(monkeypatch) -> None:

@@ -5,6 +5,57 @@ See AI-WORKSPACE.md for how this fits alongside Briefing, Changelog, and Handoff
 
 ---
 
+## 014 — A run is a folder with a fixed selection and a checksummed journal; Resume trusts only that — 2026-10-18 — Claude (Opus 5.5)
+
+**Status:** Accepted (v0.3.0 Checkpoints 03.3-03.4; implements plan §9.5/§9.7)
+
+**Context:** Before 03.3 a "resume" was any re-run into a folder: a PDF whose name looked right was
+skipped, a custom Folder name could point anywhere, and the chapter list was re-derived each time, so
+a resumed run could silently change its chapters, formats or source. Grouped files were keyed by
+displayed number, so two pages sharing a number collided.
+
+**Decision:**
+1. **Folder.** A new run reserves `<output root>/<novel-slug>-N` (03.0 allocator, exclusive `mkdir`)
+   only after its chapter list is settled; a refused run leaves no folder. The Folder name field is
+   retired. The root defaults to `~/Downloads/Web-Novel-Scraper-Outputs`.
+2. **Fixed selection.** `run-selection.json` holds the run's pages (URL, label, slug, ids, title) in
+   order; its SHA-256 is in the journal header. A resume uses exactly these pages and makes no
+   table-of-contents request, however the site's list has changed since; if the current saved list
+   now gives one of those pages another number, the resume is refused.
+3. **Journal.** `run-journal.jsonl`: header + `publish`/`failure`/`resume`/`end` records, CRC-32 per
+   line, consecutive `seq`, `fsync` per record. A torn last line is ignored and trimmed; any other
+   damage refuses the resume. No chapter text is ever written to it.
+4. **Publication.** Render to a temp file beside the target, `fsync`, `os.replace`, hash, then
+   record. A group/format counts as done only if its latest record lacks no page and the file's size
+   and SHA-256 match; filename presence alone never counts. An unrecorded file is rendered again.
+5. **Resume is journal-authoritative.** Formats, grouping, chunk size and range come from the
+   header; a job that disagrees, another novel, or another source fingerprint is refused, naming the
+   difference. The GUI builds the resume job *from* the journal and only asks which run.
+6. **Groups.** Outputs live in `PDF/` (and `TXT/`, Checkpoint 05); one grouping for every format;
+   grouped files are named `<Novel>_Chapters_<first>-<last>` from the first and last *selected*
+   labels (the whole-range file no longer says "All_Chapters"); content is keyed by page, so equal
+   displayed numbers never collide; a name another group owns gets the group key appended. Grouped
+   files are published at the end; on Stop only groups with every page obtained are published; a
+   group published with pages missing records them and is completed by a later resume.
+7. **One worker per folder.** `run.lock` (the 03.2a `FileLock`) is held for the whole run.
+8. **Audit.** Each session rewrites `run-audit.json`: per selected page its label, URL, slug, title,
+   status (saved / resumed / failed / not saved), reason, and the file and SHA-256 holding it.
+
+**Alternatives considered:**
+- *Store only the selection hash and re-derive pages on resume.* Rejected: a refreshed or grown list
+  would silently change the run.
+- *Publish complete chunks during the run.* More crash-resilient but changes the established
+  "Building output" phase; the HTML cache already makes re-fetching cheap. Revisit if long grouped
+  runs show a need.
+- *Keep outputs at the folder root.* Rejected: TXT and PDF side by side plus four metadata files is
+  confusing; format folders keep the run folder readable.
+
+**Consequences:** Pre-0.3.0 folders are never resumable and never touched (owner decision). Tests that
+re-ran into one folder to "resume" now reserve a run and resume it explicitly; tests of the filename
+scan were replaced by "a stray file is never trusted" regressions.
+
+---
+
 ## 013 — v0.3.0 is a Windows-only release candidate; macOS acceptance is deferred — 2026-10-18 — Claude (Opus 5.5)
 
 **Status:** Accepted (owner decision, 2026-10-18; supersedes the two-platform gate in plan §4 07 and §5)

@@ -142,7 +142,7 @@ def test_fixture_chapter_parses_and_renders_pdf(tmp_path) -> None:
     )
 
     assert report.failed == []
-    pdfs = sorted(tmp_path.glob("*.pdf"))
+    pdfs = sorted(tmp_path.rglob("*.pdf"))
     assert [p.name for p in pdfs] == ["Chapter 5_ The Test.pdf"]
     text = " ".join(page.extract_text() or "" for page in PdfReader(str(pdfs[0])).pages)
     assert "The Test" in text

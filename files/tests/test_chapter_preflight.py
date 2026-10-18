@@ -212,7 +212,7 @@ def test_extending_keeps_every_earlier_overlay_chapter(tmp_path, store):
     assert [c.label.text for c in persisted.chapters][:12] == [str(n) for n in range(1, 13)]
     assert persisted.covers(1, 20)
     # a later request inside what is now covered needs no traffic
-    run(tmp_path, store, adapter, 1, 20)
+    run(tmp_path, store, adapter, 1, 20, folder="again")
     assert len(adapter.calls) == 1
 
 
@@ -622,9 +622,9 @@ def test_refresh_without_a_saved_list_says_so_and_still_discovers(tmp_path, stor
 
 def test_two_refreshes_in_one_second_get_unique_backup_names(tmp_path, store):
     names = set()
-    for _ in range(3):
+    for attempt in range(3):
         write_overlay(store, range(1, 6))
-        run(tmp_path / "x", store, WindowAdapter(range(1, 6)), 1, 5, refresh=True)
+        run(tmp_path / "x", store, WindowAdapter(range(1, 6)), 1, 5, refresh=True, folder=f"out{attempt}")
         names |= {p.name for p in store.runtime_path(SOURCE).parent.glob("*.bak-*")}
     assert len(names) == 3
 

@@ -134,7 +134,7 @@ class DuplicateDisplayedNumberAdapter(FakeAdapter):
         )
 
 
-def _job(tmp_path, mode: OutputMode, *, start=1, end=5, chunk_size=10) -> ScrapeJob:
+def _job(tmp_path, mode: OutputMode, *, start=1, end=5, chunk_size=10, **kw) -> ScrapeJob:
     return ScrapeJob(
         novel_slug=ENABLED_NOVEL,
         adapter_key=ENABLED_KEY,
@@ -145,11 +145,13 @@ def _job(tmp_path, mode: OutputMode, *, start=1, end=5, chunk_size=10) -> Scrape
         use_cache=False,
         output_dir=tmp_path,
         chunk_size=chunk_size,
+        **kw,
     )
 
 
 def _pdfs(tmp_path) -> list[str]:
-    return sorted(p.name for p in tmp_path.glob("*.pdf"))
+    """Every PDF under the folder (v0.3.0 03.3 publishes into the run folder's ``PDF/``)."""
+    return sorted(p.name for p in tmp_path.rglob("*.pdf"))
 
 
 def _runtime_manifest(store):
@@ -200,7 +202,9 @@ def test_single_mode_writes_one_pdf(tmp_path) -> None:
         _job(tmp_path, OutputMode.SINGLE), adapter=adapter, log=lambda m: None
     )
 
-    assert _pdfs(tmp_path) == ["Shadow_Slave_All_Chapters.pdf"]
+    # v0.3.0 03.3: the whole-range file is named by its range, not "All_Chapters".
+    assert _pdfs(tmp_path) == ["Shadow_Slave_Chapters_1-5.pdf"]
+    assert (tmp_path / "PDF" / "Shadow_Slave_Chapters_1-5.pdf").is_file()
     assert len(report.written) == 1
     assert adapter.fetched == [1, 2, 3, 4, 5]
 
@@ -208,22 +212,23 @@ def test_single_mode_writes_one_pdf(tmp_path) -> None:
 # ── Resume ───────────────────────────────────────────────────────────────────
 def test_resume_skips_existing_separate_pdfs(tmp_path) -> None:
     first = FakeAdapter(count=5)
-    pipeline.run_scrape(
-        _job(tmp_path, OutputMode.SEPARATE), adapter=first, log=lambda m: None
+    made = pipeline.run_scrape(
+        _job(tmp_path, OutputMode.SEPARATE, allocate_run=True), adapter=first, log=lambda m: None
     )
+    assert made.output_dir == tmp_path / "shadow-slave-1"
     assert len(_pdfs(tmp_path)) == 5
 
-    # Second run into the SAME dir: nothing should be fetched, the index should
-    # be loaded from the saved manifest (build not called again), and every chapter is skipped.
+    # Resume the SAME run: its journal decides; nothing is fetched (every file verifies by
+    # checksum) and no chapter-list request is made.
     second = FakeAdapter(count=5)
     report = pipeline.run_scrape(
-        _job(tmp_path, OutputMode.SEPARATE), adapter=second, log=lambda m: None
+        _job(made.output_dir, OutputMode.SEPARATE, resume=True), adapter=second, log=lambda m: None
     )
 
-    assert second.built == 0  # covered by the saved chapter list: no TOC request
+    assert second.built == 0  # a resume uses the run's own selection: no TOC request
     assert second.fetched == []  # no chapter re-fetched
     assert sorted(report.skipped_existing) == [1, 2, 3, 4, 5]
-    assert report.written == []
+    assert report.written == [] and report.resumed is True
     assert len(_pdfs(tmp_path)) == 5  # unchanged
 
 
@@ -231,7 +236,7 @@ def test_duplicate_displayed_numbers_write_and_resume_as_distinct_pdfs(tmp_path)
     logs: list[str] = []
     first = DuplicateDisplayedNumberAdapter()
     report = pipeline.run_scrape(
-        _job(tmp_path, OutputMode.SEPARATE, start=3664, end=3664),
+        _job(tmp_path, OutputMode.SEPARATE, start=3664, end=3664, allocate_run=True),
         adapter=first,
         log=logs.append,
     )
@@ -248,7 +253,7 @@ def test_duplicate_displayed_numbers_write_and_resume_as_distinct_pdfs(tmp_path)
 
     second = DuplicateDisplayedNumberAdapter()
     resumed = pipeline.run_scrape(
-        _job(tmp_path, OutputMode.SEPARATE, start=3664, end=3664),
+        _job(report.output_dir, OutputMode.SEPARATE, start=3664, end=3664, resume=True),
         adapter=second,
         log=lambda _message: None,
     )
@@ -261,13 +266,14 @@ def test_duplicate_displayed_numbers_write_and_resume_as_distinct_pdfs(tmp_path)
 
 
 def test_resume_skips_existing_single_pdf(tmp_path) -> None:
-    pipeline.run_scrape(
-        _job(tmp_path, OutputMode.SINGLE, end=3), adapter=FakeAdapter(count=3),
+    made = pipeline.run_scrape(
+        _job(tmp_path, OutputMode.SINGLE, end=3, allocate_run=True), adapter=FakeAdapter(count=3),
         log=lambda m: None,
     )
     second = FakeAdapter(count=3)
     report = pipeline.run_scrape(
-        _job(tmp_path, OutputMode.SINGLE, end=3), adapter=second, log=lambda m: None
+        _job(made.output_dir, OutputMode.SINGLE, end=3, resume=True), adapter=second,
+        log=lambda m: None,
     )
     assert second.fetched == []
     assert report.written == []
@@ -311,13 +317,13 @@ def test_an_explicit_range_inside_the_list_runs_and_an_open_end_reaches_the_tail
 
     open_ended = FakeAdapter(count=5)
     report = pipeline.run_scrape(
-        _job(tmp_path, OutputMode.SEPARATE, start=3, end=10**9),
+        _job(tmp_path / "second", OutputMode.SEPARATE, start=3, end=10**9),
         adapter=open_ended,
         log=lambda m: None,
     )
     assert report.effective_range == (3, 5)
     assert open_ended.built == 1           # the open end always re-checks the tail
-    assert open_ended.fetched == [5]       # 3 and 4 were already written by the first run
+    assert open_ended.fetched == [3, 4, 5]  # a new run folder: everything is saved again
 
 
 def test_exhausted_chapter_failure_recorded_and_run_continues(tmp_path) -> None:

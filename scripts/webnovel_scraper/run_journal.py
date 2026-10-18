@@ -1,0 +1,376 @@
+"""Append-only, checksummed run journal and the fixed selection of a run (v0.3.0 03.3, plan §9.5).
+
+A run folder ``<root>/<novel-slug>-N`` holds, next to its outputs:
+
+* ``run-reservation.json`` - written by ``run_storage.allocate_run_dir`` (who reserved the folder);
+* ``run-selection.json``   - the run's chapter pages, in order, exactly as selected when it began;
+* ``run-journal.jsonl``    - one header line, then one line per event, each with a CRC;
+* ``run.lock``             - held while a run (new or resumed) is working in the folder.
+
+The selection is written once and never changed: a resumed run fetches exactly the pages the run
+started with, whatever the site's chapter list says today. Its SHA-256 is in the journal header,
+so an edited or swapped selection is refused.
+
+Journal lines are ``{"seq": n, "type": ..., ..., "crc": "xxxxxxxx"}`` where ``crc`` is CRC-32 over
+the canonical JSON of the line without it, ``seq`` counts from 0 (the header) without gaps, and
+every line is flushed and ``fsync``-ed before the call returns. A crash can only tear the *last*
+line, which replay ignores (and a resume trims before appending). A bad line anywhere else, a gap
+in ``seq`` or a header that does not describe this folder makes the journal unusable: Resume
+refuses and a new run is the remedy.
+
+Event types: ``publish`` (an output file: group key, format, relative path, size, SHA-256, the
+selection positions it holds and the ones it lacks), ``failure`` (a page that could not be saved),
+``resume`` (a resumed session began) and ``end`` (how a session ended). Nothing here contains
+chapter text.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import zlib
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Iterable, Optional
+
+from .atomic_io import write_json_atomic
+from .source_identity import ChapterIdentity, SourceIdentity, SourceIdentityError
+
+JOURNAL_FILENAME = "run-journal.jsonl"
+SELECTION_FILENAME = "run-selection.json"
+LOCK_FILENAME = "run.lock"
+JOURNAL_KIND = "web-novel-scraper-run-journal"
+SELECTION_KIND = "web-novel-scraper-run-selection"
+SCHEMA_VERSION = 1
+APP_VERSION = "0.3.0"
+GROUPING_MODES = ("separate", "chunked", "single")
+FORMATS = ("pdf", "txt")
+END_STATES = ("complete", "complete_with_problems", "cancelled", "failed")
+# A selection or journal larger than this is not something this app wrote.
+MAX_FILE_BYTES = 64 * 1024 * 1024
+_HEX64 = re.compile(r"[0-9a-f]{64}")
+_REL_PATH = re.compile(r"(?:PDF|TXT)/[^/\\:*?\"<>|\x00-\x1f]{1,250}\.(?:pdf|txt)")
+
+
+class JournalError(RuntimeError):
+    """The run's journal or selection cannot be trusted (the message says why)."""
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _canonical(payload: object) -> bytes:
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def record_crc(record: dict) -> str:
+    """CRC-32 (8 hex digits) over a record's canonical JSON without its ``crc`` field."""
+    body = {k: v for k, v in record.items() if k != "crc"}
+    return f"{zlib.crc32(_canonical(body)) & 0xFFFFFFFF:08x}"
+
+
+def selection_sha256(chapters: Iterable[ChapterIdentity]) -> str:
+    return hashlib.sha256(_canonical([c.to_json() for c in chapters])).hexdigest()
+
+
+def file_sha256(path: Path) -> tuple[int, str]:
+    """``(size, sha256)`` of a file, read in blocks."""
+    digest = hashlib.sha256()
+    size = 0
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+            size += len(block)
+    return size, digest.hexdigest()
+
+
+# ── header ───────────────────────────────────────────────────────────────────
+@dataclass(frozen=True)
+class RunHeader:
+    """What a run is: which source, which pages, which outputs. Fixed for the run's life."""
+
+    novel_slug: str
+    run_number: int
+    source: SourceIdentity
+    selection_sha256: str
+    selection_count: int
+    first_label: str
+    last_label: str
+    requested: tuple[int, int]
+    effective: tuple[int, int]
+    formats: tuple[str, ...]
+    grouping_mode: str
+    chunk_size: int
+    manifest_sha256: Optional[str] = None
+    notes: tuple[str, ...] = ()
+    app_version: str = APP_VERSION
+    created_utc: str = ""
+
+    def __post_init__(self) -> None:
+        if self.grouping_mode not in GROUPING_MODES:
+            raise JournalError(f"Unknown grouping mode {self.grouping_mode!r}.")
+        if not self.formats or any(f not in FORMATS for f in self.formats) or len(set(self.formats)) != len(self.formats):
+            raise JournalError(f"Invalid output formats {self.formats!r}.")
+        if type(self.chunk_size) is not int or self.chunk_size < 1:
+            raise JournalError(f"Invalid chunk size {self.chunk_size!r}.")
+        if not _HEX64.fullmatch(self.selection_sha256 or ""):
+            raise JournalError("The run's selection checksum is malformed.")
+        if self.source.novel_slug != self.novel_slug:
+            raise JournalError("The run's source belongs to another novel.")
+
+    def to_json(self) -> dict:
+        return {
+            "kind": JOURNAL_KIND,
+            "schema_version": SCHEMA_VERSION,
+            "run": {"novel_slug": self.novel_slug, "number": self.run_number},
+            "source": self.source.to_json(),
+            "source_fingerprint": self.source.fingerprint(),
+            "selection": {
+                "sha256": self.selection_sha256, "count": self.selection_count,
+                "first_label": self.first_label, "last_label": self.last_label,
+                "requested": list(self.requested), "effective": list(self.effective),
+            },
+            "formats": list(self.formats),
+            "grouping": {"mode": self.grouping_mode, "chunk_size": self.chunk_size},
+            "manifest": {"content_sha256": self.manifest_sha256},
+            "notes": list(self.notes),
+            "app_version": self.app_version,
+            "created_utc": self.created_utc,
+        }
+
+    @classmethod
+    def from_json(cls, raw: dict) -> "RunHeader":
+        try:
+            if raw.get("kind") != JOURNAL_KIND or raw.get("schema_version") != SCHEMA_VERSION:
+                raise JournalError("The journal was not written by this version of the app.")
+            source = SourceIdentity.from_json(raw["source"])
+            if raw.get("source_fingerprint") != source.fingerprint():
+                raise JournalError("The journal's source record does not match its fingerprint.")
+            sel, grouping = raw["selection"], raw["grouping"]
+            return cls(
+                novel_slug=raw["run"]["novel_slug"], run_number=int(raw["run"]["number"]),
+                source=source, selection_sha256=sel["sha256"], selection_count=int(sel["count"]),
+                first_label=str(sel["first_label"]), last_label=str(sel["last_label"]),
+                requested=tuple(int(v) for v in sel["requested"]),
+                effective=tuple(int(v) for v in sel["effective"]),
+                formats=tuple(raw["formats"]), grouping_mode=grouping["mode"],
+                chunk_size=grouping["chunk_size"], manifest_sha256=raw["manifest"]["content_sha256"],
+                notes=tuple(str(n) for n in raw.get("notes", ())), app_version=str(raw["app_version"]),
+                created_utc=str(raw["created_utc"]),
+            )
+        except JournalError:
+            raise
+        except (KeyError, TypeError, ValueError, AttributeError, SourceIdentityError) as exc:
+            raise JournalError(f"The journal header is malformed ({exc}).") from exc
+
+
+# ── replay ───────────────────────────────────────────────────────────────────
+@dataclass
+class Replay:
+    header: RunHeader
+    publishes: dict = field(default_factory=dict)    # (group key, format) -> latest publish record
+    failures: list = field(default_factory=list)
+    ends: list = field(default_factory=list)
+    sessions: int = 1
+    next_seq: int = 1
+    good_length: int = 0                              # bytes up to the last intact line
+    torn_tail: bool = False
+
+    @property
+    def last_end(self) -> Optional[str]:
+        return self.ends[-1]["state"] if self.ends else None
+
+
+def _check_publish(record: dict, count: int) -> None:
+    for name in ("key", "format", "path", "size", "sha256", "pages", "missing"):
+        if name not in record:
+            raise JournalError(f"a publish record lacks {name!r}")
+    if record["format"] not in FORMATS or not _REL_PATH.fullmatch(record["path"]):
+        raise JournalError("a publish record names an unexpected file")
+    if not record["path"].upper().startswith(record["format"].upper() + "/"):
+        raise JournalError("a publish record's file is in the wrong format folder")
+    if type(record["size"]) is not int or record["size"] < 0 or not _HEX64.fullmatch(str(record["sha256"])):
+        raise JournalError("a publish record has a malformed checksum")
+    for name in ("pages", "missing"):
+        values = record[name]
+        if not isinstance(values, list) or any(type(v) is not int or not 0 <= v < count for v in values):
+            raise JournalError(f"a publish record has malformed {name}")
+
+
+def replay_journal(path: Path) -> Replay:
+    """Read and verify a journal. Raises :class:`JournalError` if it cannot be trusted."""
+    try:
+        if path.stat().st_size > MAX_FILE_BYTES:
+            raise JournalError("The run journal is unexpectedly large.")
+        data = path.read_bytes()
+    except FileNotFoundError:
+        raise JournalError("This folder has no run journal, so it cannot be resumed.") from None
+    except OSError as exc:
+        raise JournalError(f"The run journal could not be read ({exc}).") from exc
+    lines = data.split(b"\n")
+    complete = lines[:-1]                  # every line that ended with a newline
+    tail = lines[-1]                       # b"" when the file ends with a newline
+    replay: Optional[Replay] = None
+    offset = 0
+    for number, raw_line in enumerate(complete):
+        is_last = number == len(complete) - 1 and not tail
+        try:
+            record = json.loads(raw_line.decode("utf-8"))
+            if not isinstance(record, dict) or record.get("crc") != record_crc(record):
+                raise ValueError("checksum mismatch")
+            if record.get("seq") != number:
+                raise ValueError("sequence gap")
+        except (ValueError, UnicodeDecodeError) as exc:
+            if is_last:                    # a torn final line: ignore it, resume trims it
+                if replay is None:
+                    break
+                replay.torn_tail = True
+                break
+            raise JournalError(f"Line {number + 1} of the run journal is damaged ({exc}).") from None
+        if number == 0:
+            if record.get("type") != "header":
+                raise JournalError("The run journal does not start with a header.")
+            replay = Replay(header=RunHeader.from_json(record))
+        else:
+            assert replay is not None
+            kind = record.get("type")
+            if kind == "publish":
+                try:
+                    _check_publish(record, replay.header.selection_count)
+                except JournalError as exc:
+                    raise JournalError(f"Line {number + 1} of the run journal: {exc}.") from None
+                replay.publishes[(record["key"], record["format"])] = record
+            elif kind == "failure":
+                replay.failures.append(record)
+            elif kind == "end":
+                if record.get("state") not in END_STATES:
+                    raise JournalError(f"Line {number + 1} of the run journal has an unknown end state.")
+                replay.ends.append(record)
+            elif kind == "resume":
+                replay.sessions += 1
+            else:
+                raise JournalError(f"Line {number + 1} of the run journal has an unknown type {kind!r}.")
+        offset += len(raw_line) + 1
+        replay.next_seq = number + 1
+        replay.good_length = offset
+    if replay is None:
+        raise JournalError("The run journal has no readable header.")
+    if tail:                               # bytes after the last newline: a torn append
+        replay.torn_tail = True
+    return replay
+
+
+# ── the journal ──────────────────────────────────────────────────────────────
+class RunJournal:
+    """Writes one run folder's journal. Create a new run with :meth:`create`, continue one with
+    :meth:`resume`. Not thread-safe by itself; the pipeline writes from one thread."""
+
+    def __init__(self, run_dir: Path, next_seq: int, clock=_utc_now) -> None:
+        self.run_dir = Path(run_dir)
+        self.path = self.run_dir / JOURNAL_FILENAME
+        self._seq = next_seq
+        self._clock = clock
+
+    # -- creation -----------------------------------------------------------
+    @classmethod
+    def create(
+        cls, run_dir: Path, header: RunHeader, chapters: list[ChapterIdentity], *, clock=_utc_now
+    ) -> "RunJournal":
+        """Write the selection, then the journal header. Refuses a folder that already has either."""
+        run_dir = Path(run_dir)
+        journal_path, selection_path = run_dir / JOURNAL_FILENAME, run_dir / SELECTION_FILENAME
+        if journal_path.exists() or selection_path.exists():
+            raise JournalError(
+                f"{run_dir} already holds a run. Use Resume Existing Run for it, or start a new run."
+            )
+        if selection_sha256(chapters) != header.selection_sha256 or len(chapters) != header.selection_count:
+            raise JournalError("The selection does not match the run header.")
+        write_json_atomic(selection_path, {
+            "kind": SELECTION_KIND,
+            "schema_version": SCHEMA_VERSION,
+            "source": header.source.to_json(),
+            "sha256": header.selection_sha256,
+            "chapters": [c.to_json() for c in chapters],
+        })
+        record = {"seq": 0, "type": "header", **header.to_json()}
+        record["crc"] = record_crc(record)
+        fd = os.open(journal_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        try:
+            os.write(fd, _canonical(record) + b"\n")
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        return cls(run_dir, 1, clock)
+
+    @classmethod
+    def resume(cls, run_dir: Path, replay: Replay, *, clock=_utc_now) -> "RunJournal":
+        """Continue a verified journal: a torn last line is trimmed first, so the next record
+        follows the last intact one."""
+        journal = cls(run_dir, replay.next_seq, clock)
+        if replay.torn_tail:
+            with open(journal.path, "r+b") as handle:
+                handle.truncate(replay.good_length)
+                handle.flush()
+                os.fsync(handle.fileno())
+        return journal
+
+    # -- appending ----------------------------------------------------------
+    def append(self, kind: str, **fields: object) -> dict:
+        record = {"seq": self._seq, "type": kind, "utc": self._clock(), **fields}
+        record["crc"] = record_crc(record)
+        with open(self.path, "ab") as handle:
+            handle.write(_canonical(record) + b"\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        self._seq += 1
+        return record
+
+    def publish(self, *, key: str, fmt: str, path: str, size: int, sha256: str,
+                pages: list[int], missing: list[int]) -> dict:
+        return self.append("publish", key=key, format=fmt, path=path, size=size, sha256=sha256,
+                           pages=list(pages), missing=list(missing))
+
+    def failure(self, *, position: int, page_url: str, label: str, reason: str) -> dict:
+        return self.append("failure", position=position, page_url=page_url, label=label,
+                           reason=str(reason)[:500])
+
+    def resumed(self) -> dict:
+        return self.append("resume")
+
+    def end(self, state: str, **counts: object) -> dict:
+        if state not in END_STATES:
+            raise ValueError(f"unknown end state {state!r}")
+        return self.append("end", state=state, **counts)
+
+
+# ── the selection file ───────────────────────────────────────────────────────
+def load_selection(run_dir: Path, header: RunHeader) -> list[ChapterIdentity]:
+    """The run's pages, verified against the header (same source, same checksum)."""
+    path = Path(run_dir) / SELECTION_FILENAME
+    try:
+        if path.stat().st_size > MAX_FILE_BYTES:
+            raise JournalError("The run's selection file is unexpectedly large.")
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raise JournalError("The run's selection file is missing.") from None
+    except (OSError, ValueError) as exc:
+        raise JournalError(f"The run's selection file is unreadable ({exc}).") from exc
+    try:
+        if raw.get("kind") != SELECTION_KIND or raw.get("schema_version") != SCHEMA_VERSION:
+            raise JournalError("The run's selection file is not from this version of the app.")
+        if SourceIdentity.from_json(raw["source"]) != header.source:
+            raise JournalError("The run's selection file belongs to another source.")
+        chapters = [ChapterIdentity.from_json(header.source, row) for row in raw["chapters"]]
+    except JournalError:
+        raise
+    except (KeyError, TypeError, AttributeError, SourceIdentityError) as exc:
+        raise JournalError(f"The run's selection file is malformed ({exc}).") from exc
+    if selection_sha256(chapters) != header.selection_sha256 or raw.get("sha256") != header.selection_sha256:
+        raise JournalError("The run's selection file was changed since the run began (checksum mismatch).")
+    if len(chapters) != header.selection_count or len({c.page_url for c in chapters}) != len(chapters):
+        raise JournalError("The run's selection file is inconsistent.")
+    return chapters

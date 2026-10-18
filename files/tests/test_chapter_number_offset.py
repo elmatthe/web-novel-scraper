@@ -207,9 +207,17 @@ def test_fractional_page_parses_as_fractional_number() -> None:
     assert title == "Birthday and Anniversary Part 1"
 
 
-def test_fractional_pdf_does_not_collide_with_integer_resume_lookup(tmp_path) -> None:
-    (tmp_path / "Chapter 627.2_ Birthday and Anniversary Part 1.pdf").write_bytes(b"pdf")
-    assert pipeline._existing_separate_pdf(tmp_path, 627) is None
+def test_fractional_and_integer_pages_get_distinct_files_and_records(tmp_path) -> None:
+    """627 and 627.2 are two pages, two files and two journal records (v0.3.0 03.3 replaced the
+    filename-scan resume, whose integer lookup once risked matching the fractional file)."""
+    from webnovel_scraper.models import OutputMode
+    from webnovel_scraper.run_output import plan_groups
+
+    groups = plan_groups(2, OutputMode.SEPARATE, 10)
+    assert [g.positions for g in groups] == [(0,), (1,)] and groups[0].key != groups[1].key
+    a = ChapterContent(index=627, title="Birthday", paragraphs=["x"])
+    b = ChapterContent(index=627.2, title="Birthday and Anniversary Part 1", paragraphs=["x"])
+    assert pipeline._separate_pdf_name(a) != pipeline._separate_pdf_name(b)
 
 
 def test_offset_novel_index_is_displayed_space_with_extras_skipped() -> None:

@@ -78,10 +78,12 @@ from tkinter import font as tkfont
 # Add it explicitly too, so launching via an absolute path also works.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from webnovel_scraper import catalog, pipeline  # noqa: E402
+from webnovel_scraper import catalog, pipeline, run_index, run_storage  # noqa: E402
 from webnovel_scraper.models import OutputMode, ScrapeJob  # noqa: E402
 from webnovel_scraper.chapter_preflight import ChapterListRefused  # noqa: E402
 from webnovel_scraper.registry import AdapterDisabledError  # noqa: E402
+from webnovel_scraper.run_journal import JournalError  # noqa: E402
+from webnovel_scraper.run_storage import RunStorageError  # noqa: E402
 from webnovel_scraper.ui import appearance, run_activity, run_progress, selection  # noqa: E402
 from webnovel_scraper.ui import settings as ui_settings  # noqa: E402
 from webnovel_scraper.ui.activity import (  # noqa: E402
@@ -115,10 +117,9 @@ DEFAULT_BROWSER_MODE = True
 # Cloudflare, which is the whole reason the browser is primary. When enabled it
 # tries a couple of cheap HTTP rungs before falling back to camoufox.
 DEFAULT_HTTP_FIRST = False
-# Default parent for scraped output: the user's Downloads folder. Resolved via
-# Path.home() so it is platform-neutral (never a hardcoded path). The novel slug
-# (or a custom name) plus a "-N" auto-increment is appended by the pipeline.
-DEFAULT_OUTPUT_PARENT = Path.home() / "Downloads"
+# Where new run folders go (plan decision 4): ~/Downloads/Web-Novel-Scraper-Outputs (the home
+# folder if there is no Downloads). Each new run reserves its own "<novel-slug>-N" folder in it.
+DEFAULT_OUTPUT_PARENT = run_storage.default_output_root()
 # "End = all": a sentinel far above any real chapter count. The pipeline clamps
 # the requested range down to the available TOC, so this means "to the end".
 ALL_CHAPTERS = 10 ** 9
@@ -141,11 +142,12 @@ GROUPING_LABELS = {
 FORMAT_NOTE = "(TXT not available yet)"
 NO_SITE_HINT = "No website is available yet — nothing to run."
 NO_WEBSITE_TEXT = "(no website available)"
-# Resume Existing Run (Checkpoint 03 builds it): shown so the final layout is visible, kept
-# disabled and wired to nothing, so it can neither start a normal scrape nor reuse a folder.
+# Resume Existing Run (v0.3.0 03.3): continues an unfinished run in its own folder with the
+# run's own chapters, formats and grouping; only what is missing or fails its checksum is redone.
 RESUME_LABEL = "Resume Existing Run"
-RESUME_NOTE = "Available after resume support is implemented."
-FOLDER_HINT = "Blank = novel name. A number is added so nothing is overwritten."
+RESUME_NOTE = "Continues a stopped or unfinished run; saved files are checked, not redone."
+OUTPUT_HINT = "Each run gets its own numbered folder here, so nothing is ever overwritten."
+NO_RESUMABLE_TEXT = "There is no unfinished run in\n{root}\n\nChoose another run folder?"
 BROWSER_HINT = "Opens a visible browser window, which clears Cloudflare."
 # The accurate Headless description (0.2.0 §4.2): the breaker may switch a headless
 # run to a visible browser for the rest of the run, and the rescue lane is visible.
@@ -359,7 +361,7 @@ class ScraperApp(tk.Tk):
         self._sections = [self._section(i) for i in range(len(SECTION_TITLES))]
         e_start, e_end = self._build_selection(self._sections[0])
         rb_sep, rb_single, rb_chunk = self._build_output_options(self._sections[1])
-        e_folder = self._build_run(self._sections[2])
+        self._build_run(self._sections[2])
         self._build_activity()
         self._build_status_bar()
         e_delay, e_timeout = self._build_advanced()
@@ -373,7 +375,7 @@ class ScraperApp(tk.Tk):
             (e_delay, "normal"),
             (e_timeout, "normal"),
             (self._browse_btn, "normal"),
-            (e_folder, "normal"),
+            (self._resume_btn, "normal"),
             (rb_sep, "normal"),
             (rb_chunk, "normal"),
             (rb_single, "normal"),
@@ -524,16 +526,14 @@ class ScraperApp(tk.Tk):
         )
         return rb_sep, rb_single, rb_chunk
 
-    def _build_run(self, frame: ttk.Labelframe) -> ttk.Entry:
+    def _build_run(self, frame: ttk.Labelframe) -> None:
         s, m = self._bundle["styles"], self._bundle["metrics"]
         row_pad = (m["gap_sm"], 0)
 
-        # Output location. The read-only field shows the resolved TARGET folder
-        # (where the PDFs will actually land); "Browse…" picks the PARENT folder,
-        # and the optional name field overrides the folder name (blank = novel
-        # slug). A "-N" auto-increment is appended so nothing is overwritten. All
-        # path resolution stays in pipeline.resolve_output_dir — this is a thin
-        # GUI shell. The displayed target is NEVER fed back as the parent.
+        # Output location (v0.3.0 03.3). The read-only field previews the run folder a new
+        # run would reserve ("<novel-slug>-N" in the output root); "Browse…" picks the ROOT.
+        # The pipeline reserves the folder atomically when the run actually starts, so the
+        # displayed target is a preview only and is NEVER fed back as the root.
         self._field_label(frame, "Output folder", 0)
         self._output_target_var = tk.StringVar(value="")
         # width=12 + sticky "ew": a long path is scrolled inside the field and never
@@ -548,15 +548,8 @@ class ScraperApp(tk.Tk):
         )
         self._browse_btn.grid(row=0, column=2, sticky="e", padx=(m["gap_md"], 0))
 
-        self._field_label(frame, "Folder name", 1)
-        self._folder_name_var = tk.StringVar(value="")
-        e_folder = ttk.Entry(
-            frame, textvariable=self._folder_name_var, width=12, style=s["entry"]
-        )
-        e_folder.grid(row=1, column=1, columnspan=2, sticky="ew", pady=row_pad)
-        e_folder.bind("<KeyRelease>", lambda _e: self._refresh_output_preview())
-        self._folder_hint = self._note(frame, FOLDER_HINT)
-        self._folder_hint.grid(row=2, column=0, columnspan=3, sticky="w", pady=(m["gap_xs"], 0))
+        self._output_hint = self._note(frame, OUTPUT_HINT)
+        self._output_hint.grid(row=1, column=0, columnspan=3, sticky="w", pady=(m["gap_xs"], 0))
 
         # Start / Stop (+ the Advanced Settings window on the right).
         actions = ttk.Frame(frame, style=s["surface"])
@@ -615,14 +608,13 @@ class ScraperApp(tk.Tk):
         self._eta_label = ttk.Label(info, textvariable=self._eta_var, style=s["secondary_label"])
         self._eta_label.grid(row=1, column=1, sticky="ne", padx=(m["gap_md"], 0))
 
-        # Resume Existing Run: the intended control in its final place, disabled and wired
-        # to nothing until Checkpoint 03 adds the validation resuming needs. It must never
-        # start an ordinary scrape or reuse a folder in the meantime.
+        # Resume Existing Run (03.3): offers the unfinished runs in the output root; the
+        # chosen run's journal, not the fields above, decides what is fetched and written.
         resume = ttk.Frame(frame, style=s["surface"])
         resume.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(m["gap_md"], 0))
         resume.columnconfigure(1, weight=1)
         self._resume_btn = ttk.Button(
-            resume, text=RESUME_LABEL, state="disabled", style=s["button"]
+            resume, text=RESUME_LABEL, command=self._on_resume, style=s["button"]
         )
         self._resume_btn.grid(row=0, column=0, sticky="nw")
         self._resume_note = ttk.Label(
@@ -630,7 +622,6 @@ class ScraperApp(tk.Tk):
             wraplength=8 * self._unit(), justify="left",
         )
         self._resume_note.grid(row=0, column=1, sticky="w", padx=(m["gap_md"], 0))
-        return e_folder
 
     def _build_activity(self) -> None:
         """The Activity panel (PDF-Splitter's design): a short note and Clear Log, then
@@ -1092,15 +1083,9 @@ class ScraperApp(tk.Tk):
         self._save_preferences()
 
     def _resolve_output_dir(self) -> Path:
-        """Resolve the output dir from the current parent + name. The single place
-        the GUI calls resolve_output_dir, so the rules (default ~/Downloads parent,
-        {slug}-N name, -N no-overwrite increment) live entirely in the pipeline."""
-        name = self._folder_name_var.get().strip()
-        return pipeline.resolve_output_dir(
-            self._current_slug(),
-            parent_dir=self._output_parent,
-            base_name=name or None,
-        )
+        """The run folder a new run would reserve right now (a preview: the pipeline reserves
+        the real one atomically, so another run taking this number first is harmless)."""
+        return run_storage.preview_next_run_dir(self._output_parent, self._current_slug())
 
     def _refresh_output_preview(self) -> None:
         """Update the read-only target display to where this run would write. This
@@ -1129,7 +1114,7 @@ class ScraperApp(tk.Tk):
             else str(Path.home())
         )
         chosen = filedialog.askdirectory(
-            title="Choose the folder to save the novel folder into",
+            title="Choose the folder that holds your run folders",
             initialdir=initial,
         )
         if chosen:  # empty string => the user cancelled; keep the current value
@@ -1253,12 +1238,10 @@ class ScraperApp(tk.Tk):
         # browser is not the primary engine for this run.
         http_first = bool(self._http_first_var.get()) and use_browser
 
-        # Output location: the parent (default ~/Downloads, or a Browse… choice)
-        # plus an optional custom name (blank => novel slug). resolve_output_dir
-        # applies the "-N" no-overwrite increment. Resolved ONCE here from the
-        # stored parent Path — never from the displayed target — so a prior output
-        # dir can never become this run's parent.
-        output_dir = self._resolve_output_dir()
+        # Output location (03.3): the root (default ~/Downloads/Web-Novel-Scraper-Outputs, or a
+        # Browse… choice). The pipeline reserves "<slug>-N" inside it once the chapter list is
+        # settled, so a refused run leaves no folder behind. Never the displayed preview.
+        output_dir = self._output_parent
         job = ScrapeJob(
             novel_slug=spec.novel_slug,
             adapter_key=spec.adapter_key,
@@ -1268,6 +1251,7 @@ class ScraperApp(tk.Tk):
             output_mode=mode,
             use_cache=self._cache_var.get(),
             output_dir=output_dir,
+            allocate_run=True,
             chunk_size=chunk,
             http_first=http_first,
             # 0.2.0 run-config (§3.14/§3.15): the run's behaviour now travels on the
@@ -1284,6 +1268,13 @@ class ScraperApp(tk.Tk):
         # repeated on a later run unless the user asks for it again.
         self._refresh_var.set(False)
         self._refetch_var.set(False)
+        self._launch(job, spec, saving_to=self._resolve_output_dir())
+
+    def _launch(self, job: ScrapeJob, spec, *, saving_to: Path, resuming: str = "") -> None:
+        """Start the worker for *job* (a new run or a resume) and report what it will do."""
+        use_browser, http_first = job.use_browser, job.http_first
+        delay, timeout = job.delay, job.request_timeout
+        start, end, mode, chunk = job.start, job.end, job.output_mode, job.chunk_size
 
         # The GUI no longer pre-builds a RequestManager (§3.15): the pipeline OWNS
         # and may REPLACE the active primary manager (TOC fallback / breaker switch),
@@ -1300,7 +1291,8 @@ class ScraperApp(tk.Tk):
         self._events.report_many(run_activity.run_started_events(
             novel=spec.novel_title, site=spec.display_name, start=start,
             end=None if end >= ALL_CHAPTERS else end,
-            grouping=_grouping_text(mode, chunk), output_dir=output_dir,
+            grouping=_grouping_text(mode, chunk), output_dir=saving_to, resuming=resuming,
+            formats=tuple(job.formats),
             settings=(
                 f"delay {delay:g} s, timeout {timeout} s, browser mode {browser}, "
                 f"HTTP first {'on' if http_first else 'off'}, "
@@ -1319,17 +1311,125 @@ class ScraperApp(tk.Tk):
         )
         self._worker.start()
 
-    def _collect_params(self):
-        """Validate the entry fields. Returns a tuple or None (after an error)."""
-        try:
-            start = int(self._start_var.get().strip())
-            if start < 1:
-                raise ValueError("Start chapter must be 1 or greater.")
-        except ValueError as exc:
-            messagebox.showerror("Invalid start chapter", str(exc))
-            return None
+    # ── Resume Existing Run (v0.3.0 03.3) ────────────────────────────────────
+    def _on_resume(self) -> None:
+        """Offer the unfinished runs in the output root (or any run folder the user picks) and
+        resume the chosen one exactly as it was set up."""
+        if self._running:
+            return
+        runs = run_index.list_runs(self._output_parent)
+        if runs:
+            chosen = self._choose_run_to_resume(runs)
+        else:
+            chosen = None
+            if messagebox.askyesno(RESUME_LABEL,
+                                   NO_RESUMABLE_TEXT.format(root=self._output_parent)):
+                folder = filedialog.askdirectory(title="Choose the run folder to resume",
+                                                 initialdir=str(self._output_parent))
+                chosen = Path(folder) if folder else None
+        if chosen is not None:
+            self.start_resume(chosen)
 
-        end_raw = self._end_var.get().strip()
+    def _choose_run_to_resume(self, runs: list) -> Path | None:
+        """A small modal list of resumable runs; returns the chosen folder or None."""
+        s, m = self._bundle["styles"], self._bundle["metrics"]
+        titles = {spec.novel_slug: spec.novel_title for spec in self._specs}
+        dialog = tk.Toplevel(self)
+        dialog.title(RESUME_LABEL)
+        dialog.transient(self)
+        result: list[Path | None] = [None]
+        frame = ttk.Frame(dialog, style=s["window"], padding=m["content_pad"])
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text="Unfinished runs (newest first):", style=s["label"]).pack(anchor="w")
+        listbox = tk.Listbox(frame, height=min(10, max(3, len(runs))), width=90,
+                             activestyle="dotbox", exportselection=False)
+        appearance.style_tk_widget(listbox, self._bundle, "list")
+        colors = self._bundle.get("colors")
+        if colors:
+            dialog.configure(background=colors["window"])
+        for summary in runs:
+            listbox.insert("end", summary.describe(titles.get(summary.header.novel_slug)))
+        listbox.selection_set(0)
+        listbox.pack(fill="both", expand=True, pady=(m["gap_sm"], m["gap_sm"]))
+        buttons = ttk.Frame(frame, style=s["window"])
+        buttons.pack(fill="x")
+
+        def finish(value):
+            result[0] = value
+            dialog.destroy()
+
+        def pick_selected():
+            picked = listbox.curselection()
+            finish(runs[picked[0]].path if picked else None)
+
+        def pick_other():
+            folder = filedialog.askdirectory(parent=dialog, title="Choose the run folder to resume",
+                                             initialdir=str(self._output_parent))
+            if folder:
+                finish(Path(folder))
+
+        ttk.Button(buttons, text="Resume", command=pick_selected, style=s["primary_button"]).pack(side="left")
+        ttk.Button(buttons, text="Choose another folder…", command=pick_other,
+                   style=s["button"]).pack(side="left", padx=(m["gap_sm"], 0))
+        ttk.Button(buttons, text="Cancel", command=lambda: finish(None),
+                   style=s["button"]).pack(side="right")
+        listbox.bind("<Double-Button-1>", lambda _e: pick_selected())
+        dialog.bind("<Escape>", lambda _e: finish(None))
+        dialog.grab_set()
+        self.wait_window(dialog)
+        return result[0]
+
+    def start_resume(self, run_dir: Path) -> bool:
+        """Validate *run_dir* and resume it with its own chapters, formats and grouping. Returns
+        whether a run started (an invalid folder is explained and nothing is touched)."""
+        if self._running:
+            return False
+        try:
+            summary = run_index.describe_run(run_dir)
+        except (RunStorageError, JournalError, OSError, ValueError) as exc:
+            messagebox.showerror("Cannot resume this folder", str(exc))
+            return False
+        header = summary.header
+        site = selection.website_key_for_host(summary.host)
+        spec = selection.resolve(site, header.novel_slug, self._specs)
+        if spec is None:
+            messagebox.showerror(
+                "Cannot resume this run",
+                f"{header.novel_slug} from {summary.host} is not available in this version, so "
+                "this run cannot be resumed.")
+            return False
+        params = self._collect_params(validate_range=False)
+        if params is None:
+            return False
+        _start, _end, delay, timeout, _mode, _chunk = params
+        use_browser = self._browser_var.get() and spec.adapter_key in _BROWSER_CAPABLE_ADAPTERS
+        job = ScrapeJob(
+            novel_slug=spec.novel_slug, adapter_key=spec.adapter_key,
+            start=header.requested[0], end=header.requested[1], delay=delay,
+            output_mode=OutputMode(header.grouping_mode), use_cache=self._cache_var.get(),
+            output_dir=summary.path, chunk_size=header.chunk_size, formats=header.formats,
+            resume=True, http_first=bool(self._http_first_var.get()) and use_browser,
+            use_browser=use_browser, headless=bool(self._headless_var.get()),
+            request_timeout=timeout,
+        )
+        self._launch(job, spec, saving_to=summary.path,
+                     resuming=f"{summary.files_done} of {summary.files_total} files already saved")
+        return True
+
+    def _collect_params(self, *, validate_range: bool = True):
+        """Validate the entry fields. Returns a tuple or None (after an error). A resume takes
+        its range from the run, so it skips the range fields (``validate_range=False``)."""
+        if not validate_range:
+            start, end_raw = 1, ""
+        else:
+            try:
+                start = int(self._start_var.get().strip())
+                if start < 1:
+                    raise ValueError("Start chapter must be 1 or greater.")
+            except ValueError as exc:
+                messagebox.showerror("Invalid start chapter", str(exc))
+                return None
+            end_raw = self._end_var.get().strip()
         if end_raw == "":
             end = ALL_CHAPTERS
         else:
@@ -1408,7 +1508,7 @@ class ScraperApp(tk.Tk):
                 progress_cb=progress,
                 phase_cb=self._thread_phase,
             )
-        except (AdapterDisabledError, ChapterListRefused) as exc:
+        except (AdapterDisabledError, ChapterListRefused, RunStorageError, JournalError) as exc:
             refused = exc
         except Exception as exc:  # never let the worker thread die silently
             error = exc
@@ -1455,8 +1555,8 @@ class ScraperApp(tk.Tk):
             self._running = False
             return
         self._set_running(False)
-        # The run created its {name}-N folder; refresh the preview so the next run
-        # shows the next free -N (still a sibling under the same parent).
+        # The run reserved its <slug>-N folder; refresh the preview so the next run
+        # shows the next free -N (still a sibling under the same root).
         self._refresh_output_preview()
 
     # ── Worker-thread callbacks: enqueue only, never Tk ──────────────────────

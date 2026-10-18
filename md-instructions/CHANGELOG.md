@@ -9,6 +9,35 @@ versioning.
 candidate. The macOS launcher and portable code are kept, but macOS acceptance is deferred to a
 later branch; nothing here claims macOS readiness.
 
+### Added / Changed — Numbered run folders, a checksummed run journal and real Resume (Checkpoints 03.3-03.4)
+- **Every run gets its own folder:** `~/Downloads/Web-Novel-Scraper-Outputs/<novel>-N` (for example
+  `lord-of-the-mysteries-1`), numbered per novel whatever the website, reserved safely so two runs
+  can never share or overwrite one. The folder is only made once the chapter list is settled, so a
+  refused run leaves nothing behind. The **Folder name** field is gone; **Browse…** chooses where the
+  run folders go. Older folders are never moved, changed or reused.
+- **Files are in `PDF/` inside the run folder.** The whole-range file is named by its range
+  (`Shadow_Slave_Chapters_1-500.pdf`) instead of `..._All_Chapters.pdf`.
+- **Resume Existing Run works.** It lists the unfinished runs (newest first, with how many files are
+  already saved) or lets you pick a run folder, and continues that run exactly as it was set up: the
+  same chapters, formats and grouping, with no chapter-list request. Every saved file is checked by
+  its SHA-256; only missing, damaged or never-recorded files are made again, and only their chapters
+  are fetched. A run whose source, formats or grouping no longer match, whose journal is damaged, or
+  that is open in another window is refused with the reason, and nothing is changed.
+- **Interruption-safe:** each folder keeps `run-selection.json` (the run's chapters), an append-only
+  `run-journal.jsonl` (checksummed records of every published file and every failure) and
+  `run-audit.json` (chapter by chapter: what was expected, which file holds it, its checksum, what
+  failed and why; no chapter text). Files are written to a temporary name, flushed and swapped in
+  atomically; a crash at any point is recovered by Resume. A file's name alone is never taken as
+  proof that it was saved.
+- **Grouped files:** two pages that show the same chapter number no longer collide; a group that
+  had a failed chapter is still written (and recorded as incomplete), and a later Resume completes it.
+  Stopping a run never writes a partial grouped file.
+- **Tests:** 1,306 total (34 net new, including 32 in `test_run_resume.py` covering both pipeline paths
+  and every grouping mode). Tests that resumed by re-running into the same folder now resume
+  explicitly; tests of the old filename-based skip became "a stray file is never trusted"
+  regressions. The suite now fails, rather than hangs, if a dialog opens unexpectedly. Mutation check
+  16/16 caught.
+
 ### Changed — End auto-clamp and a validated, self-updating HTML cache (Checkpoint 03.2b + owner overrides A/B)
 - **An End past the novel's last chapter is clamped again (owner decision, ADR 011, superseding the
   03.2a refusal).** `1-5000` on a novel whose site lists 3,700 chapters now scrapes `1-3700` and says

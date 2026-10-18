@@ -319,7 +319,6 @@ def test_typing_never_saves_only_discrete_moments_do(tmp_path, monkeypatch) -> N
             win._timeout_var.set(text)
             win._start_var.set(text)
             win._end_var.set(text)
-            win._folder_name_var.set("name-" + text)
             win.update()
         win.open_advanced_settings()  # opening and focusing it saves nothing either
         win.update()
@@ -341,7 +340,6 @@ def test_nothing_transient_is_persisted(tmp_path, monkeypatch) -> None:
     try:
         win._start_var.set("5")
         win._end_var.set("9")
-        win._folder_name_var.set("my-private-name")
         win._delay_var.set("2.5")  # one real preference change, so a file is written
         out = tmp_path / "chosen-output-parent"
         out.mkdir()
@@ -355,14 +353,14 @@ def test_nothing_transient_is_persisted(tmp_path, monkeypatch) -> None:
     text = _path(tmp_path).read_text(encoding="utf-8")
     saved = json.loads(text)
     assert set(saved) == set(Settings().to_json())
-    for transient in ("chosen-output-parent", "my-private-name", str(tmp_path), "Downloads",
+    for transient in ("chosen-output-parent", str(tmp_path), "Downloads",
                       "Complete", "Finished", "ETA", "PDF"):
         assert transient not in text
     again = _make_app(_store(tmp_path))
     try:
         assert again._output_parent == app.DEFAULT_OUTPUT_PARENT  # never made permanent
         assert (again._start_var.get(), again._end_var.get()) == ("1", "")
-        assert again._folder_name_var.get() == "" and again._run_status_var.get() == "Idle"
+        assert again._run_status_var.get() == "Idle"
     finally:
         again.destroy()
 

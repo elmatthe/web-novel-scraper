@@ -28,8 +28,8 @@ from urllib.parse import urlsplit
 from ..models import SiteSpec
 
 __all__ = [
-    "Website", "NovelChoice", "website_key", "websites", "novels_for", "resolve",
-    "settle",
+    "Website", "NovelChoice", "website_key", "website_key_for_host", "websites", "novels_for",
+    "resolve", "settle",
 ]
 
 
@@ -57,6 +57,12 @@ def website_key(spec: SiteSpec) -> str:
     if host.startswith("www."):
         host = host[4:]
     return host or spec.adapter_key   # a row with no usable URL still gets a stable key
+
+
+def website_key_for_host(host: str) -> str:
+    """The website key of a bare host (as a run's source records it): lower-case, no ``www.``."""
+    host = (host or "").lower()
+    return host[4:] if host.startswith("www.") else host
 
 
 def websites(specs: Iterable[SiteSpec]) -> list[Website]:
