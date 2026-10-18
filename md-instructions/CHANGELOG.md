@@ -5,6 +5,71 @@ versioning.
 
 ## [Unreleased] — v0.3.0 (in progress on `feature/v0.3.0-modernization`)
 
+### Added / Changed — Light/Dark UI foundation and window shell (Checkpoint 01.1, UI only)
+- **Light/Dark appearance.** New `scripts/webnovel_scraper/ui/appearance.py`,
+  adapted from PDF-Splitter `scripts/pdf_splitter/appearance.py` (the author's
+  local working copy supplied 2026-10-17, newer than GitHub `edcbd4f`; this file
+  is identical there), which came from the Audiobook Creation Tool v0.6.6. It
+  provides compact `Compact.*` ttk styles cloned from `clam`, Light and Dark
+  palettes, native Aqua controls on macOS, and an in-place switch that keeps every
+  typed value, selection, focus and a running scrape. Not taken: the Treeview,
+  Spinbox and Inline-button styles. Added: a Website-picker style that matches
+  the Novel dropdown, and colouring for its classic menu.
+- **Saved appearance choice.** New `scripts/webnovel_scraper/ui/settings.py`
+  (trimmed from PDF-Splitter's validated store) saves only the appearance, in
+  `files/runtime-data/settings.json`. That folder is now gitignored. A missing,
+  corrupt, foreign or newer file opens in Light with a status-bar note, a load
+  never rewrites the file, and the first save keeps a copy of an unusable
+  original.
+- **New window shell** (`scripts/app.py`, PDF-Splitter layout):
+  - three bordered sections on the left: **1. Web Novel Selection**,
+    **2. Output Options** and **3. Run**;
+  - an **Activity** panel on the right holding the existing log;
+  - a bottom status bar with the Light/Dark toggle.
+
+  Window size is measured from the widgets and display scaling rather than
+  fixed: the controls column keeps its natural width, Activity takes all extra
+  space when the window is widened or maximized, and long novel names or paths
+  never widen the window.
+- **Advanced Settings window.** Delay, timeout, browser mode, headless,
+  HTTP-first and HTML cache moved there unchanged, opened from section 3. The run
+  still reads them at Start and locks them during a run.
+- **Unchanged behaviour:**
+  - the start/stop/close run lifecycle, non-daemon worker and job settings;
+  - output folder naming;
+  - `DEFAULT_HEADLESS = False`;
+  - the catalog;
+  - every scraper, pipeline and PDF module.
+
+  New: a run-state line and a `done / total chapters` count, both fed by the
+  existing progress callback.
+- **UI decisions:**
+  - Novel stays above Website, because the Website menu lists the selected
+    novel's sites. A website-first flow is Checkpoint 02 work.
+  - PDF shows ticked and locked and TXT shows "not available yet" until a TXT
+    renderer exists (Checkpoint 05).
+  - The grouping choices are relabelled "Individual chapters", "Whole selected
+    range" and "Every X chapters per PDF", with the same three output modes as
+    before.
+  - Activity has no Summary/Detailed tabs yet (Checkpoint 02).
+  - On Windows the app is not made DPI-aware (same as PDF-Splitter), so Windows
+    scales the whole window above 100%.
+- **Tests:** 47 new offline tests in `test_ui_settings.py`, `test_ui_appearance.py`
+  and `test_ui_shell.py`. They cover:
+  - Light/Dark switching and state preservation;
+  - persistence and recovery from corrupt settings;
+  - the three-section structure;
+  - Activity resizing, minimum size, maximize/restore and long names;
+  - Start/Stop;
+  - no Tk calls from the worker thread;
+  - settings staying inside the repository.
+
+  The existing `test_phase4_gui.py`/`test_phase8_gui.py` guarantees still run;
+  the headless-hint check now reads the note under the checkbox. New
+  `files/tests/pytest.ini` sets `--capture=sys`. This fixes an intermittent "no
+  Tk display" skip: under pytest's default fd capture, about 1 in 300 Tk windows
+  on Windows failed to start. Suite: 347 passed, 0 skipped.
+
 ### Changed — flat `scripts/` layout (step 01.0, no behaviour change)
 - Program code moved from `scripts/Universal/` to `scripts/`. The entry point
   is now `scripts/app.py` and the package is `scripts/webnovel_scraper/`; file

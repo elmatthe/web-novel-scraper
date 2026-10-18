@@ -54,13 +54,20 @@ def _make_app():
 
 def test_headless_hint_describes_the_visible_override() -> None:
     """§4.2: the Headless hint is accurate about the breaker override + visible
-    rescue browser."""
+    rescue browser. Since v0.3.0 Checkpoint 01 the checkbox lives in the Advanced
+    Settings window (opened from section 3. Run) with this explanation as a wrapped
+    note directly beneath it, instead of one very long checkbox label."""
     win = _make_app()
     try:
-        text = win._headless_check.cget("text").lower()
+        assert "headless" in win._headless_check.cget("text").lower()
+        text = win._headless_hint.cget("text").lower()
         assert "visible" in text
         assert "rest of the run" in text
         assert "rescue" in text
+        # Both sit in the Advanced Settings window, whose button is in the main window.
+        assert win._headless_check.winfo_toplevel() is win._advanced
+        assert win._headless_hint.winfo_toplevel() is win._advanced
+        assert win._advanced_btn.winfo_toplevel() is win
     finally:
         win.destroy()
 

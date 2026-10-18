@@ -1,6 +1,6 @@
 # Web Novel Scraper — v0.3.0 Implementation Plan
 
-**Status:** Approved product requirements. Checkpoint 00 (planning/baseline) complete 2026-10-17 on `feature/v0.3.0-modernization`; Checkpoint 01 step 01.0 (flat `scripts/` layout) complete 2026-10-17; the 01 UI foundation has not started and awaits owner review of 01.0. Technical clarifications from Checkpoint 00 are in §8 and do not change owner decisions.  
+**Status:** Approved product requirements. Checkpoint 00 (planning/baseline) complete 2026-10-17 on `feature/v0.3.0-modernization`; Checkpoint 01 step 01.0 (flat `scripts/` layout) complete 2026-10-17; step 01.1 (Light/Dark UI foundation and three-section window shell) complete 2026-10-18 and awaits owner review and the Windows UI visual gate before 02. Technical clarifications from Checkpoint 00 are in §8 and do not change owner decisions.  
 **Created:** 2026-10-14  
 **Planning / review:** ChatGPT; **execution:** Claude Code in the local repository.  
 **Target repository:** `https://github.com/elmatthe/web-novel-scraper`  
@@ -93,6 +93,16 @@ Supersedes the read-only GitHub snapshot above wherever they differ.
 - **Verify:** focused theme/layout tests; manual **Windows UI visual gate** (Light/Dark, restored/maximized, scaled/min-size, all sections legible) and initial macOS smoke where available. No scraper/data/pipeline behavior changes. Owner approval of the UI direction before proceeding.
 
 - **01.0 Result (2026-10-17): COMPLETE.** The move was committed as 20 renames (17 unchanged; `app.py`, `browser_env.py` and `request_manager.py` carry only the path-line repairs) plus the `.gitkeep` deletions, and every dependent path listed above was repaired (README had none). `files/tests/test_flat_layout.py` adds 8 offline guards: import root, isolated `scripts/app.py` load, in-repo cache and browser paths, both launchers' `MAIN_SCRIPT`, and a fixture chapter → real parser → pipeline → PDF. In-place verify PASS: **300 passed** (292 + 8). Startup smoke test via `.venv\Scripts\pythonw.exe scripts\app.py` passed. **Owner decision:** the three `md-instructions` deletions were *not* committed; they are deferred to a separate documentation-cleanup decision, which overrides this step's "unless the owner objects" clause. Also fixed: Checkpoint 00's Briefing status note put "v0.3.0" first in `## Current Version` and failed two `test_release_metadata.py` guards.
+- **01.1 Result (2026-10-18): COMPLETE, awaiting owner review.**
+  - **Appearance:** new `scripts/webnovel_scraper/ui/appearance.py` (PDF-Splitter `appearance.py`, local copy, identical to `edcbd4f`; Treeview/Spinbox/Inline styles dropped; a Combobox-matched `Compact.TMenubutton` added for the Website picker).
+  - **Settings:** new `ui/settings.py`, schema v1, appearance only, saved in `files/runtime-data/settings.json`, which is now gitignored per C6.
+  - **Shell:** `app.py` rebuilt with three bordered sections on the left, Activity (the existing log) on the right, a status bar with the Light/Dark toggle, and `_fit_window` measured geometry.
+  - **Advanced settings:** delay, timeout, browser, headless, HTTP-first and cache moved, unchanged, into an Advanced Settings window built at startup.
+  - **Unchanged:** the run lifecycle, job config, `DEFAULT_HEADLESS`, output naming and the catalog.
+  - **Tests:** C10 guarantees carried forward; 47 tests added; new `files/tests/pytest.ini` (`--capture=sys`) removes an intermittent Tk start-up skip caused by pytest's fd capture.
+  - **Gate:** in place 347 passed, 0 skipped; GUI/UI tests also pass on Python 3.12.10; startup smoke test passed.
+  - **Pending:** the manual Windows visual gate and the macOS smoke test.
+  - **Deferred to 02:** website-first selection, Summary/Detailed tabs, Clear Log, ETA and broader preference persistence.
 
 ### 02 — Functional UI, logs and progress (UI/CONTROLLER ONLY)
 - Wire site/novel/range selections, independent format selections (PDF default; TXT may be disabled with explanation until 05), mutually exclusive grouping, source availability, output preview, normal Start/Cancel and explicit Resume affordance. Implement Activity Summary/Detailed + technical logging, styled phase-aware progress, safe thread-pump and persistence. An unimplemented control must be visibly disabled, not pretend to work.

@@ -23,8 +23,12 @@ and `scripts/requirements.txt`. (v0.3.0 step 01.0 moved the code out of the old
 `scripts/MacOS/` placeholders; the code was already cross-platform.) Dev-only
 material (the pytest suite, fixtures, QA logs, runtime cache/output, legacy
 reference) lives under `files/` and never ships. The pytest suite is at
-`files/tests/`, its fixtures at `files/test-files/`. Clean module boundaries
-under `scripts/webnovel_scraper/`:
+`files/tests/`, its fixtures at `files/test-files/`. The app's own runtime state
+stays inside the repository in designated, gitignored locations under `files/`:
+the HTML cache `files/cache/`, the contained browsers `files/bin/`, and (since
+v0.3.0 Checkpoint 01.1) `files/runtime-data/` for GUI preferences
+(`settings.json`); later checkpoints add session logs and chapter-list overlays
+there (plan §8 C6). Clean module boundaries under `scripts/webnovel_scraper/`:
 - `models.py` â€” normalized dataclasses (`SiteSpec`, `ChapterMeta`, `ChapterContent`,
   plus `OutputMode` and `ScrapeJob`). **0.2.1:** `ChapterMeta`/`ChapterContent.index`
   mean the site's DISPLAYED chapter number (`int | float`, fractional for FWN's
@@ -106,7 +110,16 @@ under `scripts/webnovel_scraper/`:
   travels on an immutable `ScrapeJob` (`use_browser` / `headless` / `request_timeout` /
   `rescue_workers == 1`) + a per-run `runtime_site_spec` copy; the pipeline owns/replaces
   the active manager (no GUI-prebuilt manager, no mutated catalog row).
-- `app.py` â€” the tkinter GUI entry point.
+- `ui/` — GUI support only, no scraping (v0.3.0 Checkpoint 01.1): `appearance.py`
+  (compact `Compact.*` ttk styles, Light/Dark palettes, native Aqua branch,
+  in-place switch; adapted from PDF-Splitter) and `settings.py` (validated,
+  atomic `files/runtime-data/settings.json` store; appearance only for now).
+- `app.py` — the tkinter GUI entry point. Since v0.3.0 Checkpoint 01.1 the window
+  has three bordered sections on the left (1. Web Novel Selection, 2. Output
+  Options, 3. Run), the Activity log on the right, a status bar with the
+  Light/Dark toggle, and an Advanced Settings window (delay, timeout, browser,
+  headless, HTTP-first, cache). Its size is measured from the widgets
+  (`_fit_window`), not fixed.
 Networking never lives in parsers; parsing never lives in the GUI; the PDF builder
 knows nothing about sites. `scripts/verify.py` is the mechanical gate (pytest +
 dependency-pinning + docs-freshness) run before every phase commit; it runs the
@@ -114,15 +127,17 @@ suite in `files/tests/` (a `conftest.py` there puts `scripts/` on
 `sys.path` so `import webnovel_scraper` resolves).
 
 ## Current Version
-**Status as of 2026-10-17:** 0.2.0 was
+**Status as of 2026-10-18:** 0.2.0 was
 **released** on 2026-06-30 (tag `v0.2.0`, the latest GitHub release); the
 "Unreleased" wording directly below is historical. 0.2.1 is merged to `main`
 but untagged and unreleased. v0.3.0 is in progress on
 `feature/v0.3.0-modernization` (based on `577b5db`). Its scope is the
 PDF-Splitter-style UI, manifest-first chapter lists, Lord of the Mysteries 1/2 on
 validated `.net`/`.com` sources, and TXT/PDF output. See `handoff.md` and
-`Web-Novel-Scraper-v0.3.0-Implementation-Plan.md` for current state. The rest of
-this section describes 0.2.0/0.2.1 as built.
+`Web-Novel-Scraper-v0.3.0-Implementation-Plan.md` for current state. Checkpoint
+01.1 (Light/Dark UI foundation and the three-section window shell) is complete
+and awaits owner review. The rest of this section describes 0.2.0/0.2.1 as
+built.
 
 **0.2.0 (Unreleased — implemented, pending the user's manual live test).**
 **Fast-primary + single-lane hard-chapter rescue.** 0.1.3 ran one persistent VISIBLE

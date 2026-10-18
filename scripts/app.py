@@ -1,4 +1,4 @@
-"""app.py — single-window tkinter GUI entry point (Phase 6).
+"""app.py — single-window tkinter GUI entry point.
 
 This is a *thin shell* over the already-tested package modules: the catalog
 drives the dropdowns, and a Start press builds a :class:`ScrapeJob`, resolves
@@ -12,9 +12,30 @@ No scraping, parsing, or PDF logic lives here — all of that is in the
 only collects inputs, marshals every UI update back onto the Tk thread via
 ``self.after(0, ...)``, and shows the log/progress the pipeline emits.
 
-Defense in depth on disabled sites: the catalog greys them in the Site menu and
+Defense in depth on disabled sites: the catalog greys them in the Website menu and
 Start cannot dispatch one (this file), the pipeline refuses a disabled row
 before building an adapter, and the stub adapter raises as a final backstop.
+
+Window layout (v0.3.0 Checkpoint 01; adapted from the PDF-Splitter shell, local
+working copy supplied 2026-10-17, newer than GitHub ``edcbd4f``):
+
+* a header, a body and a bottom status bar holding the Light/Dark toggle;
+* the body has three numbered, bordered sections stacked on the left — 1. Web Novel
+  Selection, 2. Output Options, 3. Run — at their *measured natural width* (grid
+  weight 0 + minsize), and the Activity panel on the right (weight 1), so every
+  extra pixel of a wider or maximized window goes to Activity;
+* the rarely changed fetch settings (delay, timeout, browser, headless, HTTP-first,
+  HTML cache) live in an "Advanced Settings" window so the main window stays short
+  enough for a scaled laptop screen; their values and behaviour are unchanged;
+* the window minimum and default size are derived from the widgets' requested sizes,
+  font metrics and display scaling (``_fit_window``), never from fixed pixel sizes;
+* long novel names and paths never enlarge the window (fields have character-width
+  requests; notes wrap to the measured column width).
+
+Appearance comes from :mod:`webnovel_scraper.ui.appearance` (named ``Compact.*`` ttk
+styles refreshed in place, so a Light/Dark switch keeps every value, selection, focus
+and a running scrape). The choice is saved by :mod:`webnovel_scraper.ui.settings` in
+the ignored ``files/runtime-data/settings.json``.
 """
 
 from __future__ import annotations
@@ -23,7 +44,8 @@ import sys
 import threading
 import tkinter as tk
 from pathlib import Path
-from tkinter import filedialog, messagebox, scrolledtext, ttk
+from tkinter import filedialog, messagebox, ttk
+from tkinter import font as tkfont
 
 # When launched as ``python scripts/app.py`` the script's own
 # directory (scripts/) is sys.path[0], so the package import resolves.
@@ -33,6 +55,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from webnovel_scraper import catalog, pipeline  # noqa: E402
 from webnovel_scraper.models import OutputMode, ScrapeJob  # noqa: E402
 from webnovel_scraper.registry import AdapterDisabledError  # noqa: E402
+from webnovel_scraper.ui import appearance  # noqa: E402
+from webnovel_scraper.ui.settings import SettingsStore  # noqa: E402
 
 # Adapters that can use the Playwright browser path (Cloudflare). Every other
 # adapter is HTTP-only, so the browser checkboxes are inert when one of those is
@@ -72,14 +96,65 @@ ALL_CHAPTERS = 10 ** 9
 # event loop via ``self.after`` — never a blocking sleep — so the UI stays alive.
 CLOSE_POLL_MS = 50
 
+APP_TITLE = "Web Novel Scraper"
+SUBTITLE = "Save web-novel chapters as clean, print-ready PDFs."
+SECTION_TITLES = ("1. Web Novel Selection", "2. Output Options", "3. Run")
+ACTIVITY_TITLE = "Activity"
+# User-facing names for the three existing grouping modes (plan §8 C11): only the
+# labels changed; the OutputMode values the job carries are the same as before.
+GROUPING_LABELS = {
+    OutputMode.SEPARATE: "Individual chapters",
+    OutputMode.SINGLE: "Whole selected range",
+    OutputMode.CHUNKED: "Every",  # followed by the chapters-per-PDF field
+}
+FORMAT_NOTE = "(TXT not available yet)"
+NO_SITE_HINT = "All sources for this novel are coming soon — nothing to run yet."
+FOLDER_HINT = "Blank = novel name. A number is added so nothing is overwritten."
+BROWSER_HINT = "Opens a visible browser window, which clears Cloudflare."
+# The accurate Headless description (0.2.0 §4.2): the breaker may switch a headless
+# run to a visible browser for the rest of the run, and the rescue lane is visible.
+HEADLESS_HINT = (
+    "If Cloudflare broadly blocks headless mode, the app may automatically open and "
+    "keep a visible browser for the rest of the run; hard chapters may also open a "
+    "visible rescue browser."
+)
+ADVANCED_NOTE = (
+    "These settings are read when you press Start and are locked while a run is "
+    "in progress."
+)
+
+# Sizing intents, expressed in characters / lines (never pixels).
+NOVEL_FIELD_CHARS = 28
+NUMBER_FIELD_CHARS = 8
+ACTIVITY_FLOOR_CHARS = 40
+ACTIVITY_PREFERRED_CHARS = 72
+LOG_FLOOR_LINES = 8
+LOG_PREFERRED_LINES = 24
+ADVANCED_WRAP_CHARS = 50
+SCREEN_FRACTION = 0.92
+
 
 class ScraperApp(tk.Tk):
     """The single scraper window. All real work happens on a non-daemon worker."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self, store: SettingsStore | None = None, *, platform: str | None = None
+    ) -> None:
         super().__init__()
-        self.title("Web Novel Scraper")
-        self.minsize(640, 620)
+        self.title(APP_TITLE)
+        self._platform = sys.platform if platform is None else platform
+
+        # Preferences (appearance only at Checkpoint 01). A missing, unreadable or
+        # invalid file never stops the window: the store falls back to defaults and
+        # the status bar says so.
+        if store is None:
+            store = SettingsStore()
+            store.load()
+        self._store = store
+        self._style = ttk.Style(self)
+        self._bundle = appearance.build_bundle(
+            self._style, store.settings.appearance, root=self, platform=self._platform
+        )
 
         # Run state (all mutated only on the Tk thread except cancel_event).
         self._worker: threading.Thread | None = None
@@ -90,6 +165,11 @@ class ScraperApp(tk.Tk):
         self._closing = False
         # Widgets that must be locked while a run is in progress.
         self._locked_inputs: list[tuple[tk.Widget, str]] = []
+        # Notes that wrap to the measured control-column width (see _fit_window).
+        self._wrap_labels: list[ttk.Label] = []
+        # Classic Tk widgets ttk styles cannot reach, with their appearance role.
+        self._text_widgets: list[tuple[tk.Text, str]] = []
+        self.geometry_info: dict[str, object] = {}
 
         # Novel slug list in catalog order; titles for display.
         self._novel_slugs = catalog.all_novel_slugs()
@@ -104,215 +184,68 @@ class ScraperApp(tk.Tk):
         self._build_ui()
         self._novel_combo.current(0)
         self._on_novel_change()
+        self._apply_bundle(self._bundle)
+        self._fit_window()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        if store.diagnostics:
+            self._set_status(
+                f"Settings problem ({store.diagnostics[0]}); safe defaults in use."
+            )
 
     # ── UI construction ──────────────────────────────────────────────────────
+    def _unit(self) -> int:
+        """Pixel width of one body-font character (the sizing unit)."""
+        return max(
+            1, tkfont.Font(root=self, font=self._bundle["fonts"]["body"]).measure("0")
+        )
+
     def _build_ui(self) -> None:
-        pad = {"padx": 8, "pady": 4}
-        root = ttk.Frame(self, padding=12)
-        root.pack(fill="both", expand=True)
-        root.columnconfigure(1, weight=1)
-        r = 0
+        s, m = self._bundle["styles"], self._bundle["metrics"]
+        self._gap = int(m["gap_md"])
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(1, weight=1)
 
-        # Novel dropdown.
-        ttk.Label(root, text="Novel:").grid(row=r, column=0, sticky="w", **pad)
-        self._novel_combo = ttk.Combobox(
-            root,
-            state="readonly",
-            values=[
-                catalog.get_adapters_for_novel(slug)[0].novel_title
-                for slug in self._novel_slugs
-            ],
+        # Header: title and subtitle share one row to save vertical space.
+        header = ttk.Frame(
+            self, style=s["window"],
+            padding=(m["content_pad"], m["gap_md"], m["content_pad"], m["gap_sm"]),
         )
-        self._novel_combo.grid(row=r, column=1, columnspan=2, sticky="ew", **pad)
-        self._novel_combo.bind(
-            "<<ComboboxSelected>>", lambda _e: self._on_novel_change()
+        header.grid(row=0, column=0, sticky="ew")
+        header.columnconfigure(1, weight=1)
+        ttk.Label(header, text=APP_TITLE, style=s["title"], anchor="w").grid(
+            row=0, column=0, sticky="sw"
         )
-        r += 1
-
-        # Site selector (a Menubutton + Menu so individual disabled sites can be
-        # greyed and made non-selectable — a Combobox can't disable single items).
-        ttk.Label(root, text="Site:").grid(row=r, column=0, sticky="w", **pad)
-        self._site_key = tk.StringVar(value="")
-        self._site_menubtn = ttk.Menubutton(root, text="(select a novel)")
-        self._site_menu = tk.Menu(self._site_menubtn, tearoff=0)
-        self._site_menubtn["menu"] = self._site_menu
-        self._site_menubtn.grid(row=r, column=1, columnspan=2, sticky="ew", **pad)
-        r += 1
-
-        self._site_hint = ttk.Label(root, text="", foreground="#a05000")
-        self._site_hint.grid(row=r, column=1, columnspan=2, sticky="w", padx=8)
-        r += 1
-
-        # Chapter range.
-        ttk.Label(root, text="Start chapter:").grid(
-            row=r, column=0, sticky="w", **pad
-        )
-        self._start_var = tk.StringVar(value="1")
-        e_start = ttk.Entry(root, textvariable=self._start_var, width=12)
-        e_start.grid(row=r, column=1, sticky="w", **pad)
-        r += 1
-
-        ttk.Label(root, text="End chapter:").grid(row=r, column=0, sticky="w", **pad)
-        self._end_var = tk.StringVar(value="")
-        e_end = ttk.Entry(root, textvariable=self._end_var, width=12)
-        e_end.grid(row=r, column=1, sticky="w", **pad)
-        ttk.Label(root, text="(blank = all chapters)").grid(
-            row=r, column=2, sticky="w", **pad
-        )
-        r += 1
-
-        # Delay + timeout. The delay is the user-facing rate-limit / anti-detection
-        # knob (Phase 9A): higher = slower but less likely to be blocked.
-        ttk.Label(root, text="Delay between fetches (seconds):").grid(
-            row=r, column=0, sticky="w", **pad
-        )
-        self._delay_var = tk.StringVar(value=DEFAULT_DELAY)
-        e_delay = ttk.Entry(root, textvariable=self._delay_var, width=12)
-        e_delay.grid(row=r, column=1, sticky="w", **pad)
+        # width=1 so the subtitle can never force the window wider; it still fills.
         ttk.Label(
-            root,
-            text="(anti-detection: higher = slower but less likely to be blocked)",
-            foreground="#555555",
-        ).grid(row=r, column=2, sticky="w", **pad)
-        r += 1
+            header, text=SUBTITLE, style=s["status_label"], anchor="w", width=1
+        ).grid(row=0, column=1, sticky="sew", padx=(m["gap_lg"], 0), pady=(0, m["gap_xs"]))
+        ttk.Frame(self, style=s["divider"], height=1).grid(row=0, column=0, sticky="sew")
 
-        ttk.Label(root, text="Timeout (s):").grid(row=r, column=0, sticky="w", **pad)
-        self._timeout_var = tk.StringVar(value=DEFAULT_TIMEOUT)
-        e_timeout = ttk.Entry(root, textvariable=self._timeout_var, width=12)
-        e_timeout.grid(row=r, column=1, sticky="w", **pad)
-        r += 1
+        # Body: the three control sections (left) + Activity (right).
+        self._body = ttk.Frame(self, style=s["window"], padding=m["gap_sm"])
+        self._body.grid(row=1, column=0, sticky="nsew")
+        self._body.columnconfigure(0, weight=0)
+        self._body.columnconfigure(1, weight=1)
+        self._body.rowconfigure(0, weight=1)
+        self._left = ttk.Frame(self._body, style=s["window"])
+        self._left.grid(row=0, column=0, sticky="nsew", padx=(0, self._gap // 2))
+        self._left.columnconfigure(0, weight=1)
+        # Spare height in a tall window stays below the Run section.
+        self._left.rowconfigure(len(SECTION_TITLES), weight=1)
+        self._activity = ttk.Labelframe(
+            self._body, text=ACTIVITY_TITLE, style=s["labelframe"], padding=m["card_pad"]
+        )
+        self._activity.grid(row=0, column=1, sticky="nsew", padx=(self._gap // 2, 0))
+        self._activity.columnconfigure(0, weight=1)
+        self._activity.rowconfigure(0, weight=1)
 
-        # Output location. The read-only field shows the resolved TARGET folder
-        # (where the PDFs will actually land); "Browse…" picks the PARENT folder,
-        # and the optional name field overrides the folder name (blank = novel
-        # slug). A "-N" auto-increment is appended so nothing is overwritten. All
-        # path resolution stays in pipeline.resolve_output_dir — this is a thin
-        # GUI shell. The displayed target is NEVER fed back as the parent.
-        ttk.Label(root, text="Output folder:").grid(
-            row=r, column=0, sticky="w", **pad
-        )
-        self._output_target_var = tk.StringVar(value="")
-        e_output = ttk.Entry(
-            root, textvariable=self._output_target_var, state="readonly"
-        )
-        e_output.grid(row=r, column=1, sticky="ew", **pad)
-        self._browse_btn = ttk.Button(
-            root, text="Browse…", command=self._on_browse
-        )
-        self._browse_btn.grid(row=r, column=2, sticky="w", **pad)
-        r += 1
-
-        ttk.Label(root, text="Folder name:").grid(
-            row=r, column=0, sticky="w", **pad
-        )
-        self._folder_name_var = tk.StringVar(value="")
-        e_folder = ttk.Entry(root, textvariable=self._folder_name_var, width=24)
-        e_folder.grid(row=r, column=1, sticky="w", **pad)
-        e_folder.bind("<KeyRelease>", lambda _e: self._refresh_output_preview())
-        ttk.Label(
-            root,
-            text="(blank = novel name; a number is added so nothing is overwritten)",
-            foreground="#555555",
-        ).grid(row=r, column=2, sticky="w", **pad)
-        r += 1
-
-        # Output mode.
-        ttk.Label(root, text="Output mode:").grid(
-            row=r, column=0, sticky="nw", **pad
-        )
-        mode_frame = ttk.Frame(root)
-        mode_frame.grid(row=r, column=1, columnspan=2, sticky="w", **pad)
-        self._mode_var = tk.StringVar(value=OutputMode.SEPARATE.value)
-        rb_sep = ttk.Radiobutton(
-            mode_frame, text="Separate (one PDF per chapter)",
-            value=OutputMode.SEPARATE.value, variable=self._mode_var,
-            command=self._on_mode_change,
-        )
-        rb_sep.grid(row=0, column=0, sticky="w")
-        rb_chunk = ttk.Radiobutton(
-            mode_frame, text="Chunked", value=OutputMode.CHUNKED.value,
-            variable=self._mode_var, command=self._on_mode_change,
-        )
-        rb_chunk.grid(row=1, column=0, sticky="w")
-        ttk.Label(mode_frame, text="chapters per PDF:").grid(
-            row=1, column=1, sticky="w", padx=(8, 2)
-        )
-        self._chunk_var = tk.StringVar(value=DEFAULT_CHUNK)
-        self._chunk_entry = ttk.Entry(
-            mode_frame, textvariable=self._chunk_var, width=8
-        )
-        self._chunk_entry.grid(row=1, column=2, sticky="w")
-        rb_single = ttk.Radiobutton(
-            mode_frame, text="Single (one PDF for the whole range)",
-            value=OutputMode.SINGLE.value, variable=self._mode_var,
-            command=self._on_mode_change,
-        )
-        rb_single.grid(row=2, column=0, sticky="w")
-        r += 1
-
-        # Browser mode + cache toggles.
-        opt_frame = ttk.Frame(root)
-        opt_frame.grid(row=r, column=0, columnspan=3, sticky="w", **pad)
-        self._browser_var = tk.BooleanVar(value=DEFAULT_BROWSER_MODE)
-        self._browser_check = ttk.Checkbutton(
-            opt_frame,
-            text="Use browser mode (recommended for Free Web Novel — visible browser, clears Cloudflare)",
-            variable=self._browser_var,
-            command=self._on_browser_toggle,
-        )
-        self._browser_check.grid(row=0, column=0, sticky="w")
-        self._headless_var = tk.BooleanVar(value=DEFAULT_HEADLESS)
-        self._headless_check = ttk.Checkbutton(
-            opt_frame,
-            text=(
-                "Headless primary browser (advanced). If Cloudflare broadly blocks "
-                "headless mode, the app may automatically open and keep a visible "
-                "browser for the rest of the run; hard chapters may also open a "
-                "visible rescue browser."
-            ),
-            variable=self._headless_var,
-        )
-        self._headless_check.grid(row=1, column=0, sticky="w", padx=(20, 0))
-        self._http_first_var = tk.BooleanVar(value=DEFAULT_HTTP_FIRST)
-        self._http_first_check = ttk.Checkbutton(
-            opt_frame,
-            text="Try fast HTTP first (may trip Cloudflare — off by default)",
-            variable=self._http_first_var,
-        )
-        self._http_first_check.grid(row=2, column=0, sticky="w", padx=(20, 0))
-        self._cache_var = tk.BooleanVar(value=True)
-        self._cache_check = ttk.Checkbutton(
-            opt_frame, text="Use HTML cache (resume re-runs)",
-            variable=self._cache_var,
-        )
-        self._cache_check.grid(row=3, column=0, sticky="w")
-        r += 1
-
-        # Start / Stop.
-        btn_frame = ttk.Frame(root)
-        btn_frame.grid(row=r, column=0, columnspan=3, sticky="w", **pad)
-        self._start_btn = ttk.Button(
-            btn_frame, text="Start", command=self._on_start
-        )
-        self._start_btn.grid(row=0, column=0, padx=(0, 8))
-        self._stop_btn = ttk.Button(
-            btn_frame, text="Stop", command=self._on_stop, state="disabled"
-        )
-        self._stop_btn.grid(row=0, column=1)
-        r += 1
-
-        # Progress bar.
-        self._progress = ttk.Progressbar(root, mode="determinate", maximum=1)
-        self._progress.grid(row=r, column=0, columnspan=3, sticky="ew", **pad)
-        r += 1
-
-        # Log pane.
-        root.rowconfigure(r, weight=1)
-        self._log_text = scrolledtext.ScrolledText(
-            root, height=14, wrap="word", state="disabled"
-        )
-        self._log_text.grid(row=r, column=0, columnspan=3, sticky="nsew", **pad)
+        self._sections = [self._section(i) for i in range(len(SECTION_TITLES))]
+        e_start, e_end = self._build_selection(self._sections[0])
+        rb_sep, rb_single, rb_chunk = self._build_output_options(self._sections[1])
+        e_folder = self._build_run(self._sections[2])
+        self._build_activity()
+        self._build_status_bar()
+        e_delay, e_timeout = self._build_advanced()
 
         # Inputs locked during a run (state to restore is the normal state).
         self._locked_inputs = [
@@ -332,6 +265,488 @@ class ScraperApp(tk.Tk):
 
         self._on_mode_change()
 
+    def _section(self, index: int) -> ttk.Labelframe:
+        s, m = self._bundle["styles"], self._bundle["metrics"]
+        frame = ttk.Labelframe(
+            self._left, text=SECTION_TITLES[index], style=s["labelframe"],
+            padding=m["card_pad"],
+        )
+        frame.grid(row=index, column=0, sticky="ew", pady=(0 if index == 0 else self._gap, 0))
+        frame.columnconfigure(1, weight=1)
+        return frame
+
+    def _field_label(self, frame: tk.Misc, text: str, row: int) -> ttk.Label:
+        s, m = self._bundle["styles"], self._bundle["metrics"]
+        label = ttk.Label(frame, text=text, style=s["label"])
+        label.grid(
+            row=row, column=0, sticky="w", padx=(0, m["gap_md"]),
+            pady=(0 if row == 0 else m["gap_sm"], 0),
+        )
+        return label
+
+    def _note(self, frame: tk.Misc, text: str, style_key: str = "secondary_label") -> ttk.Label:
+        """A note that wraps to the measured column width (set in ``_fit_window``)."""
+        label = ttk.Label(
+            frame, text=text, style=self._bundle["styles"][style_key],
+            wraplength=16 * self._unit(), justify="left",
+        )
+        self._wrap_labels.append(label)
+        return label
+
+    def _build_selection(self, frame: ttk.Labelframe) -> tuple[ttk.Entry, ttk.Entry]:
+        s, m = self._bundle["styles"], self._bundle["metrics"]
+        row_pad = (m["gap_sm"], 0)
+
+        # Novel dropdown. A fixed character width: a long title never widens the window.
+        self._field_label(frame, "Novel", 0)
+        self._novel_combo = ttk.Combobox(
+            frame,
+            state="readonly",
+            style=s["combobox"],
+            width=NOVEL_FIELD_CHARS,
+            values=[
+                catalog.get_adapters_for_novel(slug)[0].novel_title
+                for slug in self._novel_slugs
+            ],
+        )
+        self._novel_combo.grid(row=0, column=1, sticky="ew")
+        self._novel_combo.bind(
+            "<<ComboboxSelected>>", lambda _e: self._on_novel_change()
+        )
+
+        # Website selector (a Menubutton + Menu so individual disabled sites can be
+        # greyed and made non-selectable — a Combobox can't disable single items).
+        # It lists the sites for the selected novel, so it sits below Novel.
+        self._field_label(frame, "Website", 1)
+        self._site_key = tk.StringVar(value="")
+        # A fixed character width, like the Novel field: a long site name is clipped
+        # inside the picker and never widens the window.
+        self._site_menubtn = ttk.Menubutton(
+            frame, text="(select a novel)", style=s["menubutton"], width=NOVEL_FIELD_CHARS
+        )
+        self._site_menu = tk.Menu(self._site_menubtn, tearoff=0)
+        self._site_menubtn["menu"] = self._site_menu
+        self._site_menubtn.grid(row=1, column=1, sticky="ew", pady=row_pad)
+
+        # Shown only when the novel has no runnable site (gridded on demand).
+        self._site_hint = self._note(frame, "", "warning_label")
+        self._site_hint.grid(row=2, column=0, columnspan=2, sticky="w", pady=(m["gap_xs"], 0))
+        self._site_hint.grid_remove()
+
+        # Chapter range.
+        self._field_label(frame, "Start chapter", 3)
+        self._start_var = tk.StringVar(value="1")
+        e_start = ttk.Entry(
+            frame, textvariable=self._start_var, width=NUMBER_FIELD_CHARS, style=s["entry"]
+        )
+        e_start.grid(row=3, column=1, sticky="w", pady=row_pad)
+
+        self._field_label(frame, "End chapter", 4)
+        end_row = ttk.Frame(frame, style=s["surface"])
+        end_row.grid(row=4, column=1, sticky="w", pady=row_pad)
+        self._end_var = tk.StringVar(value="")
+        e_end = ttk.Entry(
+            end_row, textvariable=self._end_var, width=NUMBER_FIELD_CHARS, style=s["entry"]
+        )
+        e_end.grid(row=0, column=0, sticky="w")
+        ttk.Label(end_row, text="blank = all chapters", style=s["secondary_label"]).grid(
+            row=0, column=1, sticky="w", padx=(m["gap_md"], 0)
+        )
+        return e_start, e_end
+
+    def _build_output_options(
+        self, frame: ttk.Labelframe
+    ) -> tuple[ttk.Radiobutton, ttk.Radiobutton, ttk.Radiobutton]:
+        s, m = self._bundle["styles"], self._bundle["metrics"]
+
+        # Formats. PDF is the only renderer today and both formats may never be off,
+        # so PDF shows ticked and locked, and TXT shows visibly unavailable. Neither
+        # pretends to change the run; TXT is enabled when a TXT renderer exists.
+        self._field_label(frame, "Format", 0)
+        formats = ttk.Frame(frame, style=s["surface"])
+        formats.grid(row=0, column=1, sticky="w")
+        self._pdf_var = tk.BooleanVar(value=True)
+        self._pdf_check = ttk.Checkbutton(
+            formats, text="PDF", variable=self._pdf_var, style=s["checkbutton"],
+            state="disabled",
+        )
+        self._pdf_check.grid(row=0, column=0, sticky="w")
+        self._txt_var = tk.BooleanVar(value=False)
+        self._txt_check = ttk.Checkbutton(
+            formats, text="TXT", variable=self._txt_var, style=s["checkbutton"],
+            state="disabled",
+        )
+        self._txt_check.grid(row=0, column=1, sticky="w", padx=(m["gap_lg"], 0))
+        # Beside the boxes (not on a row of its own) so it never makes the section taller.
+        self._format_note = ttk.Label(formats, text=FORMAT_NOTE, style=s["secondary_label"])
+        self._format_note.grid(row=0, column=2, sticky="w", padx=(m["gap_sm"], 0))
+
+        # Grouping: exactly one of the three existing output modes.
+        self._field_label(frame, "Grouping", 1)
+        self._mode_var = tk.StringVar(value=OutputMode.SEPARATE.value)
+        rb_sep = ttk.Radiobutton(
+            frame, text=GROUPING_LABELS[OutputMode.SEPARATE],
+            value=OutputMode.SEPARATE.value, variable=self._mode_var,
+            command=self._on_mode_change, style=s["radiobutton"],
+        )
+        rb_sep.grid(row=1, column=1, sticky="w", pady=(m["gap_sm"], 0))
+        rb_single = ttk.Radiobutton(
+            frame, text=GROUPING_LABELS[OutputMode.SINGLE],
+            value=OutputMode.SINGLE.value, variable=self._mode_var,
+            command=self._on_mode_change, style=s["radiobutton"],
+        )
+        rb_single.grid(row=2, column=1, sticky="w")
+        chunk_row = ttk.Frame(frame, style=s["surface"])
+        chunk_row.grid(row=3, column=1, sticky="w")
+        rb_chunk = ttk.Radiobutton(
+            chunk_row, text=GROUPING_LABELS[OutputMode.CHUNKED],
+            value=OutputMode.CHUNKED.value, variable=self._mode_var,
+            command=self._on_mode_change, style=s["radiobutton"],
+        )
+        rb_chunk.grid(row=0, column=0, sticky="w")
+        self._chunk_var = tk.StringVar(value=DEFAULT_CHUNK)
+        self._chunk_entry = ttk.Entry(
+            chunk_row, textvariable=self._chunk_var, width=5, style=s["entry"]
+        )
+        self._chunk_entry.grid(row=0, column=1, sticky="w", padx=(m["gap_sm"], m["gap_sm"]))
+        ttk.Label(chunk_row, text="chapters per PDF", style=s["label"]).grid(
+            row=0, column=2, sticky="w"
+        )
+        return rb_sep, rb_single, rb_chunk
+
+    def _build_run(self, frame: ttk.Labelframe) -> ttk.Entry:
+        s, m = self._bundle["styles"], self._bundle["metrics"]
+        row_pad = (m["gap_sm"], 0)
+
+        # Output location. The read-only field shows the resolved TARGET folder
+        # (where the PDFs will actually land); "Browse…" picks the PARENT folder,
+        # and the optional name field overrides the folder name (blank = novel
+        # slug). A "-N" auto-increment is appended so nothing is overwritten. All
+        # path resolution stays in pipeline.resolve_output_dir — this is a thin
+        # GUI shell. The displayed target is NEVER fed back as the parent.
+        self._field_label(frame, "Output folder", 0)
+        self._output_target_var = tk.StringVar(value="")
+        # width=12 + sticky "ew": a long path is scrolled inside the field and never
+        # widens the window.
+        e_output = ttk.Entry(
+            frame, textvariable=self._output_target_var, state="readonly", width=12,
+            style=s["entry"],
+        )
+        e_output.grid(row=0, column=1, sticky="ew")
+        self._browse_btn = ttk.Button(
+            frame, text="Browse…", command=self._on_browse, style=s["button"]
+        )
+        self._browse_btn.grid(row=0, column=2, sticky="e", padx=(m["gap_md"], 0))
+
+        self._field_label(frame, "Folder name", 1)
+        self._folder_name_var = tk.StringVar(value="")
+        e_folder = ttk.Entry(
+            frame, textvariable=self._folder_name_var, width=12, style=s["entry"]
+        )
+        e_folder.grid(row=1, column=1, columnspan=2, sticky="ew", pady=row_pad)
+        e_folder.bind("<KeyRelease>", lambda _e: self._refresh_output_preview())
+        self._folder_hint = self._note(frame, FOLDER_HINT)
+        self._folder_hint.grid(row=2, column=0, columnspan=3, sticky="w", pady=(m["gap_xs"], 0))
+
+        # Start / Stop (+ the Advanced Settings window on the right).
+        actions = ttk.Frame(frame, style=s["surface"])
+        actions.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(m["gap_md"], 0))
+        actions.columnconfigure(2, weight=1)
+        self._start_btn = ttk.Button(
+            actions, text="Start", command=self._on_start, style=s["primary_button"]
+        )
+        if self._platform == "darwin":
+            # Aqua ignores custom button fills; its native default-button cue
+            # supplies the primary accent instead (as in PDF-Splitter).
+            self._start_btn.configure(default="active")
+        self._start_btn.grid(row=0, column=0, sticky="w")
+        self._stop_btn = ttk.Button(
+            actions, text="Stop", command=self._on_stop, state="disabled",
+            style=s["danger_button"],
+        )
+        self._stop_btn.grid(row=0, column=1, sticky="w", padx=(m["gap_sm"], 0))
+        self._advanced_btn = ttk.Button(
+            actions, text="Advanced Settings…", command=self.open_advanced_settings,
+            style=s["button"],
+        )
+        self._advanced_btn.grid(row=0, column=2, sticky="e", padx=(m["gap_md"], 0))
+
+        # Progress bar + the run's state and chapter count.
+        self._progress = ttk.Progressbar(
+            frame, mode="determinate", maximum=1, style=s["progressbar"]
+        )
+        self._progress.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(m["gap_md"], 0))
+        info = ttk.Frame(frame, style=s["surface"])
+        info.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(m["gap_xs"], 0))
+        info.columnconfigure(0, weight=1)
+        self._run_status_var = tk.StringVar(value="Idle")
+        ttk.Label(
+            info, textvariable=self._run_status_var, style=s["secondary_label"], width=1
+        ).grid(row=0, column=0, sticky="ew")
+        self._counts_var = tk.StringVar(value="—")
+        ttk.Label(info, textvariable=self._counts_var, style=s["secondary_label"]).grid(
+            row=0, column=1, sticky="e", padx=(m["gap_md"], 0)
+        )
+        return e_folder
+
+    def _build_activity(self) -> None:
+        """The working log, inside the bordered Activity panel. Checkpoint 02 puts its
+        Summary/Detailed tabs in this same body frame; the panel, its grid weight and
+        the window fit stay as they are."""
+        s = self._bundle["styles"]
+        self._activity_body = ttk.Frame(self._activity, style=s["surface"])
+        self._activity_body.grid(row=0, column=0, sticky="nsew")
+        self._activity_body.columnconfigure(0, weight=1)
+        self._activity_body.rowconfigure(0, weight=1)
+        self._log_text = tk.Text(
+            self._activity_body, width=ACTIVITY_FLOOR_CHARS, height=LOG_FLOOR_LINES,
+            wrap="word", state="disabled", font=self._bundle["fonts"]["mono"],
+            padx=6, pady=4,
+        )
+        self._log_text.grid(row=0, column=0, sticky="nsew")
+        bar = ttk.Scrollbar(
+            self._activity_body, orient="vertical", command=self._log_text.yview,
+            style=s["vscrollbar"],
+        )
+        bar.grid(row=0, column=1, sticky="ns")
+        self._log_text.configure(yscrollcommand=bar.set)
+        self._text_widgets.append((self._log_text, "log"))
+
+    def _build_status_bar(self) -> None:
+        s, m = self._bundle["styles"], self._bundle["metrics"]
+        outer = ttk.Frame(self, style=s["window"])
+        outer.grid(row=2, column=0, sticky="ew")
+        ttk.Frame(outer, style=s["divider"], height=1).pack(fill="x")
+        bar = ttk.Frame(outer, style=s["window"], padding=m["status_pad"])
+        bar.pack(fill="x")
+        self._status_var = tk.StringVar(value="Ready.")
+        # width=1 keeps a long message from enlarging the window; it still fills the row.
+        ttk.Label(
+            bar, textvariable=self._status_var, style=s["status_label"], anchor="w", width=1
+        ).pack(side="left", fill="x", expand=True)
+        self._appearance_btn = ttk.Button(
+            bar, text="", style=s["ghost_button"], command=self.toggle_appearance,
+            takefocus=True,
+        )
+        self._appearance_btn.pack(side="right", padx=(m["gap_md"], 0))
+
+    def _build_advanced(self) -> tuple[ttk.Entry, ttk.Entry]:
+        """The Advanced Settings window: built once with the main window and kept
+        hidden, so its Tk variables and widgets always exist (Start reads them, the
+        run lock disables them) whether or not it is open. Close only hides it."""
+        s, m = self._bundle["styles"], self._bundle["metrics"]
+        wrap = ADVANCED_WRAP_CHARS * self._unit()
+        dialog = tk.Toplevel(self)
+        dialog.withdraw()
+        dialog.title("Advanced Settings")
+        dialog.transient(self)
+        dialog.resizable(False, False)
+        dialog.protocol("WM_DELETE_WINDOW", self.close_advanced_settings)
+        dialog.bind("<Escape>", lambda _e: (self.close_advanced_settings(), "break")[1])
+        self._advanced = dialog
+
+        outer = ttk.Frame(dialog, style=s["window"], padding=m["content_pad"])
+        outer.pack(fill="both", expand=True)
+        outer.columnconfigure(0, weight=1)
+
+        def group(title: str, row: int) -> ttk.Labelframe:
+            frame = ttk.Labelframe(
+                outer, text=title, style=s["labelframe"], padding=m["card_pad"]
+            )
+            frame.grid(row=row, column=0, sticky="ew", pady=(0 if row == 0 else self._gap, 0))
+            frame.columnconfigure(1, weight=1)
+            return frame
+
+        def hint(parent: tk.Misc, text: str, row: int, indent: int = 0) -> ttk.Label:
+            label = ttk.Label(
+                parent, text=text, style=s["secondary_label"], wraplength=wrap - indent,
+                justify="left",
+            )
+            label.grid(row=row, column=0, columnspan=2, sticky="w", padx=(indent, 0))
+            return label
+
+        # Delay + timeout. The delay is the user-facing rate-limit / anti-detection
+        # knob (Phase 9A): higher = slower but less likely to be blocked.
+        speed = group("Speed", 0)
+        self._field_label(speed, "Delay between fetches (seconds)", 0)
+        self._delay_var = tk.StringVar(value=DEFAULT_DELAY)
+        e_delay = ttk.Entry(
+            speed, textvariable=self._delay_var, width=NUMBER_FIELD_CHARS, style=s["entry"]
+        )
+        e_delay.grid(row=0, column=1, sticky="w")
+        self._delay_hint = hint(
+            speed, "Anti-detection: higher = slower but less likely to be blocked.", 1
+        )
+        self._field_label(speed, "Timeout (seconds)", 2)
+        self._timeout_var = tk.StringVar(value=DEFAULT_TIMEOUT)
+        e_timeout = ttk.Entry(
+            speed, textvariable=self._timeout_var, width=NUMBER_FIELD_CHARS, style=s["entry"]
+        )
+        e_timeout.grid(row=2, column=1, sticky="w", pady=(m["gap_sm"], 0))
+
+        # Browser mode + its modifiers (Free Web Novel only; inert for HTTP sites).
+        indent = 20
+        browser = group("Browser", 1)
+        self._browser_var = tk.BooleanVar(value=DEFAULT_BROWSER_MODE)
+        self._browser_check = ttk.Checkbutton(
+            browser,
+            text="Use browser mode (recommended for Free Web Novel)",
+            variable=self._browser_var,
+            command=self._on_browser_toggle,
+            style=s["checkbutton"],
+        )
+        self._browser_check.grid(row=0, column=0, columnspan=2, sticky="w")
+        self._browser_hint = hint(browser, BROWSER_HINT, 1, indent)
+        self._headless_var = tk.BooleanVar(value=DEFAULT_HEADLESS)
+        self._headless_check = ttk.Checkbutton(
+            browser,
+            text="Headless primary browser (advanced)",
+            variable=self._headless_var,
+            style=s["checkbutton"],
+        )
+        self._headless_check.grid(
+            row=2, column=0, columnspan=2, sticky="w", padx=(indent, 0), pady=(m["gap_sm"], 0)
+        )
+        self._headless_hint = hint(browser, HEADLESS_HINT, 3, 2 * indent)
+        self._http_first_var = tk.BooleanVar(value=DEFAULT_HTTP_FIRST)
+        self._http_first_check = ttk.Checkbutton(
+            browser,
+            text="Try fast HTTP first (may trip Cloudflare — off by default)",
+            variable=self._http_first_var,
+            style=s["checkbutton"],
+        )
+        self._http_first_check.grid(
+            row=4, column=0, columnspan=2, sticky="w", padx=(indent, 0), pady=(m["gap_sm"], 0)
+        )
+
+        cache = group("Cache", 2)
+        self._cache_var = tk.BooleanVar(value=True)
+        self._cache_check = ttk.Checkbutton(
+            cache, text="Use HTML cache (resume re-runs)",
+            variable=self._cache_var, style=s["checkbutton"],
+        )
+        self._cache_check.grid(row=0, column=0, columnspan=2, sticky="w")
+
+        ttk.Label(
+            outer, text=ADVANCED_NOTE, style=s["status_label"], wraplength=wrap,
+            justify="left",
+        ).grid(row=3, column=0, sticky="w", pady=(m["gap_md"], 0))
+        self._advanced_close = ttk.Button(
+            outer, text="Close", command=self.close_advanced_settings, style=s["button"]
+        )
+        self._advanced_close.grid(row=4, column=0, sticky="e", pady=(m["gap_md"], 0))
+        return e_delay, e_timeout
+
+    # ── Appearance + window fit ──────────────────────────────────────────────
+    def toggle_appearance(self) -> None:
+        """Switch Light/Dark in place and save the choice. Named styles are
+        reconfigured, never rebuilt, so values, selections, focus and a running
+        scrape are untouched. A failed save keeps the choice for this session."""
+        new = appearance.toggled(self._store.settings.appearance)
+        result = self._store.update(appearance=new)
+        bundle = appearance.build_bundle(
+            self._style, new, platform=self._platform, root=self
+        )
+        appearance.notify_listeners(bundle)
+        self._apply_bundle(bundle)
+        name = new.capitalize()
+        self._set_status(
+            f"Appearance: {name}." if result.ok
+            else f"Appearance: {name} for this session only (not saved: {result.message})."
+        )
+
+    def _apply_bundle(self, bundle: dict) -> None:
+        """Apply *bundle* to everything ttk styles cannot reach."""
+        self._bundle = bundle
+        colors = bundle["colors"]
+        self.configure(background=colors["window"])
+        self._advanced.configure(background=colors["window"])
+        ring = max(1, round(bundle["metrics"]["border_width"]))
+        for widget, role in self._text_widgets:
+            appearance.style_tk_widget(widget, bundle, role, highlightthickness=ring)
+        if bundle.get("ttk_active"):
+            # On Aqua the Website menu and the dropdown list stay native.
+            appearance.style_tk_widget(self._site_menu, bundle, "menu")
+            appearance.style_combobox_popdown(self._novel_combo, bundle)
+        other = "Light" if bundle["appearance"] == appearance.DARK else "Dark"
+        self._appearance_btn.configure(text=f"{other} mode")
+
+    def _set_status(self, message: str) -> None:
+        self._status_var.set(message)
+
+    def _set_log_size(self, *, chars: int, lines: int) -> None:
+        self._log_text.configure(width=chars, height=lines)
+
+    def _fit_window(self) -> None:
+        """Derive the minimum and default geometry from measured widget sizes
+        (PDF-Splitter's measure -> minimum-size -> default technique)."""
+        unit = self._unit()
+        m = self._bundle["metrics"]
+        hint_text = str(self._site_hint.cget("text"))
+
+        # Minimum: the log at its floor and the no-site hint shown, so showing that
+        # hint later can never clip the Run section.
+        self._site_hint.configure(text=NO_SITE_HINT)
+        self._site_hint.grid()
+        self._set_log_size(chars=ACTIVITY_FLOOR_CHARS, lines=LOG_FLOOR_LINES)
+        self.update_idletasks()
+        left_width = self._left.winfo_reqwidth()
+        self._body.columnconfigure(0, weight=0, minsize=left_width)
+        # A section's interior is the column minus its padding and 1px borders.
+        interior = left_width - 2 * (int(m["card_pad"]) + int(m["border_width"]) + 1)
+        for label in self._wrap_labels:
+            label.configure(wraplength=max(8 * unit, interior))
+        self.update_idletasks()
+        min_width, min_height = self.winfo_reqwidth(), self.winfo_reqheight()
+
+        # Default: a roomier log; the hint as the current selection needs it.
+        self._set_site_hint(hint_text)
+        self._set_log_size(chars=ACTIVITY_PREFERRED_CHARS, lines=LOG_PREFERRED_LINES)
+        self.update_idletasks()
+        want_width, want_height = self.winfo_reqwidth(), self.winfo_reqheight()
+
+        # Back to the floor so the window's own requested size is the minimum; the
+        # explicit geometry below decides the real size and Activity absorbs the rest.
+        self._set_log_size(chars=ACTIVITY_FLOOR_CHARS, lines=LOG_FLOOR_LINES)
+        self.update_idletasks()
+
+        screen_w, screen_h = self.winfo_screenwidth(), self.winfo_screenheight()
+        width = max(min_width, min(want_width, int(screen_w * SCREEN_FRACTION)))
+        height = max(min_height, min(want_height, int(screen_h * SCREEN_FRACTION)))
+        x = max(0, (screen_w - width) // 2)
+        y = max(0, (screen_h - height) // 3)
+        self.minsize(min_width, min_height)
+        self.geometry(f"{width}x{height}+{x}+{y}")
+        fits = min_width <= screen_w and min_height <= screen_h
+        scaling = float(self.tk.call("tk", "scaling"))
+        self.geometry_info = {
+            "minimum": (min_width, min_height), "default": (width, height),
+            "screen": (screen_w, screen_h), "tk_scaling": round(scaling, 3),
+            "scale_percent": round(scaling / (96 / 72) * 100),
+            "controls_width": left_width, "unit_px": unit, "fits_screen": fits,
+        }
+        if not fits:
+            self._set_status("This display is too small for the minimum window size.")
+
+    # ── Advanced Settings window ─────────────────────────────────────────────
+    def open_advanced_settings(self) -> tk.Toplevel:
+        """Show the Advanced Settings window centred over the main window."""
+        dialog = self._advanced
+        dialog.update_idletasks()
+        width, height = dialog.winfo_reqwidth(), dialog.winfo_reqheight()
+        x = self.winfo_rootx() + max(0, (self.winfo_width() - width) // 2)
+        y = self.winfo_rooty() + max(0, (self.winfo_height() - height) // 3)
+        x = max(0, min(x, self.winfo_screenwidth() - width))
+        y = max(0, min(y, self.winfo_screenheight() - height))
+        dialog.geometry(f"+{x}+{y}")
+        dialog.deiconify()
+        dialog.lift()
+        dialog.focus_set()
+        return dialog
+
+    def close_advanced_settings(self) -> None:
+        self._advanced.withdraw()
+
     # ── Selection handlers ───────────────────────────────────────────────────
     def _current_slug(self) -> str:
         idx = self._novel_combo.current()
@@ -349,7 +764,7 @@ class ScraperApp(tk.Tk):
             return None
 
     def _on_novel_change(self) -> None:
-        """Repopulate the Site menu for the newly selected novel."""
+        """Repopulate the Website menu for the newly selected novel."""
         self._site_menu.delete(0, "end")
         specs = catalog.get_adapters_for_novel(self._current_slug())
         first_enabled: str | None = None
@@ -376,14 +791,21 @@ class ScraperApp(tk.Tk):
         spec = self._current_spec()
         if spec is not None:
             self._site_menubtn.configure(text=spec.display_name)
-            self._site_hint.configure(text="")
+            self._set_site_hint("")
         else:
             self._site_menubtn.configure(text="(no site available)")
-            self._site_hint.configure(
-                text="All sources for this novel are coming soon — nothing to run yet."
-            )
+            self._set_site_hint(NO_SITE_HINT)
         self._refresh_browser_state()
         self._refresh_start_state()
+
+    def _set_site_hint(self, text: str) -> None:
+        """Show the hint only when it has something to say (its row is reserved in
+        the measured minimum, so showing it never clips the sections below)."""
+        self._site_hint.configure(text=text)
+        if text:
+            self._site_hint.grid()
+        else:
+            self._site_hint.grid_remove()
 
     def _on_mode_change(self) -> None:
         chunked = self._mode_var.get() == OutputMode.CHUNKED.value
@@ -518,6 +940,8 @@ class ScraperApp(tk.Tk):
 
         self._set_running(True)
         self._progress.configure(value=0, maximum=1)
+        self._run_status_var.set("Running…")
+        self._counts_var.set("—")
         self._append_log("─" * 50)
         self._append_log(
             f"Starting: {spec.novel_title} via {spec.display_name} "
@@ -627,11 +1051,13 @@ class ScraperApp(tk.Tk):
         self._append_log(
             "Stop requested — finishing the current chapter, then halting…"
         )
+        self._run_status_var.set("Stopping after the current chapter…")
         self._stop_btn.configure(state="disabled")
 
     def _on_run_finished(self) -> None:
         self._append_log("— run ended —")
         self._set_running(False)
+        self._run_status_var.set("Run ended.")
         # The run created its {name}-N folder; refresh the preview so the next run
         # shows the next free -N (still a sibling under the same parent).
         self._refresh_output_preview()
@@ -659,6 +1085,7 @@ class ScraperApp(tk.Tk):
 
     def _set_progress(self, done: int, total: int) -> None:
         self._progress.configure(maximum=max(total, 1), value=done)
+        self._counts_var.set(f"{done} / {total} chapters")
 
     # ── Enable/disable while running ─────────────────────────────────────────
     def _set_running(self, running: bool) -> None:
@@ -699,6 +1126,7 @@ class ScraperApp(tk.Tk):
         if self._cancel_event is not None:
             self._cancel_event.set()
         self._append_log("Closing — waiting for the current chapter to finish…")
+        self._run_status_var.set("Closing after the current chapter…")
         # Lock the buttons; the window stays up (responsive) while we wait.
         for btn in (self._stop_btn, self._start_btn):
             try:
@@ -720,7 +1148,9 @@ class ScraperApp(tk.Tk):
 
 def main() -> None:
     """GUI entry point — launched by Setup_and_Run / the package."""
-    app = ScraperApp()
+    store = SettingsStore()
+    store.load()
+    app = ScraperApp(store)
     app.mainloop()
 
 

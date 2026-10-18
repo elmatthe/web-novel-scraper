@@ -1,66 +1,97 @@
 # webnovel-scraper - Handoff
 
-## Current Snapshot — v0.3.0 step 01.0 complete (flat `scripts/` layout)
-**2026-10-17 · HOME-PC (Windows 11) · Claude Code (Opus 5.5) · branch
+## Current Snapshot — v0.3.0 Checkpoint 01.1 complete (Light/Dark UI foundation)
+**2026-10-18 · HOME-PC (Windows 11) · Claude Code (Opus 5.5) · branch
 `feature/v0.3.0-modernization`**
 
 - **Active plan:** `md-instructions/Web-Novel-Scraper-v0.3.0-Implementation-Plan.md`
   (owner-approved; §1 "Verified baseline", §4 checkpoint 01, §8 C1–C15).
 - **Base:** `577b5db` = `main` (`e7dc407`) plus the FWN offset/duplicate-output
-  fix (owner-approved base). Checkpoint 00 = `1ab1747`; step 01.0 is the commit
-  after it. `fix/freewebnovel-offset-and-output-collisions` stays local.
+  fix (owner-approved base). Checkpoint 00 = `1ab1747`; step 01.0 (flat
+  `scripts/` layout, 20 renames) = `f169565`; 01.1 is the commit after it.
+  `fix/freewebnovel-offset-and-output-collisions` stays local.
 - **Release state:** v0.2.0 is the latest release and tag (2026-06-30). 0.2.1 is
   merged to `main` via PR #4 but untagged. v0.3.0 supersedes it (plan §8 C3).
-- **Step 01.0 (layout only, no behaviour change):** committed the move
-  `scripts/Universal/*` → `scripts/*` and the deletion of the empty
-  `scripts/Windows/` and `scripts/MacOS/` placeholders. Git records all 20 files
-  as renames: 17 are unchanged (R100), and `app.py`, `browser_env.py` and
-  `request_manager.py` carry only the path-line repairs below. Repaired the dependent paths:
-  - `files/tests/conftest.py` now puts `scripts/` on `sys.path`.
-  - `MAIN_SCRIPT` and header comments in both launchers now point at
-    `scripts\app.py` / `scripts/app.py`.
-  - `parents[3]` → `parents[2]` in `webnovel_scraper/request_manager.py`
-    (`DEFAULT_CACHE_ROOT`) and `webnovel_scraper/browser_env.py`
-    (`CONTAINED_BROWSERS_PATH`).
-  - Path comments in `scripts/app.py`; `files/bypass_eval.py` `sys.path`.
-  - Briefing architecture text. README had no script-path references.
-
-  New `files/tests/test_flat_layout.py` (8 offline tests) covers:
-  - imports from `scripts/`, including a fresh isolated interpreter loading
-    `scripts/app.py` the launcher's way;
-  - the cache root and contained browsers resolving inside the repo;
-  - both launchers' `MAIN_SCRIPT` values;
-  - one real FWN fixture chapter running through the real parser and pipeline
-    into a PDF.
-
-  Also fixed a Checkpoint 00 regression: Briefing's status note said "v0.3.0"
-  before "0.2.0" in `## Current Version`, which failed two
-  `test_release_metadata.py` guards. Commit `1ab1747` carried that failure because
-  the 00 gate ran on a clean `577b5db` worktree before the doc edits.
+- **Checkpoint 01.1 (UI only).** No scraper, pipeline, adapter, PDF, cache,
+  dependency or default changes: `DEFAULT_HEADLESS` is still `False`, output
+  folders are still `<parent>/<slug>-N`, and the catalog is unchanged.
+  - New `scripts/webnovel_scraper/ui/` package (Tk only, no scraping):
+    - `appearance.py` is adapted from PDF-Splitter `appearance.py` (local working
+      copy supplied 2026-10-17; this file is identical to GitHub `edcbd4f`), which
+      came from ACT v0.6.6. It provides the `Compact.*` clam-cloned ttk styles, the
+      Light/Dark palettes, the Aqua branch and the in-place refresh. Removed the
+      Treeview, Spinbox and Inline styles (no such widgets here). Added
+      `Compact.TMenubutton`, built from the Combobox field/arrow clones so the
+      Website picker matches the Novel dropdown, and a `menu` role for `tk.Menu`.
+    - `settings.py` is PDF-Splitter's store trimmed to schema v1 with
+      `appearance` only. It has a forgiving load, an atomic save, and keeps a
+      `settings.unusable-<stamp>.json` copy of a bad original. The file is
+      `files/runtime-data/settings.json`, now gitignored.
+  - `scripts/app.py` shell rebuilt. Every run-lifecycle method is unchanged
+    (`_on_start`, `_collect_params`, `_run_worker`, `_on_stop`, close/poll); the
+    status line updates were the only additions to them.
+    - Header (title + subtitle). Left column, three bordered sections:
+      - **1. Web Novel Selection:** Novel, Website, Start/End chapter, and the
+        no-site hint.
+      - **2. Output Options:** PDF ticked and locked, TXT visibly unavailable,
+        grouping radios "Individual chapters" / "Whole selected range" /
+        "Every X chapters per PDF" (same `OutputMode` values).
+      - **3. Run:** Output folder + Browse…, Folder name, Start/Stop,
+        Advanced Settings…, progress bar, run state and `done / total chapters`.
+    - Right: the **Activity** panel holding the existing log. Bottom status bar
+      with the Light/Dark toggle.
+    - Delay, timeout, browser mode, headless, HTTP-first and HTML cache moved,
+      unchanged, into an "Advanced Settings" window. It is built at startup and
+      only hidden, so Start, the run lock and the tests use the same widgets.
+    - `_fit_window` measures the minimum and default size: 631×571 minimum and
+      855×571 default at 100% on 1920×1080.
+  - Tests: `test_ui_settings.py` (19), `test_ui_appearance.py` (9) and
+    `test_ui_shell.py` (19). `test_phase4_gui.py`'s headless-hint test now reads
+    the hint note in the Advanced window: the same three wording assertions plus
+    its placement. `conftest.py` redirects the settings file to each test's temp
+    folder.
+  - New `files/tests/pytest.ini` sets `--capture=sys`. This fixes the
+    intermittent "no Tk display" skip seen at 01.0: with pytest's default fd
+    capture, about 1 in 300 `tk.Tk()` calls on Windows could not read Tk's own
+    `init.tcl`. With sys capture there were 0 failures in 900.
+- **Non-obvious UI decisions** (also in CHANGELOG):
+  1. Novel stays above Website because the Website menu lists the selected
+     novel's sites (current behaviour). A website-first flow is 02 wiring.
+  2. The advanced settings moved to their own window so the main window stays
+     short enough for 150% scaling on a 1080p laptop.
+  3. PDF is ticked and locked and TXT is disabled ("TXT not available yet"),
+     because both formats may never be off and neither box may pretend to change a
+     run. TXT is enabled at 05.
+  4. Activity holds the single existing log in `_activity_body`. 02 puts the
+     Summary/Detailed tabs and Clear Log there; no tabs were faked now.
+  5. Like PDF-Splitter, the process is not made DPI-aware. Windows scales the
+     whole window above 100%, so sizes stay consistent but text can look softer.
+  6. The run-state line and chapter counts come only from the existing
+     progress callback and run events.
 - **Last verification:** `scripts/verify.py` in place with `.venv` Python
-  3.13.12. **PASS: pytest 300 passed (292 baseline + 8 new); deps PASS; docs
-  PASS.** In one of the in-place runs a single GUI test skipped through its
-  existing "no Tk display" guard. It did not recur in two more full runs or five
-  GUI-file reruns.
+  3.13.12. **PASS: pytest 347 passed (300 baseline + 47 new), 0 skipped; deps
+  PASS; docs PASS.** Two more full runs: 347 passed, 0 skipped. The 59 GUI/UI
+  tests also pass on the existing Python 3.12.10. A mutation check confirmed the
+  tests bite: letting the controls column stretch fails 3 layout tests, and
+  resetting a value on theme switch fails the preservation test.
 
-  Startup smoke test: the launcher's exact command, `.venv\Scripts\pythonw.exe
-  scripts\app.py` with the launcher's `PLAYWRIGHT_BROWSERS_PATH`, opened the "Web
-  Novel Scraper" window. It closed gracefully with exit 0, and nothing was created
-  outside the repository. The `.bat` itself was not run: it waits for Enter, and
-  its sentinel and requirements-lock checks already show it would skip every
-  install. Nothing was installed and there was no live scraping.
-- **Pending manual test:** double-click `Setup_and_Run-Web-Novel-Scraper.bat`
-  once to confirm Step 5 launches the GUI from `scripts\app.py`, and run the
-  `.command` on a Mac when available. Next planned manual gate: the Windows UI
-  visual gate at the end of 01.
-- **Next exact action:** Checkpoint 01 UI foundation (after owner review of
-  01.0):
-  - adapt PDF-Splitter `appearance.py` (Compact ttk styles, Light/Dark palettes,
-    Aqua variants, state-preserving toggle) into `scripts/`, per plan §8 C5;
-  - rebuild the `app.py` shell as three bordered left sections plus a right
-    Activity area, with `_fit_window` geometry;
-  - port the `test_phase4_gui`/`test_phase8_gui` guarantees (C10);
-  - change no scraper, data or pipeline behaviour.
+  Startup smoke test: `.venv\Scripts\pythonw.exe scripts\app.py` opened the "Web
+  Novel Scraper" window, which closed gracefully with exit 0. It wrote no settings
+  file (startup only reads) and created nothing outside the repository. Nothing
+  was installed and there was no live scraping.
+- **Pending manual tests (owner):**
+  - Windows UI visual gate: Light/Dark, restored and maximized, minimum size,
+    125%/150% display scaling, every section legible, and the Website menu's
+    colours in Dark mode.
+  - Double-click `Setup_and_Run-Web-Novel-Scraper.bat` once.
+  - macOS: run the `.command` and check the Aqua look when a Mac is available.
+- **Next exact action:** owner review of the 01.1 UI foundation. Do not start
+  Checkpoint 02 until it is approved. Checkpoint 02 then covers:
+  - Activity Summary/Detailed tabs, Clear Log, PDF-Splitter's `ActivityPump`
+    queue and session logs;
+  - phase-aware progress and ETA;
+  - the website-first selection flow and Resume affordance;
+  - ordinary preference persistence.
 
 ### Uncommitted local state (deliberately NOT committed)
 - `md-instructions/0.2.1_release_plan.md`, `0.2.1_bug-hunt.md` and
@@ -84,6 +115,13 @@
   Briefing/handoff and handoff length are docs debt for 07 (C14).
 
 ### Log (newest first)
+- 2026-10-18 — Checkpoint 01.1: Light/Dark appearance (adapted from
+  PDF-Splitter) and the three-section + Activity window shell with measured
+  geometry; advanced fetch settings moved, unchanged, to an Advanced Settings
+  window; appearance saved in ignored `files/runtime-data/settings.json`.
+  47 tests added; `files/tests/pytest.ini` (`--capture=sys`) fixes the
+  intermittent Tk skip. Verify PASS (347, 0 skipped). No scraper, pipeline,
+  PDF, dependency or default changes.
 - 2026-10-17 — Step 01.0: flat `scripts/` layout committed as renames, with
   dependent paths repaired. 8 layout regression tests added. Checkpoint 00's
   Briefing version-guard regression fixed. In-place verify PASS (300). Launcher

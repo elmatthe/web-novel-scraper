@@ -39,6 +39,8 @@ files/test-logs/
 files/cache/
 files/output/
 files/test-output/
+# GUI preferences and other per-machine runtime state (v0.3.0, plan section 8 C6).
+files/runtime-data/
 files/**/cache/
 
 # Output PDFs are generated artifacts — do NOT ignore committed test fixtures.
