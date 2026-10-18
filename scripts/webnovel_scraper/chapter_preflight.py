@@ -21,10 +21,19 @@ What it does, in order (plan §9.3):
    seeded with everything already known. Each reconciled window is persisted; coverage only grows
    over labels the adapter was actually asked about *and* accounted for, so an interrupted
    discovery never declares an unexamined window covered.
-6. Select by manifest, keyed by source page URL, never by displayed number alone. Anything the
-   request needs that the list neither holds nor records as confirmed-absent refuses the run with a
-   diagnostic. A hole *inside* a list the site just returned (a sparse TOC) is reported as a TOC
-   gap and is never turned into a claim that the source lacks the chapter.
+6. Select by manifest, keyed by source page URL, never by displayed number alone. A hole *inside*
+   a list the site just returned (a sparse TOC) is reported as a TOC gap and is never turned into a
+   claim that the source lacks the chapter.
+
+Range adjustment (owner decision 2026-10-18, ADR 011, superseding ADR 010 decision 3): a finite End
+past the last chapter a **fresh, successful, complete** discovery lists is clamped to that chapter
+(``1-5000`` on a 3,700-chapter list scrapes ``1-3700``), and a Start just below the first listed
+chapter is raised to it; both adjustments are logged and kept on the report beside the requested
+range. Nothing outside the list is ever recorded as absent or covered, so a later run asks the site
+again and picks up newly published chapters. A request whose missing part cannot be explained by
+fresh evidence (no discovery this run, a discovery that returned nothing, an adapter that could not
+confirm its list is complete, a huge hole, a hole above a newer saved chapter) still refuses with a
+diagnostic, and a Start past every listed chapter reports that none are available.
 """
 
 from __future__ import annotations
@@ -50,7 +59,7 @@ from .chapter_store import (
     ManifestLockBusy,
     ManifestStoreError,
 )
-from .models import ChapterMeta, SiteSpec
+from .models import ChapterIndex, ChapterMeta, SiteSpec  # noqa: F401 - ChapterIndex re-exported
 from .request_manager import ScrapeCancelled
 from .source_identity import ChapterIdentity, ChapterLabel, SourceIdentity, SourceIdentityError
 
@@ -87,6 +96,17 @@ class Selection:
     absent: list = field(default_factory=list)         # (label, evidence): source-confirmed absent
     discovered: bool = False                           # the adapter was asked this run
     empty_index: bool = False                          # the adapter returned nothing at all
+    range_notes: list = field(default_factory=list)    # human lines: how the range was adjusted
+
+
+def index_tail_confirmed(metas: object) -> bool:
+    """Whether a discovery result vouches that its list runs to the site's real last chapter.
+
+    An adapter that cannot confirm completeness (for example a site whose own chapter count
+    disagrees with the list it served) returns a list carrying ``tail_confirmed = False``; such a
+    list is never used to clamp an End. Plain lists are the adapters' normal complete answer.
+    """
+    return bool(getattr(metas, "tail_confirmed", True))
 
 
 # ── ChapterMeta <-> manifest identity bridge ─────────────────────────────────
@@ -185,6 +205,8 @@ class _Preflight:
         self.backup: Optional[Path] = None
         self.originals: dict[str, ChapterMeta] = {}
         self._shown: set[str] = set()
+        # Whether this run's discovery vouched for its tail (only then may an End be clamped).
+        self.tail_confirmed = False
 
     # -- entry --------------------------------------------------------------
     def execute(self) -> Selection:
@@ -374,6 +396,12 @@ class _Preflight:
         )
         if not metas and not effective.chapters:
             return effective, None, True
+        self.tail_confirmed = index_tail_confirmed(metas)
+        if not self.tail_confirmed:
+            self.log(
+                "WARNING: the site could not confirm that its chapter list is complete, so its "
+                "last listed chapter is not treated as the novel's end."
+            )
         identities = self._identities(metas, report=True)
         wholes = [n for n in (whole_number(c.label) for c in identities) if n is not None]
         examined = (min(wholes), max(wholes)) if wholes else None
@@ -440,17 +468,34 @@ class _Preflight:
         else:
             high, high_value = self.end, Decimal(self.end)
 
+        first_known = wholes[0] if wholes else None
+        last_known = wholes[-1] if wholes else None
         gap_runs: list[tuple[int, int]] = []
         unresolved: list[tuple[int, int]] = []
+        leading: list[tuple[int, int]] = []     # below the whole list: Start is raised to it
+        beyond: list[tuple[int, int]] = []      # above the whole list: End is clamped to it
         for a, b in effective.uncovered_spans(self.start, high):
             if examined is None:
                 unresolved.append((a, b))
                 continue
             low_x, high_x = examined
             if a < low_x:
-                unresolved.append((a, min(b, low_x - 1)))
+                part = (a, min(b, low_x - 1))
+                below_list = first_known is not None and part[1] < first_known
+                if below_list and part[1] - part[0] + 1 <= MAX_TOC_GAP_RUN:
+                    leading.append(part)
+                else:
+                    unresolved.append(part)
             if b > high_x:
-                unresolved.append((max(a, high_x + 1), b))
+                part = (max(a, high_x + 1), b)
+                # Only a fresh discovery that vouches for its tail may say where the novel ends, and
+                # only past every chapter known at all (a newer saved chapter means the site's
+                # answer was short, not that the novel ended).
+                past_list = last_known is not None and part[0] > last_known
+                if self.end is not None and self.tail_confirmed and past_list:
+                    beyond.append(part)
+                else:
+                    unresolved.append(part)
             inner = (max(a, low_x), min(b, high_x))
             if inner[0] <= inner[1]:
                 (unresolved if inner[1] - inner[0] + 1 > MAX_TOC_GAP_RUN else gap_runs).append(inner)
@@ -463,6 +508,33 @@ class _Preflight:
             for c in listed
             if low_value <= c.label.value <= high_value
         ]
+        if not chapters and (beyond or leading):
+            where = f"the site's chapter list ends at chapter {last_known}" if last_known else (
+                "the site lists no chapters"
+            )
+            raise ChapterListRefused(
+                f"None of chapters {self.start}-{self.end} are available: {where}. Nothing was "
+                "fetched or written."
+            )
+        effective_low, effective_high = self.start, high
+        notes: list[str] = []
+        if leading and chapters:
+            effective_low = max(self.start, int(chapters[0].index))
+            notes.append(
+                f"the site's chapter list starts at chapter {first_known}, so chapters "
+                f"{leading[0][0]}-{leading[-1][1]} are not available and this run starts at chapter "
+                f"{effective_low}"
+            )
+        if beyond and chapters:
+            effective_high = int(max(meta_label(m).value for m in chapters))
+            notes.append(
+                f"End chapter {self.end} is past the last chapter the site lists ({last_known}), so "
+                f"this run covers chapters {effective_low}-{effective_high}. Chapters "
+                f"{beyond[0][0]}-{self.end} are not listed yet; nothing is recorded about them, so a "
+                "later run checks the site again"
+            )
+        for note in notes:
+            self.log(f"NOTE: range adjusted: {note}.")
         absent = [
             (a.label.text, a.evidence)
             for a in effective.absent
@@ -475,10 +547,11 @@ class _Preflight:
             )
         return Selection(
             chapters=chapters,
-            effective_range=(self.start, high),
+            effective_range=(effective_low, effective_high),
             toc_gaps=[n for a, b in gap_runs for n in range(a, b + 1)],
             absent=absent,
             discovered=discovered,
+            range_notes=notes,
         )
 
     def _refusal(self, unresolved: list[tuple[int, int]], wholes: list[int]) -> str:
@@ -488,7 +561,13 @@ class _Preflight:
             verb = "is" if a == b else "are"
             if wholes and b < wholes[0]:
                 reasons.append(
-                    f"the site's chapter list starts at chapter {wholes[0]}, so {span} {verb} not available"
+                    f"the site's chapter list starts at chapter {wholes[0]}, so {span} {verb} not "
+                    "available (too many missing numbers to treat as a gap in the list)"
+                )
+            elif wholes and a > wholes[-1] and not self.tail_confirmed:
+                reasons.append(
+                    f"the site could not confirm that its chapter list is complete after chapter "
+                    f"{wholes[-1]}, so {span} could not be checked"
                 )
             elif wholes and a > wholes[-1]:
                 reasons.append(

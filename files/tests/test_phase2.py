@@ -29,7 +29,8 @@ def test_request_manager_instantiates_and_derives_cache_dir(tmp_path) -> None:
     mgr = RequestManager("shadow-slave", cache_root=tmp_path)
     assert mgr.slug == "shadow-slave"
     assert mgr.use_cache is True
-    assert mgr.cache_dir == tmp_path / "shadow-slave"
+    assert mgr.cache_root == tmp_path
+    assert mgr.legacy_cache_dir == tmp_path / "shadow-slave"
 
 
 def test_cache_key_is_deterministic() -> None:
@@ -39,11 +40,11 @@ def test_cache_key_is_deterministic() -> None:
     assert cache_key_for(url).endswith(".html")
 
 
-def test_cache_path_lives_under_slug_dir(tmp_path) -> None:
+def test_cache_path_lives_under_host_and_slug_dir(tmp_path) -> None:
     mgr = RequestManager("nq", cache_root=tmp_path)
     url = "https://example.com/x"
     path = mgr.cache_path_for(url)
-    assert path.parent == tmp_path / "nq"
+    assert path.parent == tmp_path / "example.com" / "nq"
     assert path.name == cache_key_for(url)
 
 
@@ -68,9 +69,7 @@ def test_cloudflare_challenge_detection() -> None:
 def test_fetch_html_serves_from_cache_without_network(tmp_path) -> None:
     mgr = RequestManager("slug", cache_root=tmp_path)
     url = "https://example.com/ch1"
-    cache_path = mgr.cache_path_for(url)
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    cache_path.write_text("<html>cached body</html>", encoding="utf-8")
+    assert mgr.cache.store(url, "<html>cached body</html>", strategy="http")
     # No session is created; a hit returns the cached text directly.
     assert mgr.fetch_html(url) == "<html>cached body</html>"
 

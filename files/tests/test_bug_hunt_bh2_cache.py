@@ -20,13 +20,29 @@ REAL_PAYLOAD = (
 )
 
 
+def write_pair(mgr, url: str, html: str) -> Path:
+    """An entry with a well-formed provenance record whose bytes may still be unusable — what a
+    cache saved before a content check existed looks like (v0.3.0 03.2b)."""
+    import hashlib
+    import json
+
+    path = mgr.cache_path_for(url)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = html.encode("utf-8")
+    path.write_bytes(data)
+    path.with_suffix(".json").write_text(json.dumps({
+        "schema_version": 1, "kind": "html-cache-entry", "url": url, "final_url": url,
+        "host": url.split("/")[2], "novel_slug": mgr.slug, "fetched_utc": "2026-10-18T00:00:00Z",
+        "byte_len": len(data), "sha256": hashlib.sha256(data).hexdigest(), "classification": "valid",
+        "strategy": "http", "origin": "network", "app_version": "0.2.1"}), encoding="utf-8")
+    return path
+
+
 def test_cached_cloudflare_challenge_is_treated_as_cache_miss(tmp_path) -> None:
     url = "https://example.test/chapter-1"
     logs: list[str] = []
     mgr = RequestManager("slug", cache_root=tmp_path, log_fn=logs.append)
-    cache_path = mgr.cache_path_for(url)
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    cache_path.write_text(CHALLENGE, encoding="utf-8")
+    write_pair(mgr, url, CHALLENGE)
     calls: list[str] = []
 
     def fake_uncached(_url: str, strategy: str) -> str:
@@ -45,9 +61,7 @@ def test_cached_cloudflare_challenge_is_treated_as_cache_miss(tmp_path) -> None:
 def test_cached_real_payload_is_still_returned_as_cache_hit(tmp_path) -> None:
     url = "https://example.test/chapter-2"
     mgr = RequestManager("slug", cache_root=tmp_path)
-    cache_path = mgr.cache_path_for(url)
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    cache_path.write_text(REAL_PAYLOAD, encoding="utf-8")
+    assert mgr.cache.store(url, REAL_PAYLOAD, strategy="http")
 
     def explode(_url: str, _strategy: str) -> str:
         raise AssertionError("network path must not run for a real cache hit")
@@ -62,9 +76,7 @@ def test_cached_real_payload_is_still_returned_as_cache_hit(tmp_path) -> None:
 def test_refetch_after_cached_challenge_overwrites_cache_with_real_payload(tmp_path) -> None:
     url = "https://example.test/chapter-3"
     mgr = RequestManager("slug", cache_root=tmp_path)
-    cache_path = mgr.cache_path_for(url)
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    cache_path.write_text(CHALLENGE, encoding="utf-8")
+    cache_path = write_pair(mgr, url, CHALLENGE)
     calls: list[tuple[str, str]] = []
 
     def fake_uncached(seen_url: str, strategy: str) -> str:
@@ -77,4 +89,7 @@ def test_refetch_after_cached_challenge_overwrites_cache_with_real_payload(tmp_p
     assert calls == [(url, rm.FETCH_STRATEGY_HTTP)]
     assert cache_path.read_text(encoding="utf-8") == REAL_PAYLOAD
     assert mgr.last_fetch_info.from_cache is False
+    # ... and the replacement is itself a valid entry on the next read
+    assert mgr.fetch(url, use_browser=False) == REAL_PAYLOAD
+    assert mgr.last_fetch_info.from_cache is True
 

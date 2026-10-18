@@ -69,8 +69,11 @@ def test_html_cache_root_resolves_inside_repo() -> None:
     assert request_manager._REPO_ROOT == REPO_ROOT
     assert request_manager.DEFAULT_CACHE_ROOT == REPO_ROOT / "files" / "cache"
     manager = RequestManager("shadow-slave", use_cache=False)
-    assert manager.cache_dir == REPO_ROOT / "files" / "cache" / "shadow-slave"
-    assert manager.cache_dir.is_relative_to(REPO_ROOT)
+    page = manager.cache_path_for("https://freewebnovel.com/novel/shadow-slave/chapter-1")
+    assert page.parent == REPO_ROOT / "files" / "cache" / "freewebnovel.com" / "shadow-slave"
+    assert page.is_relative_to(REPO_ROOT)
+    # the pre-0.3.0 folder is still where legacy copies are read from
+    assert manager.legacy_cache_dir == REPO_ROOT / "files" / "cache" / "shadow-slave"
 
 
 def test_contained_browsers_path_resolves_inside_repo(monkeypatch) -> None:

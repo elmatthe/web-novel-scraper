@@ -24,6 +24,14 @@ class EmptyExtractionError(Exception):
     """
 
 
+class ChapterMismatchError(EmptyExtractionError):
+    """The page was fetched and has a body, but it shows a different chapter than the chapter
+    list expects at that address (the site's numbering moved, or the wrong page was served).
+
+    An extraction-class failure: never a block, never swept, and never published as if it were
+    the expected chapter. The usual cure is an explicit chapter-list refresh."""
+
+
 class OutputMode(str, Enum):
     """How chapters are grouped into PDF files."""
 
@@ -96,6 +104,17 @@ class ChapterMeta:
         return not (self.title and self.title.strip())
 
 
+class ChapterIndex(list):
+    """A discovered chapter list (``ChapterMeta`` rows) that also says whether the adapter could
+    confirm it runs to the site's real last chapter. ``tail_confirmed=False`` means the list may be
+    short (for example the site's own chapter count disagrees with it), so the preflight never uses
+    its last chapter to clamp a requested End. A plain list counts as confirmed."""
+
+    def __init__(self, items=(), *, tail_confirmed: bool = True) -> None:
+        super().__init__(items)
+        self.tail_confirmed = tail_confirmed
+
+
 @dataclass
 class ChapterContent:
     """A fully extracted chapter: resolved title + cleaned body paragraphs."""
@@ -164,6 +183,10 @@ class ScrapeJob:
     # baseline) and rediscover it for this run. Never set silently; the GUI clears it
     # after every run.
     refresh_chapter_list: bool = False
+    # ── 0.3.0 03.2b ──────────────────────────────────────────────────────────
+    # One-shot, explicit: fetch every selected chapter page from the site again instead of
+    # serving it from the HTML cache; the fresh valid pages replace the cached ones.
+    refresh_html_cache: bool = False
 
     def __post_init__(self) -> None:
         # 0.2.0 invariant #1: strictly single-lane rescue. Reject any other count

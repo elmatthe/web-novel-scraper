@@ -5,6 +5,114 @@ See AI-WORKSPACE.md for how this fits alongside Briefing, Changelog, and Handoff
 
 ---
 
+## 013 — v0.3.0 is a Windows-only release candidate; macOS acceptance is deferred — 2026-10-18 — Claude (Opus 5.5)
+
+**Status:** Accepted (owner decision, 2026-10-18; supersedes the two-platform gate in plan §4 07 and §5)
+
+**Context:** The plan required separate Windows and Apple Silicon/macOS manual gates before release.
+No macOS machine is part of this execution, and the owner wants a reliable Windows release first.
+
+**Decision:** v0.3.0's release gate is Windows only. The portable code and the macOS launcher
+(`Setup_and_Run-Web-Novel-Scraper.command`) are kept as they are and are not deleted, but macOS
+acceptance, launcher testing and macOS-specific fixes move to a later owner-directed branch. No
+document may claim macOS readiness for v0.3.0. The `fcntl` lock branch and the Aqua styling remain
+untested on macOS and are listed as such.
+
+**Consequences:** Windows bootstrap, scaling and browser readiness get full attention in 07. A later
+macOS pass starts from the deferred list in `handoff.md`.
+
+---
+
+## 012 — The HTML cache is validated, provenance-carrying and host-scoped; index pages are never cached — 2026-10-18 — Claude (Opus 5.5)
+
+**Status:** Accepted (v0.3.0 Checkpoint 03.2b; implements plan §9.6 and owner override B)
+
+**Context:** Until 03.2b the cache was `files/cache/<novel>/<hash>.html`: raw HTML, no provenance,
+written non-atomically, checked on read only for garbled bytes and challenges. The table-of-contents
+page was cached like any chapter, so an open-ended re-run could be served an old index and never see
+newly published chapters. `.net` and `.com` would have shared a folder.
+
+**Decision:**
+1. **Layout and provenance.** `files/cache/<host>/<novel>/<key>.html` plus `<key>.json` (schema 1:
+   URL, final URL, host, novel, fetch time, byte length, SHA-256, classification, strategy, origin,
+   app version). `key` is the old key (`sha256(url)[:24]`). A manager scoped to a source caches only
+   that source's host.
+2. **A hit is proven, not assumed.** The sidecar must match the page, host and novel; length and hash
+   must match; the bytes must be UTF-8, not garbled, not a challenge and end their document. Any
+   failure is a logged miss; the next fetch replaces the pair, so a bad entry costs one request.
+3. **Atomic pairs.** HTML then sidecar, each temp + `fsync` + `os.replace`; an interrupted pair fails
+   the hash check.
+4. **Only usable pages stay.** The request manager never caches a challenge, an undecodable,
+   truncated or empty page, or a page the site answered from another address. An adapter that cannot
+   extract the chapter (no body, or the page shows another chapter number than the manifest expects:
+   the new offset guard) sets the entry aside as `<key>.invalid.html`; if it came from the cache it
+   fetches once more, and a second failure fails the chapter (no loop). Rescued pages are cached
+   only after they extract as the right chapter.
+5. **Index pages are always fresh.** FreeWebNovel and WebNovel fetch their index with
+   `use_cache=False`, so the tail re-check and any extension always see the site as it is now.
+   Chapter pages never expire on their own.
+6. **Legacy copy.** A miss looks for the pre-0.3.0 `<novel>/<key>.html`; if it passes the same checks
+   it is *copied* in with `origin: "legacy-copy"`. The old file is never moved, changed or deleted.
+7. **Explicit refresh.** `ScrapeJob.refresh_html_cache` (a one-shot box in Advanced Settings) skips
+   cached reads for one run and saves the fresh pages over the old ones.
+
+**Alternatives considered:**
+- *Commit pages only after extraction (deferred write).* Cleaner in theory, but it threads a commit
+  call through every adapter and the rescue path; write-then-invalidate gives the same guarantee.
+- *Expire chapter pages by age.* Rejected: a published chapter does not change, and age-based
+  refetching costs requests for nothing. Explicit refresh covers revisions.
+- *Cache index pages with a short time-to-live.* Rejected: the index is one request per discovery,
+  and any staleness can hide new chapters.
+- *Move the 1.2 GB legacy cache into the new layout in one pass.* Rejected: destructive and slow;
+  on-demand copying keeps the owner's data untouched.
+
+**Consequences:** The first run after upgrading copies legacy pages as it reads them (both copies
+stay on disk until the owner deletes the old folders). A chapter whose page now shows another number
+fails visibly instead of being published under the wrong number; refreshing the chapter list fixes a
+genuinely moved novel.
+
+---
+
+## 011 — An oversized End is clamped to the last chapter a fresh, complete discovery lists — 2026-10-18 — Claude (Opus 5.5)
+
+**Status:** Accepted (owner decision, 2026-10-18). **Supersedes ADR 010 decision 3 ("Refuse, do not
+clamp") for oversized ranges only;** every other part of ADR 010 stands.
+
+**Context:** 03.2a refused `1-5000` on a 3,700-chapter list. The owner rejected that: the habit of
+typing a large End must keep working, and an honest clamp is what the user means.
+
+**Decision:**
+1. **End clamp.** When a discovery made *this run* returned normally and vouches for its tail, a
+   requested span lying entirely above every chapter known at all is "not published yet": the End
+   is clamped to the last listed chapter. `requested_range` stays as asked; `effective_range` is
+   what is scraped; a `NOTE: range adjusted:` line goes to Activity Summary, `RunReport.range_notes`
+   and the summary block. Nothing above the list is recorded as absent or covered, so a later run
+   asks the site again and a finished novel can be extended.
+2. **What never clamps.** A failed, cancelled or blocked discovery (it raises); no discovery this
+   run; a discovery that returned nothing for the window; an adapter whose list may be short
+   (`ChapterIndex(tail_confirmed=False)`, e.g. WebNovel listing fewer chapters than its own
+   `chapterCnt`); a hole below a newer saved chapter (the site's answer was short). These still
+   refuse with the reason named.
+3. **Start.** A Start past every listed chapter refuses as "None of chapters X-Y are available"
+   (nothing fetched). A Start at most `MAX_TOC_GAP_RUN` (200) below the first listed chapter is
+   raised to it with a note; a larger leading hole still refuses.
+4. **Sparse TOC gaps are unchanged:** reported, skipped, never recorded absent. A run with gaps
+   inside its range now ends as "Finished with gaps" (completed with problems), never as a clean
+   "Completed", so a partial book is never presented as complete.
+
+**Alternatives considered:**
+- *Keep refusing (ADR 010).* Rejected by the owner.
+- *Clamp from the saved manifest without asking the site.* Rejected: a saved last chapter may be
+  stale; only fresh evidence may say where the novel ends.
+- *Record the numbers past the end as absent.* Rejected: it invents evidence and would block the
+  next extension.
+
+**Consequences:** `1-5000` on a 3,700-chapter novel scrapes 1-3700 and says so. Both pipeline paths
+behave identically (shared preflight). Regression tests cover both paths, the unconfirmed-tail case,
+growth on a later run and duplicate/fractional pages under a clamp.
+
+---
+
 ## 010 — The chapter manifest, not the output folder, decides the chapter list; coverage is claimed only for what was examined — 2026-10-18 — Claude (Sonnet 5.5)
 
 **Status:** Accepted (v0.3.0 Checkpoint 03.2a)

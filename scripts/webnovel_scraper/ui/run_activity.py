@@ -294,6 +294,7 @@ def outcome_events(report: object | None, *, processed: tuple[int, int] | None =
         empty = list(getattr(report, "extraction_failed", ()) or ())
         problems = len(set(failed) | set(missing) | set(empty))
         unaccounted = (processed[1] - processed[0]) if processed else 0
+        gaps = _gaps_in_range(report)
         if getattr(report, "cancelled", False):
             outcome = "stopped"
             events.append(run("Stopped before the end of the selected range, as requested."))
@@ -301,6 +302,14 @@ def outcome_events(report: object | None, *, processed: tuple[int, int] | None =
             outcome = "completed_with_problems"
             events.append(run(f"Finished with problems: {_plural(problems, 'chapter')} could "
                               "not be saved.", WARNING))
+        elif gaps and (written or skipped):
+            # Everything listed was saved, but numbers inside the range are missing from the
+            # site's own list: the output is not a complete copy of the range (owner rule).
+            outcome = "completed_with_problems"
+            verb = "is" if len(gaps) == 1 else "are"
+            events.append(run(f"Finished with gaps: {_plural(len(gaps), 'chapter number')} inside "
+                              f"the range {verb} missing from the site's chapter list, so the output "
+                              "is not a complete copy of the range.", WARNING))
         elif unaccounted > 0:
             # A run that ended normally accounts for every selected chapter; if the
             # pipeline's own count disagrees, say so rather than call it complete.

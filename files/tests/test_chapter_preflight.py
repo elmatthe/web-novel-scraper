@@ -107,9 +107,10 @@ class WindowAdapter:
                               paragraphs=[f"Body of chapter {meta.index}, long enough to render."])
 
 
-def job(tmp_path, start, end, *, mode=OutputMode.SEPARATE, refresh=False, **kw) -> ScrapeJob:
+def job(tmp_path, start, end, *, mode=OutputMode.SEPARATE, refresh=False, folder="out",
+        **kw) -> ScrapeJob:
     return ScrapeJob(novel_slug=NOVEL, adapter_key=KEY, start=start, end=end, delay=0.0,
-                     output_mode=mode, use_cache=False, output_dir=tmp_path / "out",
+                     output_mode=mode, use_cache=False, output_dir=tmp_path / folder,
                      refresh_chapter_list=refresh, **kw)
 
 
@@ -265,22 +266,98 @@ def test_an_open_end_past_the_list_is_refused(tmp_path, store):
     assert adapter.fetched == []
 
 
-# ── false-success prevention ──────────────────────────────────────────────────
-def test_a_finite_range_beyond_the_tail_refuses_and_fetches_nothing(tmp_path, store):
+# ── End clamping (owner decision 2026-10-18, ADR 011) ─────────────────────────
+def test_an_oversized_end_is_clamped_to_the_last_listed_chapter(tmp_path, store):
     adapter = WindowAdapter(range(1, 31))
-    with pytest.raises(ChapterListRefused) as refused:
+    report, logs = run(tmp_path, store, adapter, 1, 50)
+
+    assert report.requested_range == (1, 50)
+    assert report.effective_range == (1, 30)
+    assert len(report.written) == 30 and report.failed == []
+    assert [Path(u).name for u in adapter.fetched][-1] == "chapter-30"
+    adjusted = [line for line in logs if line.startswith("NOTE: range adjusted:")]
+    assert len(adjusted) == 1 and "End chapter 50" in adjusted[0] and "1-30" in adjusted[0]
+    assert report.range_notes and "31-50 are not listed yet" in report.range_notes[0]
+    assert "Range adjusted: End chapter 50" in report.summary()
+    manifest = effective(store)
+    assert manifest.covers(1, 30) and not manifest.covers(31, 31)    # nothing claimed past the list
+    assert manifest.absent == ()                                      # and nothing invented absent
+
+
+def test_a_clamped_novel_is_extended_when_the_site_publishes_more(tmp_path, store):
+    run(tmp_path, store, WindowAdapter(range(1, 31)), 1, 50)
+    grown = WindowAdapter(range(1, 41))
+    report, _ = run(tmp_path, store, grown, 1, 50, folder="second")
+    assert [(c["start_hint"], c["end_hint"]) for c in grown.calls] == [(31, 50)]   # only the unknown part
+    assert report.effective_range == (1, 40)
+    assert effective(store).covers(1, 40)
+
+
+def test_a_start_past_every_listed_chapter_reports_none_available(tmp_path, store):
+    adapter = WindowAdapter(range(1, 31), windowed=False)
+    with pytest.raises(ChapterListRefused, match="None of chapters 50-60 are available") as refused:
+        run(tmp_path, store, adapter, 50, 60)
+    assert "ends at chapter 30" in str(refused.value)
+    assert adapter.fetched == [] and list((tmp_path / "out").glob("*.pdf")) == []
+
+
+def test_an_unconfirmed_tail_is_never_used_to_clamp(tmp_path, store):
+    class Unconfirmed(WindowAdapter):
+        def build_chapter_index(self, spec, **kw):
+            return pre.ChapterIndex(super().build_chapter_index(spec, **kw), tail_confirmed=False)
+
+    adapter = Unconfirmed(range(1, 31))
+    with pytest.raises(ChapterListRefused, match="could not confirm that its chapter list is complete"):
         run(tmp_path, store, adapter, 1, 50)
-    message = str(refused.value)
-    assert "ends at chapter 30" in message and "31-50" in message
-    assert "Nothing was fetched or written" in message
     assert adapter.fetched == []
-    assert list((tmp_path / "out").glob("*.pdf")) == []
+    # ... but a range inside what it did list still runs
+    report, _ = run(tmp_path, store, adapter, 1, 30, folder="inside")
+    assert report.effective_range == (1, 30)
 
 
-def test_a_start_below_the_first_listed_chapter_is_refused(tmp_path, store):
+def test_a_short_answer_below_a_newer_saved_chapter_is_refused_not_clamped(tmp_path, store):
+    write_overlay(store, [1, 2, 3, 4, 5, 60], spans=[(1, 5)])
+    adapter = WindowAdapter(range(1, 31))              # the site's answer stops below saved chapter 60
+    with pytest.raises(ChapterListRefused, match="could not be confirmed"):
+        run(tmp_path, store, adapter, 1, 59)
+    assert adapter.fetched == []
+
+
+def test_a_failed_discovery_never_clamps(tmp_path, store):
+    adapter = WindowAdapter(range(1, 31), fail_with=RuntimeError("HTTP 503"))
+    with pytest.raises(RuntimeError, match="503"):
+        run(tmp_path, store, adapter, 1, 50)
+    assert adapter.fetched == []
+
+
+def test_clamping_keeps_duplicate_and_fractional_pages_distinct(tmp_path, store):
+    class Irregular(WindowAdapter):
+        def build_chapter_index(self, spec, **kw):
+            metas = [cmeta(n) for n in range(1, 6)]
+            metas.append(ChapterMeta(index=5, url=url(6), slug=6, source_id="6"))       # a second "5"
+            metas.append(ChapterMeta(index=5.5, url=url(7), slug=7, source_id="7"))     # an insert
+            return metas
+
+    adapter = Irregular([])
+    report, _ = run(tmp_path, store, adapter, 1, 99)
+    assert report.effective_range == (1, 5)
+    assert sorted(Path(u).name for u in adapter.fetched) == [f"chapter-{n}" for n in range(1, 8)]
+    assert len(report.written) == 7 and len(set(report.written)) == 7
+
+
+def test_a_start_just_below_the_first_listed_chapter_is_raised_to_it(tmp_path, store):
     adapter = WindowAdapter(range(5, 31))
-    with pytest.raises(ChapterListRefused, match="starts at chapter 5"):
-        run(tmp_path, store, adapter, 1, 10)
+    report, logs = run(tmp_path, store, adapter, 1, 10)
+    assert report.effective_range == (5, 10) and len(report.written) == 6
+    assert any("starts at chapter 5" in line for line in logs if line.startswith("NOTE: range adjusted:"))
+    assert not effective(store).covers(1, 4)
+
+
+def test_a_huge_hole_before_the_first_listed_chapter_is_still_refused(tmp_path, store):
+    adapter = WindowAdapter(range(400, 431), windowed=False)
+    with pytest.raises(ChapterListRefused, match="starts at chapter 400"):
+        run(tmp_path, store, adapter, 1, 420)
+    assert adapter.fetched == []
 
 
 def test_a_discovery_that_returns_nothing_for_the_window_is_not_a_confirmed_absence(tmp_path, store):
@@ -681,10 +758,19 @@ def test_rescue_path_discovers_only_the_missing_window_and_persists_it(tmp_path,
     assert len(report.written) == 18 and effective(store).covers(1, 25)
 
 
-def test_rescue_path_refuses_instead_of_clamping(tmp_path, store):
+def test_rescue_path_clamps_an_oversized_end(tmp_path, store):
     shared = WindowAdapter(range(1, 11))
-    with pytest.raises(ChapterListRefused, match="ends at chapter 10"):
-        rescue_run(tmp_path, store, shared, 1, 99)
+    report, logs = rescue_run(tmp_path, store, shared, 1, 99)
+    assert report.requested_range == (1, 99) and report.effective_range == (1, 10)
+    assert len(report.written) == 10
+    assert any(line.startswith("NOTE: range adjusted: End chapter 99") for line in logs)
+    assert not effective(store).covers(11, 11)
+
+
+def test_rescue_path_reports_none_available_for_a_start_past_the_list(tmp_path, store):
+    shared = WindowAdapter(range(1, 11), windowed=False)
+    with pytest.raises(ChapterListRefused, match="None of chapters 20-30 are available"):
+        rescue_run(tmp_path, store, shared, 20, 30)
     assert shared.fetched == [] and list((tmp_path / "out").glob("*.pdf")) == []
 
 
@@ -703,7 +789,7 @@ def test_rescue_path_cancel_during_discovery_returns_a_cancelled_report(tmp_path
     assert report.cancelled and report.written == []
 
 
-@pytest.mark.parametrize("start,end", [(1, 10), (4, 8), (7, 10**9)])
+@pytest.mark.parametrize("start,end", [(1, 10), (4, 8), (7, 10**9), (3, 5000)])
 def test_both_paths_select_identically_and_persist_the_same_list(tmp_path, start, end):
     results = []
     for name, runner in (("legacy", None), ("rescue", rescue_run)):

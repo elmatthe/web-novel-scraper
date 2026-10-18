@@ -79,11 +79,24 @@ def test_extract_title_returns_displayed_number_for_offset_fixture() -> None:
 
 
 def test_offset_fixture_body_extracts_and_flows_through_extract_chapter() -> None:
-    meta = ChapterMeta(index=4222, url=fwn.chapter_url_for(SM_SPEC, 4222), slug=4222)
+    # The page at slug 4222 displays chapter 4207, so a manifest row says label 4207, slug 4222.
+    meta = ChapterMeta(index=4207, url=fwn.chapter_url_for(SM_SPEC, 4222), slug=4222)
     adapter = FreeWebNovelAdapter(request_manager=FakeRM())
     content = adapter._extract_chapter(_fixture("fwn_sm_chapter_slug4222_displayed4207.html"), meta)
     assert content.index == meta.index
     assert content.paragraphs  # the sanitized fixture is extraction-viable
+
+
+def test_a_page_showing_another_chapter_is_never_published_as_the_expected_one() -> None:
+    """The offset guard (v0.3.0 03.2b): expecting chapter 4222 at a page that shows 4207 is a
+    mismatch, an extraction-class failure, never a silently mislabelled chapter."""
+    from webnovel_scraper.models import ChapterMismatchError, EmptyExtractionError
+
+    meta = ChapterMeta(index=4222, url=fwn.chapter_url_for(SM_SPEC, 4222), slug=4222)
+    adapter = FreeWebNovelAdapter(request_manager=FakeRM())
+    with pytest.raises(ChapterMismatchError, match="shows chapter 4207") as caught:
+        adapter._extract_chapter(_fixture("fwn_sm_chapter_slug4222_displayed4207.html"), meta)
+    assert isinstance(caught.value, EmptyExtractionError)
 
 
 def test_unnumbered_extras_have_no_parseable_positive_number() -> None:

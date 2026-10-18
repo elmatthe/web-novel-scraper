@@ -30,6 +30,7 @@ import requests
 from .browser_env import ensure_browsers_path
 from .cloudflare_detection import has_real_payload, is_cloudflare_challenge
 from .host_rate_limiter import HostRateLimiter
+from .html_cache import HtmlCache
 
 logger = logging.getLogger(__name__)
 
@@ -432,7 +433,8 @@ def _looks_garbled(html: str) -> bool:
 
 
 def cache_key_for(url: str) -> str:
-    """Deterministic cache filename for a URL (same URL -> same name)."""
+    """Deterministic cache filename for a URL (same URL -> same name). The validated cache
+    (``html_cache``) keeps this key, so a pre-0.3.0 file maps to its new entry one to one."""
     digest = hashlib.sha256(url.encode("utf-8")).hexdigest()[:24]
     return f"{digest}.html"
 
@@ -525,6 +527,15 @@ def _looks_like_browser_launch_failure(exc: Exception) -> bool:
     return any(marker in msg for marker in _BROWSER_LAUNCH_FAILURE_MARKERS)
 
 
+def _page_url(page: Any) -> Optional[str]:
+    """The address a browser page ended on (after redirects), if it can tell."""
+    try:
+        value = getattr(page, "url", None)
+    except Exception:
+        return None
+    return value if isinstance(value, str) and value else None
+
+
 def _origin_of(url: str) -> Optional[str]:
     """Return ``scheme://netloc/`` for ``url``, or None if it has no host."""
     parts = urlsplit(url)
@@ -575,8 +586,15 @@ class RequestManager:
     """Fetches HTML over HTTP or a stealth browser, with a shared on-disk cache.
 
     Args:
-        slug: drives the cache subdirectory (``files/cache/{slug}/``).
-        use_cache: read/write the on-disk HTML cache.
+        slug: the novel; with each page's own host it scopes the HTML cache
+            (``files/cache/<host>/<slug>/``, v0.3.0 03.2b, see ``html_cache``).
+        use_cache: read/write the on-disk HTML cache. A fetch with ``use_cache=False``
+            neither reads nor writes it (the adapters fetch table-of-contents pages that
+            way, so a new chapter is always seen).
+        site_key: the only host this manager may cache pages for (the run's source);
+            ``None`` lets each page's own host scope it.
+        refresh_cache: explicit refresh: never serve a cached page, but still save the
+            freshly fetched (valid) ones over the old entries.
         headless: run the browser headless. Defaults to **False** (visible) in
             0.1.3 — the FreeWebNovel primary path is a persistent VISIBLE camoufox
             browser (the legacy-matched config Cloudflare clears for); an advanced
@@ -607,13 +625,25 @@ class RequestManager:
         browser_nav_timeout: float = BROWSER_NAV_TIMEOUT_MS / 1000.0,
         cloudflare_timeout: float = CF_CLEAR_TIMEOUT,
         host_limiter: Optional[HostRateLimiter] = None,
+        site_key: Optional[str] = None,
+        refresh_cache: bool = False,
     ) -> None:
         self.slug = slug
         self.use_cache = use_cache
         self.headless = headless
         self.try_http_first = try_http_first
-        self.cache_dir = (cache_root or DEFAULT_CACHE_ROOT) / slug
+        self.refresh_cache = bool(refresh_cache)
         self._log: Callable[[str], None] = log_fn or logger.info
+        self.cache_root = Path(cache_root) if cache_root is not None else DEFAULT_CACHE_ROOT
+        # The pre-0.3.0 cache folder (``files/cache/<slug>/``): only ever read, as a source of
+        # copies into the validated layout, never written, moved or deleted.
+        self.legacy_cache_dir = self.cache_root / slug
+        self.cache = HtmlCache(
+            self.cache_root, slug, site_key=site_key, legacy_root=self.cache_root, log=self._log
+        )
+        # Where the most recent network attempt actually ended (after redirects), so a page
+        # served from another address is never cached under the requested one.
+        self._last_final_url: Optional[str] = None
         self.max_retries = max(0, int(max_retries))
         self.retry_base_delay = float(retry_base_delay)
         self.retry_jitter_ratio = float(retry_jitter_ratio)
@@ -746,41 +776,28 @@ class RequestManager:
             browser_primary=browser_primary,
         )
 
-    # ── cache helpers ────────────────────────────────────────────────────────
-    def cache_path_for(self, url: str) -> Path:
-        return self.cache_dir / cache_key_for(url)
+    # ── cache helpers (validated layout, ``html_cache``) ──────────────────────
+    def cache_path_for(self, url: str) -> Optional[Path]:
+        """Where ``url``'s validated HTML is (or would be) kept; ``None`` if it cannot be cached."""
+        return self.cache.html_path(url)
 
-    def _read_cache(self, cache_path: Path) -> Optional[str]:
-        if not (self.use_cache and cache_path.is_file()):
+    def _read_cache(self, url: str) -> Optional[str]:
+        """A validated cached page for ``url``: matching provenance, length and checksum, real
+        UTF-8, not garbled, not a challenge, complete. Any problem is a logged miss."""
+        if not self.use_cache or self.refresh_cache:
             return None
-        try:
-            html = cache_path.read_text(encoding="utf-8")
-        except Exception as exc:  # corrupt/locked cache -> re-fetch
-            self._log(f"Cache read failed for {cache_path.name}: {exc}; re-fetching.")
-            return None
-        # Self-heal a poisoned cache: an entry written before the brotli fix may be
-        # mis-decoded garbage. Ignore it (and re-fetch cleanly) rather than serving
-        # garbage that fails body extraction downstream.
-        if _looks_garbled(html):
-            self._log(
-                f"Cache entry {cache_path.name} is garbled (undecodable); re-fetching."
-            )
-            return None
-        if is_cloudflare_challenge(html):
-            self._log(
-                f"Cache entry {cache_path.name} is a Cloudflare challenge; re-fetching."
-            )
-            return None
-        return html
+        hit = self.cache.read(url)
+        return None if hit is None else hit[0]
 
-    def _write_cache(self, cache_path: Path, html: str) -> None:
+    def _write_cache(self, url: str, html: str, strategy: str) -> None:
         if not self.use_cache:
             return
-        try:
-            cache_path.parent.mkdir(parents=True, exist_ok=True)
-            cache_path.write_text(html, encoding="utf-8")
-        except Exception as exc:
-            self._log(f"  (cache write failed: {exc})")
+        self.cache.store(url, html, strategy=strategy, final_url=self._last_final_url)
+
+    def invalidate_cache(self, url: str, reason: str) -> bool:
+        """Stop serving ``url``'s cached page (an adapter found it unusable). The bytes are kept
+        aside for diagnosis; the next fetch goes to the network."""
+        return self.cache.invalidate(url, reason)
 
     # ── HTTP path ────────────────────────────────────────────────────────────
     @property
@@ -823,6 +840,8 @@ class RequestManager:
         pass can refine the markers.
         """
         r = session.get(url, timeout=self._http_timeout, allow_redirects=True)
+        final = getattr(r, "url", None)
+        self._last_final_url = final if isinstance(final, str) and final else None
         status = getattr(r, "status_code", None)
         body = r.text or ""
 
@@ -947,6 +966,7 @@ class RequestManager:
 
     def _fetch_uncached_strategy(self, url: str, strategy: str) -> str:
         """Run exactly one fetch attempt using one concrete strategy."""
+        self._last_final_url = None
         if strategy == FETCH_STRATEGY_HTTP:
             html = self._http_get(self.session, url)
         elif strategy == FETCH_STRATEGY_CLOUDSCRAPER:
@@ -997,9 +1017,8 @@ class RequestManager:
         retry_base_delay: float,
         browser_primary: bool = False,
     ) -> str:
-        cache_path = self.cache_path_for(url)
         if use_cache:
-            cached = self._read_cache(cache_path)
+            cached = self._read_cache(url)
             if cached is not None:
                 self.last_fetch_info = FetchInfo(from_cache=True, classification="cache")
                 return cached
@@ -1025,7 +1044,7 @@ class RequestManager:
                 elapsed = time.time() - t0
                 self._log(f"  fetched {len(html) / 1024.0:.1f} KB in {elapsed:.1f} s")
                 if use_cache:
-                    self._write_cache(cache_path, html)
+                    self._write_cache(url, html, strategy)
                 self.last_fetch_info = FetchInfo(
                     from_cache=False, classification="success", strategy=strategy
                 )
@@ -1198,6 +1217,7 @@ class RequestManager:
             cf_timeout=self._cloudflare_timeout,
             log_fn=self._log,
         )
+        self._last_final_url = _page_url(page)
         if is_cloudflare_challenge(html):
             raise ChallengeFetchError(
                 "Cloudflare challenge still present after browser fetch"
@@ -1347,6 +1367,7 @@ class RequestManager:
                     self._reset_camoufox()
                     continue
                 raise
+            self._last_final_url = _page_url(page)
             if is_cloudflare_challenge(html):
                 raise ChallengeFetchError(
                     "Cloudflare challenge still present after camoufox fetch"

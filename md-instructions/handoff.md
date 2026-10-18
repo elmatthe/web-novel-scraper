@@ -1,6 +1,28 @@
 # webnovel-scraper - Handoff
 
-## Current Snapshot — v0.3.0 Checkpoint 03.2a complete (manifest preflight, discovery, both pipeline paths)
+## Current Snapshot — v0.3.0 autonomous Windows completion (03.2b → 07) in progress
+**2026-10-18 · HOME-PC (Windows 11) · Claude Code (Opus 5.5) · branch `feature/v0.3.0-modernization`**
+
+- **Mandate (owner, 2026-10-18):** 03.2a approved; finish 03.2b-07 autonomously for a **Windows-only**
+  release candidate, then hand off to an independent Codex review. No merge, tag or release.
+  Overrides A (End auto-clamp), B (automatic cache/list updates) and C (Windows only) are binding;
+  see plan §10, ADRs 011-013.
+- **Do not stage:** the three deleted historical `md-instructions` files (`0.2.1_bug-hunt.md`,
+  `0.2.1_release_plan.md`, `Decisions-template.md`) or the untracked
+  `scripts/scripts-to-use-from-my-other-repo's-GUIs/`. Never `git add -A`.
+- **Owner data on disk (gitignored, never touch destructively):** the 1.2 GB pre-0.3.0 HTML cache in
+  `files/cache/<novel>/` (copied on demand into `files/cache/<host>/<novel>/`), `files/runtime-data/`.
+- **Done in this session:**
+  - **Overrides A + B, 03.2b (validated HTML cache):** see plan §9.12, ADR 011/012, CHANGELOG.
+    Gate: `scripts/verify.py` PASS (see the log line below for the count).
+- **Next:** 03.3-03.4 (run journal, `<slug>-N` allocator in the GUI/pipeline, retire Folder name,
+  real Resume), then 04 (Lord of the Mysteries 1/2 on `.net`/`.com`), 05 (canonical text, TXT/PDF),
+  06 (hardening), 07 (Windows bootstrap, acceptance checklist, Codex prompt).
+- **Open issues carried:** en-dash title separators ("Chapter 714: – Title", 05); the CHUNKED/SINGLE
+  paths key collected content by displayed number, so two pages sharing a number (Supreme Magus 3664)
+  collide there (fix in 05 with the output refactor); docs mojibake in Briefing/handoff (07, C14).
+
+## Earlier Snapshot — v0.3.0 Checkpoint 03.2a complete (manifest preflight, discovery, both pipeline paths)
 **2026-10-18 · HOME-PC (Windows 11) · Claude Code (Sonnet 5.5) · branch
 `feature/v0.3.0-modernization`**
 

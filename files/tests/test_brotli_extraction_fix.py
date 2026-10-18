@@ -116,14 +116,37 @@ def test_garbled_cache_entry_is_ignored_and_refetched(tmp_path) -> None:
     so the next run re-fetches clean instead of serving garbage."""
     url = "https://freewebnovel.com/novel/shadow-slave/chapter-3"
     mgr = RequestManager("ss", cache_root=tmp_path)
-    cache_path = mgr.cache_path_for(url)
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    cache_path.write_text(_fixture("fwn_chapter_brotli_garbage.html"), encoding="utf-8")
-
-    assert mgr._read_cache(cache_path) is None  # garbled -> miss
+    garbage = _fixture("fwn_chapter_brotli_garbage.html")
+    write_pair(mgr, url, garbage)                 # provenance intact, bytes unusable
+    assert mgr._read_cache(url) is None           # garbled -> miss
+    # The same garbage in the pre-0.3.0 layout is never copied or served either.
+    legacy = mgr.legacy_cache_dir / mgr.cache_path_for(url).name
+    mgr.cache_path_for(url).unlink()
+    mgr.cache_path_for(url).with_suffix(".json").unlink()
+    legacy.parent.mkdir(parents=True, exist_ok=True)
+    legacy.write_text(garbage, encoding="utf-8")
+    assert mgr._read_cache(url) is None
+    assert not mgr.cache_path_for(url).exists()
     # A clean entry still reads back normally.
-    cache_path.write_text("<html><body><p>real chapter</p></body></html>", encoding="utf-8")
-    assert mgr._read_cache(cache_path) is not None
+    assert mgr.cache.store(url, "<html><body><p>real chapter</p></body></html>", strategy="http")
+    assert mgr._read_cache(url) is not None
+
+
+def write_pair(mgr, url: str, html: str):
+    """An entry with a well-formed provenance record whose bytes are still unusable."""
+    import hashlib
+    import json
+
+    path = mgr.cache_path_for(url)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = html.encode("utf-8")
+    path.write_bytes(data)
+    path.with_suffix(".json").write_text(json.dumps({
+        "schema_version": 1, "kind": "html-cache-entry", "url": url, "final_url": url,
+        "host": url.split("/")[2], "novel_slug": mgr.slug, "fetched_utc": "2026-10-18T00:00:00Z",
+        "byte_len": len(data), "sha256": hashlib.sha256(data).hexdigest(), "classification": "valid",
+        "strategy": "http", "origin": "network", "app_version": "0.2.1"}), encoding="utf-8")
+    return path
 
 
 # ── 1b: an empty-extraction failure is NOT a block and is NOT swept ───────────

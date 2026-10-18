@@ -1,6 +1,6 @@
 # Web Novel Scraper — v0.3.0 Implementation Plan
 
-**Status:** Approved product requirements. Checkpoint 00 (planning/baseline) complete 2026-10-17 on `feature/v0.3.0-modernization`; Checkpoint 01 step 01.0 (flat `scripts/` layout) complete 2026-10-17; step 01.1 (Light/Dark UI foundation and three-section window shell) complete 2026-10-18; step 02.1 (Activity Summary/Detailed logging and thread-safe event bridge) complete 2026-10-18 (`d7116db`); step 02.2 (progress, ETA, counters and run-state accuracy) complete 2026-10-18 (`3269aa7`); step 02.3 (website-first selection, preferences, Resume placeholder and counter fix) complete 2026-10-18 and approved by the owner for Windows (Light/Dark, minimum size, simulated 150%, Website menu), with launcher, native-scaling and macOS checks carried forward; step 03.0 (source identity, safe run allocation, manifest/journal contracts) and 03.1 (chapter manifest store, legacy import) are complete and approved; step 03.2a (manifest preflight, discovery and pipeline integration) is complete 2026-10-18 and awaits owner review before 03.2b. Technical clarifications from Checkpoint 00 are in §8 and do not change owner decisions.  
+**Status:** Approved product requirements. Checkpoint 00 (planning/baseline) complete 2026-10-17 on `feature/v0.3.0-modernization`; Checkpoint 01 step 01.0 (flat `scripts/` layout) complete 2026-10-17; step 01.1 (Light/Dark UI foundation and three-section window shell) complete 2026-10-18; step 02.1 (Activity Summary/Detailed logging and thread-safe event bridge) complete 2026-10-18 (`d7116db`); step 02.2 (progress, ETA, counters and run-state accuracy) complete 2026-10-18 (`3269aa7`); step 02.3 (website-first selection, preferences, Resume placeholder and counter fix) complete 2026-10-18 and approved by the owner for Windows (Light/Dark, minimum size, simulated 150%, Website menu), with launcher, native-scaling and macOS checks carried forward; step 03.0 (source identity, safe run allocation, manifest/journal contracts) and 03.1 (chapter manifest store, legacy import) are complete and approved; step 03.2a (manifest preflight, discovery and pipeline integration) is complete and approved 2026-10-18, subject to the owner overrides recorded in §10 (End auto-clamp, automatic cache/list updates, Windows-only release); 03.2b onward is executed autonomously against this plan (§10). Technical clarifications from Checkpoint 00 are in §8 and do not change owner decisions.  
 **Created:** 2026-10-14  
 **Planning / review:** ChatGPT; **execution:** Claude Code in the local repository.  
 **Target repository:** `https://github.com/elmatthe/web-novel-scraper`  
@@ -8,7 +8,7 @@
 
 ## 1. Goal and release contract
 
-Ship a stable, accessible Windows/macOS Tkinter desktop application that visually matches the author's Audiobook Creation Tool (ACT) / PDF-Splitter, has intuitive web-novel/site selection, reliable cache-first chapter discovery, consistent TXT/PDF outputs, and supports *Lord of the Mysteries* and *Lord of Mysteries 2: Circle of Inevitability* on individually verified `.net`/`.com` sources. Preserve legitimate text without site clutter or unwanted prose edits. Deliver v0.3.0 only after both platform release gates and explicit owner approval.
+Ship a stable, accessible Windows/macOS Tkinter desktop application that visually matches the author's Audiobook Creation Tool (ACT) / PDF-Splitter, has intuitive web-novel/site selection, reliable cache-first chapter discovery, consistent TXT/PDF outputs, and supports *Lord of the Mysteries* and *Lord of Mysteries 2: Circle of Inevitability* on individually verified `.net`/`.com` sources. Preserve legitimate text without site clutter or unwanted prose edits. Deliver v0.3.0 only after the release gate and explicit owner approval. **Owner override 2026-10-18 (ADR 013): the v0.3.0 release gate is Windows only; macOS acceptance is deferred to a later owner-directed branch (§10).**
 
 **Implementation order is mandatory:** first complete and approve the UI (checkpoints 01–02); only then implement chapter-list/cache changes, new sources, and content/output refactors (03–05). Reliability and release gates come last. Work in small, independently verified commits on a working branch; do not merge, tag, publish releases, or rewrite Git history without separate approval.
 
@@ -59,7 +59,7 @@ Supersedes the read-only GitHub snapshot above wherever they differ.
 
 - `SiteSpec`/catalog remains the product catalogue and disabled-site guard; site adapters discover and extract; a new or refactored **ChapterIndexStore** owns versioned, source-identified manifest I/O, validation, runtime overlay and refresh. Request manager owns fetched HTML cache. Pipeline orchestrates preflight, fetching, normalization, rendering and run reporting. GUI stays thin and Tk-thread-safe.
 - Manifest schema must include schema version, novel slug, adapter/site key, source/index URL, generation and validation timestamps (where applicable), exact chapter entries `{display_number, url, title, source_id, url_slug_or_equivalent}`, sorted ordering, provenance/confidence where needed, and **coverage of the requested range**. Entries must round-trip fractional chapter numbers losslessly (avoid lossy float serialization for numeric labels), avoid duplicate chapter identities/URL collisions (identity = source URL/slug, not displayed number; see §8 C8), and validate safe URL host/scheme.
-- Coverage is **set membership**, not `min/max` only. When user requests chapters outside or inside gaps of a validated manifest: refresh/discover/extend missing coverage before content fetching; preserve verified entries; reject stale, mismatched, corrupted or contradictory data with actionable messages. Missing requested chapters or uncertain mapping must not be silently clamped into an apparently successful run. An empty first-run store must automatically generate a manifest covering the selected range, not require manual preparation. Distinguish source actually lacks a chapter from cache merely lacking it. Respect legitimate fractional/bonus entries and show the effective selected range.
+- Coverage is **set membership**, not `min/max` only. When user requests chapters outside or inside gaps of a validated manifest: refresh/discover/extend missing coverage before content fetching; preserve verified entries; reject stale, mismatched, corrupted or contradictory data with actionable messages. Missing requested chapters or uncertain mapping must not be silently clamped into an apparently successful run. *Owner override 2026-10-18 (ADR 011):* an End past the last chapter a fresh, complete discovery lists **is** clamped to that chapter, visibly (Activity, report, `effective_range` beside `requested_range`); everything else that cannot be confirmed still refuses (§9.3). An empty first-run store must automatically generate a manifest covering the selected range, not require manual preparation. Distinguish source actually lacks a chapter from cache merely lacking it. Respect legitimate fractional/bonus entries and show the effective selected range.
 - HTML cache validity: never serve Cloudflare/challenge pages, garbled/truncated files or wrong novel/site identity as chapter HTML. Retain pre-existing backoff and recovery behavior, avoid re-fetching valid cached HTML, and provide explicit refresh/invalidate behavior when source changes. Prefer atomic JSON/cache writes and bounded update/repair paths. Keep a deterministic, documented conversion for any old output-scoped `chapter_index.json` (schema v2) and run metadata, without cross-site contamination or destructive cleanup.
 - Output run manifest/journal captures source identity, selected chapter set, grouping, requested output formats, completed/published outputs and failures; **Resume Existing Run** refuses mismatched novel, site, range/grouping/format semantics unless a clearly supported safe compatibility path exists. Only skip validated complete output artifacts; never trust filename presence alone. New run naming never overwrites or nests runs.
 
@@ -162,19 +162,20 @@ Supersedes the read-only GitHub snapshot above wherever they differ.
 - Review confirmed bugs in cancellation, headless-to-headed escalation, browser lifecycle, retry budgets, rate limiting, chapter mapping, no-network cached runs, stalled workers, missing chapters, cumulative progress and resource teardown. Fix only reproduced or evidence-backed issues; retain test coverage for previous v0.2.x fixes.
 - **Verify:** focused regression cases for each fix; full suite at checkpoint, long-run/resume stress on consented public sources with polite request pacing; logs/counters accurately reflect partial failures. No masking failed tests.
 
-### 07 — Windows + macOS acceptance, docs and v0.3.0 release readiness
+### 07 — Windows acceptance, docs and v0.3.0 release readiness (macOS deferred, ADR 013)
 - Verify `Setup_and_Run-Web-Novel-Scraper.bat` and `.command`, user-scope dependency setup, browser prerequisites/consent, fresh install/repair, directories and platform-specific browser fallback. Update README, Briefing, Decisions/CHANGELOG/Handoff and version metadata to reflect actual shipping behavior, not intended behavior. Keep user-facing instructions simple.
-- **Verify:** **separate Windows and Apple Silicon/macOS manual gates** covering 3 sections, resizing, Light/Dark, Summary/Detailed, progress, `.com` and `.net` choices, HTML cache first-run/refetch, TXT/PDF/both/grouping, resume, cancellation, and no overwrite. Run full automated suite and inspect generated PDFs/TXTs. Owner confirms signoff for each gate. **Do not merge/tag/publish** until explicitly authorized after reports and review.
+- **Owner override 2026-10-18:** the release gate is **Windows only**; keep the `.command` launcher and portable code, but macOS acceptance, launcher testing and macOS-specific fixes move to a later owner-directed branch. Never claim macOS readiness for v0.3.0.
+- **Verify:** **the Windows manual gate** (macOS gate deferred) covering 3 sections, resizing, Light/Dark, Summary/Detailed, progress, `.com` and `.net` choices, HTML cache first-run/refetch, TXT/PDF/both/grouping, resume, cancellation, and no overwrite. Run full automated suite and inspect generated PDFs/TXTs. Owner confirms signoff for each gate. **Do not merge/tag/publish** until explicitly authorized after reports and review.
 
 ## 5. Acceptance requirements (must all hold for release)
 
-- Default no-setup-confusion GUI launches on supported Windows/macOS targets, Light/Dark in-place, left 3 sections and Activity on right, usable when not maximized; summary and detailed logs distinct and correct.
+- Default no-setup-confusion GUI launches on supported Windows targets (macOS deferred, ADR 013), Light/Dark in-place, left 3 sections and Activity on right, usable when not maximized; summary and detailed logs distinct and correct.
 - `.net` and `.com` visibly separate, source availability truthful for each novel, selected source identity preserved through manifest, cache, body retrieval and resume. Both novels supported on every pairing that passed validation; unverified pairings never falsely marked available.
 - Every supported job starts from a validated chapter list, discovers selected-range gaps, never guesses title/URL mappings without evidence, and never silently drops requested chapters. HTML cache is reused only when valid; no challenge page considered valid content.
 - PDF default, TXT optional, grouping exclusive; both outputs use one normalized text source; headings exactly `Chapter N: Title`; only approved cleanup performed; original story meaning, short paragraphs and meaningful Unicode preserved.
 - All new runs write to `~/Downloads/Web-Novel-Scraper-Outputs/<novel-name>-x` without overwrite; explicit Resume Existing Run works only with validated matching metadata/artifacts.
 - Headless-first for browser-needed sites with bounded visible Playwright/manual fallback and truthful failure; HTTP-capable sources remain efficient; existing cancellation/rate limits/Cloudflare and offset behaviors are not regressed.
-- Automated, offline regression suite passes; new behavioral changes have tests; both platform manual gates documented with evidence; no secrets, raw novels or runtime caches committed; release occurs only after separate authorization.
+- Automated, offline regression suite passes; new behavioral changes have tests; the Windows manual gate documented with evidence (macOS deferred); no secrets, raw novels or runtime caches committed; release occurs only after separate authorization.
 
 ## 6. Deferred / out of scope
 
@@ -255,7 +256,7 @@ One schema for both layers, `schema_version: 1`, `kind: "chapter-manifest"`:
 1. Load the effective manifest and compute the uncovered sub-spans of the requested range. A blank end means the discovered tail, re-checked every run from the index page's tail only.
 2. No uncovered span means no TOC network traffic. Otherwise discover only those spans through the existing adapter `build_chapter_index` (the 577b5db binary-search offset reconciliation and its `count + 64` ceiling are kept). Verified entries are preserved.
 3. Persist after each reconciled window: coverage grows only over spans actually examined, so an interrupted discovery keeps its partial progress. This absorbs today's `complete: false` checkpoints.
-4. A requested label with neither an entry nor `absent` evidence makes the run refuse, naming the missing labels; it never clamps to a smaller range and reports success. "Source lacks it" (evidence recorded) is reported as *skipped (reason)*, distinct from "the cache lacks it".
+4. A requested label with neither an entry nor `absent` evidence makes the run refuse, naming the missing labels. **Superseded in part (owner, 2026-10-18, ADR 011):** a finite End above every known chapter is clamped to the last chapter a fresh, tail-confirmed discovery lists, with the adjustment logged and kept in `RunReport.range_notes`; a Start past the list reports "none available"; failed, empty, unconfirmed or contradictory discoveries still refuse. "Source lacks it" (evidence recorded) is reported as *skipped (reason)*, distinct from "the cache lacks it".
 5. **Refresh chapter list** (explicit) renames the overlay to `.bak-<utc>` and rediscovers; it never touches the baseline.
 
 ### 9.4 Legacy `chapter_index.json` migration (03.1; the old file is only ever read)
@@ -284,6 +285,7 @@ Today: `files/cache/<novel_slug>/<sha256(url)[:24]>.html`, raw HTML only, writte
 - **Truncated or corrupt HTML:** a sidecar length or hash mismatch means refetch; writes become temp file plus `os.replace`.
 - **No needless refetch:** a valid hit is served with no network call; chapter pages never expire on their own; TOC/index pages re-check only their tail. An explicit invalidate marks the entry `.invalid`.
 - **Migration:** legacy entries are copied, never moved or deleted, into the new layout after the same validation, with `origin: "legacy-copy"`.
+- **Implemented in 03.2b (2026-10-18):** see §9.12 and ADR 012.
 
 ### 9.7 Failure and interruption matrix
 
@@ -350,7 +352,7 @@ No owner decision blocks 03.0. The owner has since decided (2026-10-18) to retir
 - An open end always re-checks the tail: `[max(start, last_known - TAIL_RECHECK_MARGIN (64)), open)` plus any uncovered span below it.
 - **A discovery claims only what it was asked about and accounted for.** Coverage = the unbroken runs of whole numbers the returned chapters account for, *clipped to the hinted window* (`clipped_spans`); the adapter's padding beyond the window is stored as evidence but claims nothing. Interrupted-discovery checkpoints (`index_progress_cb`) are bounded further, to the last label whose slug has been resolved. A restart is seeded with what was kept and asks again only for the unclaimed part.
 - Persisted through `store.record_discovery` (never a bare delta: it merges into the existing overlay, refuses evidence that contradicts the baseline or overlay, reports `unchanged` without writing). Off-host, malformed or self-contradictory entries are ignored, named in a WARNING and never stored.
-- **Refusal, never clamping.** Any requested whole number the list neither holds nor records as confirmed-absent refuses the run (`ChapterListRefused`, shown as the existing "Run refused" outcome) naming the missing chapters: "the site's chapter list ends at chapter N, so chapters N+1 to M are not available". A finite `1-5000` on a 4402-chapter novel is therefore refused; leave End blank for "through the last chapter".
+- **Refusal, never clamping** *(superseded for oversized End by ADR 011, §9.12)*. Any requested whole number the list neither holds nor records as confirmed-absent refuses the run (`ChapterListRefused`, shown as the existing "Run refused" outcome) naming the missing chapters: "the site's chapter list ends at chapter N, so chapters N+1 to M are not available". A finite `1-5000` on a 4402-chapter novel is therefore refused; leave End blank for "through the last chapter".
 - **Sparse-TOC gaps.** A hole *inside* the list the site just returned (the adapter skipped number g but listed numbers on both sides) is reported as a TOC gap exactly as before (`report.toc_gaps`, the WARNING, Activity) and the run continues on the listed chapters. It is never recorded as absent, never counted as covered, and so a later run asks the site again. A hole longer than `MAX_TOC_GAP_RUN` (200), or any gap the discovery did not bracket, is refused as an unconfirmed range. A confirmed absence (evidence in the manifest) is a reasoned skip: `report.absent_skipped`, a NOTE, and a line in the summary.
 - Selection is by `ChapterIdentity` (source page URL). The legacy `ChapterMeta` bridge keeps the exact label text in `extra["manifest_label"]`, so `627.1` and `627.10` (same float) stay two pages; duplicate displayed numbers (3664) stay two pages. Discovery through a float-only adapter cannot recover `627.10` from `627.1`; manifest entries can.
 
@@ -370,3 +372,63 @@ No owner decision blocks 03.0. The owner has since decided (2026-10-18) to retir
 - No real baseline manifests are shipped yet (they need verified developer-side generation).
 - `Folder name` and the `<slug>-N` allocator are untouched (03.3).
 - Not run live: no real source, browser or network was used.
+
+### 9.12 Checkpoint 03.2b result and owner overrides A/B (2026-10-18)
+
+**Override A — End auto-clamp (ADR 011, superseding ADR 010 decision 3).** `chapter_preflight._select`
+now classifies each uncovered part of the request against *this run's* discovery:
+- above every known chapter, finite End, discovery tail-confirmed → **clamped** (`effective_range`
+  ends at the last listed chapter; `NOTE: range adjusted:` in Activity; `RunReport.range_notes`;
+  nothing recorded absent or covered, so later runs extend);
+- below the first listed chapter by at most `MAX_TOC_GAP_RUN` → Start raised, noted;
+- inside the returned list, at most 200 → sparse TOC gap, unchanged (reported, skipped, never absent);
+- anything else (no discovery this run, empty discovery, `tail_confirmed=False`, a hole below a newer
+  saved chapter, a huge hole) → refused with the reason. A Start past every chapter → "None of
+  chapters X-Y are available".
+
+`models.ChapterIndex(list, tail_confirmed=)` lets an adapter say its list may be short; the WebNovel
+adapter sets it when it lists fewer chapters than its own `chapterCnt`. A run with gaps inside its
+range now ends "Finished with gaps" (completed with problems) instead of "Completed".
+
+**03.2b / Override B — validated HTML cache (ADR 012).** New `html_cache.py`
+(`files/cache/<host>/<novel>/<key>.html` + `<key>.json` provenance; validation on read; atomic
+pairs; challenge/garbled/truncated/redirected pages never stored; invalidation to
+`<key>.invalid.html`; on-demand legacy *copy*). `RequestManager` gains `site_key`, `refresh_cache`,
+`invalidate_cache`, `cache_root`, `legacy_cache_dir`; final URLs are tracked per attempt. Index pages
+are fetched with `use_cache=False` by both enabled adapters, so a stale index can no longer hide new
+chapters. `adapters.base.extract_validated` sets aside unusable pages and refetches a cached one once.
+The FreeWebNovel adapter now refuses a page that shows another chapter number than the manifest
+expects (`models.ChapterMismatchError`, an extraction-class failure). Rescued pages are cached after a
+successful extraction. GUI: one-shot "Re-download saved chapter pages on the next run" in Advanced
+Settings (`ScrapeJob.refresh_html_cache`).
+
+**Evidence (offline, from the owner's 1.2 GB legacy cache; nothing copied or committed):** every
+cached Shadow Slave (3,065) and Reverend Insanity (2,334) page shows exactly its URL slug's number;
+Renegade Immortal is an offset novel from slug 718 (slug 718 shows "717 (2)"), which the existing
+reconciliation already handles; Supreme Magus is the known offset novel. So the offset guard does not
+fire on correctly reconciled lists. Found for 05: en-dash separators survive into titles
+("Chapter 714: – The Moongazer…").
+
+**Tests:** `test_html_cache.py` (44), preflight clamp regressions on both paths, WebNovel
+tail-confirmation, GUI re-download box; earlier cache tests updated to the provenance contract (a raw
+file without a sidecar is now a miss by design). Mutation check: 15/15 caught.
+
+**Known limits:** the cache does not lock across processes (pairs are self-validating, so a race only
+costs a refetch); legacy pages are copied on demand, so both layouts coexist until the owner deletes
+the old folders.
+
+## 10. Owner overrides and autonomous completion mandate (2026-10-18)
+
+The owner approved 03.2a and authorised autonomous completion of 03.2b through 07 for a **Windows-only
+release candidate**, with these binding overrides (implemented first):
+- **A.** Auto-clamp an oversized End to the reliably established latest chapter (ADR 011, §9.12).
+- **B.** HTML cache and chapter manifests update automatically: new TOC discoveries extend the manifest,
+  newly selected chapters are cached after validation, valid HTML is reused without network calls, the
+  open-ended tail check uses a fresh index, completed novels extend on later runs, explicit
+  refresh/invalidation stays available, nothing is pre-downloaded merely because it was listed, and no
+  novel HTML/text/cache is committed (ADR 012, §9.12).
+- **C.** Windows-only release target; macOS acceptance deferred without deleting portable code or Mac
+  files (ADR 013).
+
+Checkpoint commits continue on `feature/v0.3.0-modernization`; no merge, tag or release without
+separate owner approval. The final step is an independent Codex verification handoff.

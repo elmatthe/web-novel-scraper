@@ -163,6 +163,14 @@ REFRESH_HINT = (
     "Rebuilds the saved chapter list from the site. The current saved list is kept as a "
     ".bak backup file. Applies to the next run only."
 )
+# HTML cache (v0.3.0 03.2b): chapter pages are saved with a checksum and reused until they are
+# found unusable. This one-shot box asks the next run to fetch every selected chapter page from
+# the site again (the fresh pages replace the saved ones); it clears itself after every Start.
+REFETCH_LABEL = "Re-download saved chapter pages on the next run"
+REFETCH_HINT = (
+    "Fetches every selected chapter from the site again instead of using saved pages, and saves "
+    "the new copies. Applies to the next run only."
+)
 ADVANCED_NOTE = (
     "These settings are read when you press Start and are locked while a run is "
     "in progress."
@@ -370,6 +378,7 @@ class ScraperApp(tk.Tk):
             (rb_chunk, "normal"),
             (rb_single, "normal"),
             (self._cache_check, "normal"),
+            (self._refetch_check, "normal"),
             (self._refresh_check, "normal"),
         ]
 
@@ -796,10 +805,16 @@ class ScraperApp(tk.Tk):
         cache = group("Cache", 2)
         self._cache_var = tk.BooleanVar(value=True)
         self._cache_check = ttk.Checkbutton(
-            cache, text="Use HTML cache (resume re-runs)",
+            cache, text="Use HTML cache (saved chapter pages are reused)",
             variable=self._cache_var, style=s["checkbutton"],
         )
         self._cache_check.grid(row=0, column=0, columnspan=2, sticky="w")
+        self._refetch_var = tk.BooleanVar(value=False)
+        self._refetch_check = ttk.Checkbutton(
+            cache, text=REFETCH_LABEL, variable=self._refetch_var, style=s["checkbutton"],
+        )
+        self._refetch_check.grid(row=1, column=0, columnspan=2, sticky="w", pady=(m["gap_sm"], 0))
+        hint(cache, REFETCH_HINT, 2, indent)
 
         chapters = group("Chapter list", 3)
         self._refresh_var = tk.BooleanVar(value=False)
@@ -1263,10 +1278,12 @@ class ScraperApp(tk.Tk):
             headless=bool(self._headless_var.get()),
             request_timeout=timeout,
             refresh_chapter_list=bool(self._refresh_var.get()),
+            refresh_html_cache=bool(self._refetch_var.get()) and bool(self._cache_var.get()),
         )
-        # One-shot: the request now travels on the job, so clear the box. A refresh is never
+        # One-shot: the request now travels on the job, so clear the boxes. A refresh is never
         # repeated on a later run unless the user asks for it again.
         self._refresh_var.set(False)
+        self._refetch_var.set(False)
 
         # The GUI no longer pre-builds a RequestManager (§3.15): the pipeline OWNS
         # and may REPLACE the active primary manager (TOC fallback / breaker switch),
@@ -1288,6 +1305,7 @@ class ScraperApp(tk.Tk):
                 f"delay {delay:g} s, timeout {timeout} s, browser mode {browser}, "
                 f"HTTP first {'on' if http_first else 'off'}, "
                 f"HTML cache {'on' if job.use_cache else 'off'}"
+                f"{', saved chapter pages re-downloaded' if job.refresh_html_cache else ''}"
                 f"{', chapter list refresh requested' if job.refresh_chapter_list else ''}."
             ),
         ))

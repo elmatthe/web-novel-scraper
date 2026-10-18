@@ -291,9 +291,19 @@ def test_a_start_before_the_list_begins_is_reported(tmp_path) -> None:
 
 def test_gaps_in_the_site_list_count_only_inside_the_selected_range(tmp_path) -> None:
     report = _covered(tmp_path, (10, 20), (10, 20), toc_gaps=[3, 12, 15, 40])
-    _, events = ra.outcome_events(report, processed=(1, 1))
+    outcome, events = ra.outcome_events(report, processed=(1, 1))
     assert "Warning: Not on the site's chapter list, so not saved: 12, 15." in _summary(events)
     assert ra.final_counts(report).not_listed == 2
+    # A range with holes is never reported as a complete copy (v0.3.0 owner rule, ADR 011).
+    assert outcome == "completed_with_problems"
+    assert any(line.startswith("Warning: Finished with gaps: 2 chapter numbers")
+               for line in _summary(events))
+
+
+def test_gaps_outside_the_selected_range_do_not_spoil_a_complete_run(tmp_path) -> None:
+    report = _covered(tmp_path, (10, 20), (10, 20), toc_gaps=[3, 40])
+    outcome, _ = ra.outcome_events(report, processed=(1, 1))
+    assert outcome == "completed"
 
 
 def test_a_range_outside_the_list_reports_the_pipelines_own_reason(tmp_path) -> None:

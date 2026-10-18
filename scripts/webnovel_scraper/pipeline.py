@@ -58,6 +58,7 @@ from .models import (
     runtime_site_spec,
 )
 from .registry import REGISTRY, AdapterDisabledError
+from .source_identity import SourceIdentity, SourceIdentityError
 from .request_manager import (
     HOST_MIN_INTERVAL,
     ChallengeFetchError,
@@ -193,6 +194,7 @@ class RunReport:
     permanent_failed: list[int] = field(default_factory=list)  # 403/404 — not swept
     extraction_failed: list[int] = field(default_factory=list)  # fetched OK but no body — not swept, not a block
     toc_gaps: list[int] = field(default_factory=list)          # whole numbers the site's list skips inside the range
+    range_notes: list[str] = field(default_factory=list)       # how the requested range was adjusted (End clamp, Start raise)
     absent_skipped: list[tuple[str, str]] = field(default_factory=list)  # (label, evidence): source-confirmed absent, skipped
     rescued: list[int] = field(default_factory=list)         # ch. saved by rescue (or 2nd-pass sweep)
     warnings: list[str] = field(default_factory=list)        # adapter + pipeline warnings
@@ -216,11 +218,15 @@ class RunReport:
 
     def summary(self) -> str:
         """A short, human-readable run report (for the GUI log / CHANGELOG)."""
+        requested_end = (
+            "last" if self.requested_range[1] >= _UNBOUNDED_END_THRESHOLD else self.requested_range[1]
+        )
         lines = [
             f"Run complete{' (cancelled)' if self.cancelled else ''}.",
             f"  Output: {self.output_dir}",
-            f"  Range:  requested {self.requested_range[0]}-{self.requested_range[1]}, "
+            f"  Range:  requested {self.requested_range[0]}-{requested_end}, "
             f"scraped {self.effective_range[0]}-{self.effective_range[1]}",
+            *(f"  Range adjusted: {note}." for note in self.range_notes),
             f"  Written: {len(self.written)} PDF(s)",
             f"  Skipped (already present): {len(self.skipped_existing)}",
             f"  Failed:  {len(self.failed)}",
@@ -327,6 +333,14 @@ def resolve_output_dir(
     return root / f"{name}-{n}"
 
 
+def _site_key(spec: SiteSpec) -> Optional[str]:
+    """The one host a run's HTML cache may hold pages for (``None`` if it cannot be told)."""
+    try:
+        return SourceIdentity.from_site_spec(spec).site_key
+    except SourceIdentityError:
+        return None
+
+
 def default_manifest_store() -> ChapterManifestStore:
     """The chapter manifest store a run uses unless one is injected (tests patch this)."""
     return ChapterManifestStore()
@@ -337,6 +351,7 @@ def _record_selection(
 ) -> None:
     """Copy what the preflight learned onto the run report, with the existing TOC-gap wording."""
     report.effective_range = selection.effective_range
+    report.range_notes = list(selection.range_notes)
     report.absent_skipped = list(selection.absent)
     for label, evidence in selection.absent:
         log(f"NOTE: chapter {label} was skipped: confirmed absent at the source ({evidence}).")
@@ -1067,6 +1082,8 @@ def run_scrape(
                 # (fake-in-tests) clock the rescue path already uses — instead of
                 # falling through to real time.sleep.
                 sleep_fn=sleep_fn,
+                site_key=_site_key(spec),
+                refresh_cache=job.refresh_html_cache,
             )
             owns_rm = True
         if cancel_event is not None:
@@ -1137,6 +1154,8 @@ def _run_with_rescue(
             sleep_fn=sleep_fn,
             http_timeout=job.request_timeout,
             host_limiter=limiter,
+            site_key=_site_key(spec),
+            refresh_cache=job.refresh_html_cache,
         )
         rm.cancel_event = run_cancel
         rm.start()
@@ -1152,7 +1171,10 @@ def _run_with_rescue(
             runtime_spec=runtime_spec,
             host_limiter=limiter,
             cancel_event=run_cancel,
-            use_cache=False,                 # rescued content is intentionally not cached
+            # Rescue always fetches from the site; a rescued page that extracts as the right
+            # chapter is saved to the validated cache like any other (v0.3.0 03.2b).
+            use_cache=job.use_cache,
+            site_key=_site_key(spec),
             request_timeout=job.request_timeout,
             log=log,
             monotonic=monotonic_fn,

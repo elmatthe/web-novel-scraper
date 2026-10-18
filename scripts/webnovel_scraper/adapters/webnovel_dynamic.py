@@ -30,8 +30,8 @@ from typing import Optional
 
 from bs4 import BeautifulSoup
 
-from ..models import ChapterContent, ChapterMeta, EmptyExtractionError, SiteSpec
-from .base import BaseAdapter
+from ..models import ChapterContent, ChapterIndex, ChapterMeta, EmptyExtractionError, SiteSpec
+from .base import BaseAdapter, extract_validated
 
 logger = logging.getLogger(__name__)
 
@@ -295,7 +295,8 @@ class WebNovelDynamicAdapter(BaseAdapter):
         parses to an empty list — never silently returns an empty index.
         """
         rm = self._manager(spec)
-        html = rm.fetch(spec.url, use_browser=spec.use_browser)
+        # Always fresh and never cached (v0.3.0 03.2b): this page is where new chapters appear.
+        html = rm.fetch(spec.url, use_browser=spec.use_browser, use_cache=False)
 
         data = parse_next_data(html)
         if data:
@@ -370,11 +371,18 @@ class WebNovelDynamicAdapter(BaseAdapter):
             f"Found {len(metas)} chapters for {spec.novel_slug!r} "
             f"(range {metas[0].index}..{metas[-1].index})."
         )
-        return metas
+        # Fewer chapters than the site's own count means the list may be cut short, so its last
+        # chapter must not be taken as the novel's end (v0.3.0 End clamping, ADR 011).
+        return ChapterIndex(metas, tail_confirmed=not (expected and len(metas) < expected))
 
     def fetch_chapter(self, meta: ChapterMeta, spec: SiteSpec) -> ChapterContent:
         rm = self._manager(spec)
-        html = rm.fetch(meta.url, use_browser=spec.use_browser)
+        return extract_validated(
+            rm, meta, lambda: rm.fetch(meta.url, use_browser=spec.use_browser),
+            self._extract_chapter, self._log,
+        )
+
+    def _extract_chapter(self, html: str, meta: ChapterMeta) -> ChapterContent:
         raw_title, paragraphs = extract_chapter(html, meta.index)
 
         if not paragraphs:

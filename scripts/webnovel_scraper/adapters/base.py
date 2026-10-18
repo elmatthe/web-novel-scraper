@@ -11,13 +11,48 @@ from __future__ import annotations
 
 import re
 from abc import ABC, abstractmethod
+from typing import Callable
 
-from ..models import ChapterContent, ChapterMeta, SiteSpec
+from ..models import ChapterContent, ChapterMeta, EmptyExtractionError, SiteSpec
 
 # Characters illegal in Windows filenames plus the POSIX path separators, so a
 # chapter title can never create a subdirectory or break a path on any OS.
 _ILLEGAL_FILENAME_CHARS = re.compile(r'[:*?"<>|/\\]+')
 _WHITESPACE = re.compile(r"\s+")
+
+
+def extract_validated(
+    rm: object,
+    meta: ChapterMeta,
+    fetch: Callable[[], str],
+    extract: Callable[[str, ChapterMeta], ChapterContent],
+    log: Callable[[str], None],
+) -> ChapterContent:
+    """Fetch and extract one chapter so the HTML cache only ever keeps usable pages (03.2b).
+
+    A page that yields no body or the wrong chapter is set aside in the cache (when the request
+    manager has one). If it had come *from* the cache it is fetched once more from the site; a
+    second failure is the chapter's failure, so a bad page can never cause a refetch loop.
+    """
+    invalidate = getattr(rm, "invalidate_cache", None)
+    html = fetch()
+    info = getattr(rm, "last_fetch_info", None)
+    from_cache = bool(getattr(info, "from_cache", False))
+    try:
+        return extract(html, meta)
+    except EmptyExtractionError as exc:
+        if callable(invalidate):
+            invalidate(meta.url, str(exc))
+        if not from_cache:
+            raise
+        log(f"  chapter {meta.index}: the cached page could not be used ({exc}); fetching it again.")
+    html = fetch()
+    try:
+        return extract(html, meta)
+    except EmptyExtractionError as exc:
+        if callable(invalidate):
+            invalidate(meta.url, str(exc))
+        raise
 
 
 class BaseAdapter(ABC):

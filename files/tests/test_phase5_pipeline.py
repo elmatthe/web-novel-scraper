@@ -274,18 +274,29 @@ def test_resume_skips_existing_single_pdf(tmp_path) -> None:
     assert sorted(report.skipped_existing) == [1, 2, 3]
 
 
-# ── Finite ranges the list cannot satisfy are refused, never clamped ─────────
-def test_finite_range_beyond_the_site_list_is_refused_not_clamped(tmp_path) -> None:
+# ── An oversized End is clamped to the site's last chapter (owner decision, ADR 011) ───
+def test_finite_range_beyond_the_site_list_is_clamped_to_its_end(tmp_path) -> None:
     adapter = FakeAdapter(count=5)
-    with pytest.raises(ChapterListRefused) as refused:
+    report = pipeline.run_scrape(
+        _job(tmp_path, OutputMode.SEPARATE, start=3, end=99),
+        adapter=adapter,
+        log=lambda m: None,
+    )
+    assert report.requested_range == (3, 99)
+    assert report.effective_range == (3, 5)
+    assert adapter.fetched == [3, 4, 5]
+    assert len(_pdfs(tmp_path)) == 3
+    assert any("End chapter 99" in note for note in report.range_notes)
+
+
+def test_a_start_past_the_site_list_is_refused_with_nothing_written(tmp_path) -> None:
+    adapter = FakeAdapter(count=5)
+    with pytest.raises(ChapterListRefused, match="None of chapters 8-99 are available"):
         pipeline.run_scrape(
-            _job(tmp_path, OutputMode.SEPARATE, start=3, end=99),
+            _job(tmp_path, OutputMode.SEPARATE, start=8, end=99),
             adapter=adapter,
             log=lambda m: None,
         )
-
-    assert "ends at chapter 5" in str(refused.value)
-    assert "6-99" in str(refused.value)
     assert adapter.fetched == []           # nothing was fetched ...
     assert _pdfs(tmp_path) == []           # ... and nothing was written
 

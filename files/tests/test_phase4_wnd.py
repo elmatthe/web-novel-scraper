@@ -275,3 +275,16 @@ def test_disabled_novel_bin_for_noble_queen_refused() -> None:
     nb_spec = catalog.get_spec("the-noble-queen", "novel_bin")
     with pytest.raises(AdapterDisabledError):
         get_adapter_for_spec(nb_spec)
+
+
+# ── End clamping needs a confirmed tail (v0.3.0, ADR 011) ────────────────────
+def test_a_toc_shorter_than_the_sites_own_count_does_not_confirm_its_tail() -> None:
+    """The site says 7 chapters but lists 5: the list may be cut short, so its last chapter must
+    never be used to clamp a requested End. A list that matches the count confirms its tail."""
+    short = _toc_html(5).replace('"chapterCnt": 5', '"chapterCnt": 7')
+    metas = WebNovelDynamicAdapter(request_manager=FakeRM({NQ_SPEC.url: short})).build_chapter_index(NQ_SPEC)
+    assert [m.index for m in metas] == [1, 2, 3, 4, 5]
+    assert metas.tail_confirmed is False
+
+    full = WebNovelDynamicAdapter(request_manager=FakeRM({NQ_SPEC.url: _toc_html(5)})).build_chapter_index(NQ_SPEC)
+    assert full.tail_confirmed is True

@@ -22,8 +22,14 @@ from urllib.parse import urldefrag, urljoin, urlparse
 
 from bs4 import BeautifulSoup
 
-from ..models import ChapterContent, ChapterMeta, EmptyExtractionError, SiteSpec
-from .base import BaseAdapter
+from ..models import (
+    ChapterContent,
+    ChapterMeta,
+    ChapterMismatchError,
+    EmptyExtractionError,
+    SiteSpec,
+)
+from .base import BaseAdapter, extract_validated
 
 logger = logging.getLogger(__name__)
 
@@ -443,10 +449,13 @@ class FreeWebNovelAdapter(BaseAdapter):
         # quickly (for the visible-retry fallback) instead of walking the long ladder.
         # Only pass the kwarg when set, so the legacy call signature (and every test
         # fake that mimics it) is unchanged for the default path.
+        # ``use_cache=False`` (v0.3.0 03.2b): the index page is where the newest chapter is
+        # learned, so it is always fetched fresh and never cached; a stale copy would hide
+        # chapters the site has published since.
         if fast_path:
-            html = rm.fetch(spec.url, use_browser=spec.use_browser, fast_path=True)
+            html = rm.fetch(spec.url, use_browser=spec.use_browser, use_cache=False, fast_path=True)
         else:
-            html = rm.fetch(spec.url, use_browser=spec.use_browser)
+            html = rm.fetch(spec.url, use_browser=spec.use_browser, use_cache=False)
         soup = BeautifulSoup(html, "html.parser")
         discovered, pairs = self._scan_index_page(soup, spec)
 
@@ -954,20 +963,30 @@ class FreeWebNovelAdapter(BaseAdapter):
             # exact page (offset novels) — reuse it instead of fetching twice.
             return self._extract_chapter(prefetched, meta)
         rm = self._manager(spec)
-        # ``fast_path`` (0.2.0 §3.2): the conductor runs the primary under a bounded
-        # camoufox budget that raises a typed signal so a hard chapter is handed to
-        # the rescue lane while the primary moves on. Default False keeps the legacy
-        # (full-ladder) behaviour for every existing caller and the WND path; only
-        # pass the kwarg when set so existing test fakes keep their signature.
-        if fast_path:
-            html = rm.fetch(meta.url, use_browser=spec.use_browser, fast_path=True)
-        else:
-            html = rm.fetch(meta.url, use_browser=spec.use_browser)
-        return self._extract_chapter(html, meta)
+
+        def fetch() -> str:
+            # ``fast_path`` (0.2.0 §3.2): the conductor runs the primary under a bounded
+            # camoufox budget that raises a typed signal so a hard chapter is handed to
+            # the rescue lane while the primary moves on. Default False keeps the legacy
+            # (full-ladder) behaviour for every existing caller and the WND path; only
+            # pass the kwarg when set so existing test fakes keep their signature.
+            if fast_path:
+                return rm.fetch(meta.url, use_browser=spec.use_browser, fast_path=True)
+            return rm.fetch(meta.url, use_browser=spec.use_browser)
+
+        return extract_validated(rm, meta, fetch, self._extract_chapter, self._log)
 
     def _extract_chapter(self, html: str, meta: ChapterMeta) -> ChapterContent:
         soup = BeautifulSoup(html, "html.parser")
-        _number, title = _extract_title(soup, meta.index)
+        number, title = _extract_title(soup, meta.index)
+        if number is not None and float(number) != float(meta.index):
+            # The offset guard (plan §9.6): a page showing another chapter is never published
+            # as this one, however it reached us (cache, network or reconciliation).
+            raise ChapterMismatchError(
+                f"the page at {meta.url} shows chapter {number}, but the chapter list expects "
+                f"chapter {meta.index} there (the site's numbering may have moved; refresh the "
+                "chapter list and run again)."
+            )
 
         # Heading text used only for noise filtering (exact-match dedup).
         heading_for_filter = (

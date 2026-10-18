@@ -5,6 +5,43 @@ versioning.
 
 ## [Unreleased] — v0.3.0 (in progress on `feature/v0.3.0-modernization`)
 
+**Release scope (owner decision 2026-10-18, ADR 013):** v0.3.0 is a **Windows-only** release
+candidate. The macOS launcher and portable code are kept, but macOS acceptance is deferred to a
+later branch; nothing here claims macOS readiness.
+
+### Changed — End auto-clamp and a validated, self-updating HTML cache (Checkpoint 03.2b + owner overrides A/B)
+- **An End past the novel's last chapter is clamped again (owner decision, ADR 011, superseding the
+  03.2a refusal).** `1-5000` on a novel whose site lists 3,700 chapters now scrapes `1-3700` and says
+  so in Activity (`NOTE: range adjusted: …`), in the run summary and on the report
+  (`requested_range` stays as asked, `effective_range` is what was scraped). Only a discovery made
+  in the same run, that returned normally and vouches for its tail, may set the end; a failed,
+  empty or possibly short list still refuses. A Start past every listed chapter ends as "None of
+  chapters X-Y are available" with nothing fetched. Nothing past the end is recorded, so the next run
+  finds newly published chapters. A run whose range has gaps in the site's own list now finishes as
+  "Finished with gaps" rather than "Completed".
+- **The HTML cache is now validated and self-maintaining (ADR 012).** Pages are kept per website and
+  novel (`files/cache/<host>/<novel>/`) with a provenance record (address, time, size, SHA-256,
+  method). A saved page is reused with no network request only if every check passes; a challenge
+  page, garbled or truncated download, a page answered from another address, or a page that turns
+  out to show the wrong chapter is never served (it is set aside and fetched again once). Writes are
+  atomic. `.net` and `.com` can never share pages.
+- **New chapters can no longer be hidden by a stale index:** the table-of-contents page is always
+  fetched fresh and never cached, so an open-ended run (blank End) or an extension always sees the
+  site's current last chapter. Chapter pages stay cached indefinitely.
+- **Offset guard:** a Free Web Novel page that shows a different chapter number than the chapter list
+  expects is never published as that chapter; the chapter fails visibly with a hint to refresh the
+  chapter list.
+- **Rescued chapters are cached** once they extract correctly, so a later run needs no rescue.
+- **Existing cache kept safe:** pages saved by earlier versions (`files/cache/<novel>/`) are copied
+  into the new layout when first needed, after the same checks; the old files are never moved,
+  changed or deleted.
+- **Re-download saved chapter pages on the next run:** a new one-shot box in Advanced Settings fetches
+  the selected chapters from the site again and replaces the saved copies.
+- **Tests:** 1,272 total (61 net new: `test_html_cache.py`, clamp regressions on both pipeline paths,
+  WebNovel tail confirmation, GUI re-download box). Cache tests that wrote bare HTML files now use the
+  provenance contract; tests that asserted the 03.2a refusal now assert the clamp. Mutation check
+  15/15 caught.
+
 ### Changed — Manifest-first chapter lists in both pipeline paths (Checkpoint 03.2a)
 - **The chapter list now comes from the validated, source-specific manifest** (tracked baseline +
   ignored runtime overlay under `files/runtime-data/chapter-lists/<host>/<novel>.json`) instead of

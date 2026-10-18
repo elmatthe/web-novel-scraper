@@ -167,10 +167,13 @@ run-folder allocator and the data contracts, and 03.1 added the chapter manifest
 (`chapter_manifest.py`, `chapter_store.py`: baseline + runtime overlay, merge,
 quarantine, read-only legacy `chapter_index.json` import). 03.2a wired the store into
 both pipeline paths (`chapter_preflight.py`): the manifest now decides the chapter list,
-a covered range needs no TOC request, a range the list cannot satisfy is refused instead
-of clamped, a per-source file lock serialises writers, and the old output-folder
-`chapter_index.json` is legacy input only. The HTML cache (03.2b), run journal and Resume
-(03.3) are not done. The rest of
+a covered range needs no TOC request, a per-source file lock serialises writers, and the
+old output-folder `chapter_index.json` is legacy input only. Owner overrides (2026-10-18):
+an End past the site's last chapter is clamped to it, visibly (ADR 011); the HTML cache is
+validated, host-scoped and self-updating, with index pages always fetched fresh (03.2b,
+ADR 012, `html_cache.py`); and **v0.3.0 is a Windows-only release candidate** (macOS
+deferred, ADR 013). The run journal and Resume (03.3) and later checkpoints are tracked in
+`handoff.md`. The rest of
 this section describes 0.2.0/0.2.1 as built.
 
 **0.2.0 (Unreleased — implemented, pending the user's manual live test).**
