@@ -5,15 +5,18 @@
 
 - **State:** Checkpoints 01–07 plus owner-acceptance round-1 fixes implemented, verified and pushed.
   Not merged, tagged or released; `main` untouched. macOS deferred (ADR 013).
-- **Owner round 1 (small ranges, all nine pairings):** 29 PDFs, no chapter failures. Found: .net LOTM
-  1303 missing (misspelt `chaspter-` address rejected) and a jerky bar; both fixed (plan §9.18).
+- **Owner results so far:** nine small ranges (29 PDFs, no failures); .net LOTM 1301–1305 all five
+  after the 1303 fix; Reverend Insanity 1–13 and LOTM (.com) 1430–99999 (clamped to 1432) audited;
+  Start 1433 refused; Reverend Insanity 14–43 Stop then Resume audited (table in the acceptance doc).
+  **No whole-novel run exists yet**; the earlier automated full-novel batch was BLOCKED by a local
+  network denial (not a pass, not an app fault).
 - **Last verification:** 1,476 tests pass on Python 3.13.12 (`.venv`) and 3.12.10; `scripts/verify.py`
   PASS. Live: .net LOTM 1301–1305 saves all five (scratch copy of the owner's list self-corrected).
-- **Pending (owner):** the round-1 retest at the top of `md-instructions/v0.3.0-Acceptance-and-Review.md`,
-  then the rest of Part 1 (items 1–3 once, 5–12 per pairing, including whole-novel runs).
-- **Then:** the independent GO/NO-GO review with the prompt in Part 2 of that file. It must not
-  merge, tag or release.
-- **Next exact action:** the owner restarts via the setup file and runs the round-1 retest (P7 1301–1305).
+- **Release blockers:** whole-novel runs (item 11, at least one pairing per website) and the unreported
+  checks listed in the acceptance doc ("Owner results so far").
+- **Ready:** the independent GO/NO-GO review prompt (Part 2 of `v0.3.0-Acceptance-and-Review.md`),
+  draft notes in `md-instructions/v0.3.0-Release-Notes-DRAFT.md`. Review must not merge, tag or release.
+- **Next exact action:** the owner starts the independent review and/or runs a whole-novel pairing.
 - **Do not stage:** the deleted `md-instructions/0.2.1_bug-hunt.md`, `0.2.1_release_plan.md`,
   `Decisions-template.md`, or the untracked `scripts/scripts-to-use-from-my-other-repo's-GUIs/`.
   Never `git add -A`.
@@ -59,6 +62,9 @@ Whole-novel runs: **none yet** (owner checklist item 11).
 - Older deferred minors #3–#6 from `files/test-logs/v0.1.0_pre-release.md` remain for owner review.
 
 ## Log (newest first; Git has the full record)
+- 2026-10-18 · release preparation: owner results recorded, review prompt corrected, draft release notes,
+  regenerable caches (`__pycache__`, `.pytest_cache`) removed; everything else kept (inventory in the
+  final report).
 - 2026-10-18 · acceptance round 1 `89ce3da`: .net list reader accepts a misspelt chapter address only when it is a
   single page of the novel whose number matches (LOTM 1303); indeterminate bar on a fixed scale;
   `phase_cb` carries `from_cache` so cached chapters stay out of the ETA (plan §9.18).

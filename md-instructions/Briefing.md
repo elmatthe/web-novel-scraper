@@ -151,8 +151,9 @@ suite in `files/tests/` (a `conftest.py` there puts `scripts/` on
 tagged; its work is part of v0.3.0.
 
 **In progress: v0.3.0, a Windows-only release candidate** on `feature/v0.3.0-modernization`
-(checkpoints 01–07 implemented and verified; awaiting the owner's acceptance runs, then an
-independent GO/NO-GO review; not merged, tagged or released). macOS is deferred (ADR 013).
+(checkpoints 01–07 and owner-acceptance round 1 implemented and verified; the owner has confirmed
+the small-range, End-clamp and Stop/Resume checks listed in `v0.3.0-Acceptance-and-Review.md`, but no
+whole-novel run yet; an independent GO/NO-GO review is next; not merged, tagged or released). macOS is deferred (ADR 013).
 What v0.3.0 is, in short:
 
 - **Window:** PDF-Splitter-style Light/Dark UI with three sections (Web Novel Selection, Output
@@ -593,9 +594,11 @@ Detail per checkpoint: `CHANGELOG.md`. Current state and next action: `handoff.m
     design choice.
 
 ## Known Issues
-- **Full-novel runs are not yet proven.** The program is built for them (journal, resume, bounded
-  memory, a 300-chapter fault-injection test, a 1,432-chapter synthetic PDF in about 85 s), but no
-  whole-novel run has been made against the live sites. That is the owner's acceptance step.
+- **Full-novel runs are not yet proven (release blocker).** The program is built for them (journal,
+  resume, bounded memory, a 300-chapter fault-injection test, a 1,432-chapter synthetic PDF in about
+  85 s), but no whole-novel run has completed against the live sites. An automated attempt was blocked
+  by a local network denial (WinError 10013) before reading any chapter list; it proves nothing either
+  way. The owner's partial runs (up to 30 chapters, including Stop and Resume) all audited clean.
 - **Live site behaviour can change from day to day.** Free Web Novel (.com) sits behind Cloudflare;
   the headless-first browser switches to a visible one at the first challenge. A day when neither
   clears shows up as failed chapters that Resume can retry later.
@@ -612,6 +615,6 @@ Detail per checkpoint: `CHANGELOG.md`. Current state and next action: `handoff.m
 ## Next Steps
 1. **Owner acceptance** on Windows, using the checklist in `handoff.md`: delete `.venv` and run the
    launcher (rebuild), then the per-pairing checks, including at least one full-novel run you choose.
-2. **Independent GO/NO-GO review** of the branch (the Codex prompt in `handoff.md`). It must not
-   merge, tag or release.
+2. **Independent GO/NO-GO review** of the branch (the Codex prompt is Part 2 of
+   `v0.3.0-Acceptance-and-Review.md`). It must not merge, tag or release.
 3. **Only with the owner's approval:** merge to `main`, stamp the 0.3.0 changelog date, tag `v0.3.0`.

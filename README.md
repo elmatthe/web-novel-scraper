@@ -117,8 +117,9 @@ during a run, that is expected. Don't close it, and keep it **on screen** (not
 minimised) while it works, because a minimised browser can stall a Cloudflare check.
 It closes itself when the run ends.
 
-Free Web Novel (.net) and WebNovel (Dynamic) don't need a browser, and no window
-appears for them.
+Free Web Novel (.net) normally needs no browser and shows no window. WebNovel (Dynamic)
+usually doesn't either, but if the site shows a security check it falls back to the same
+browser engine, so a browser window may appear for it too; leave it open and on screen.
 
 ## Where the files go
 

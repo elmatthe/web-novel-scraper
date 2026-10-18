@@ -9,6 +9,15 @@ versioning.
 candidate. The macOS launcher and portable code are kept, but macOS acceptance is deferred to a
 later branch; nothing here claims macOS readiness.
 
+### Owner acceptance results to date (2026-10-18)
+- Owner-confirmed in the GUI: nine small ranges (29 PDFs, no chapter failures); .net Lord of the
+  Mysteries 1301–1305 saves all five chapters (10/10 files audited); Reverend Insanity 1–13 (14/14
+  audited); Lord of the Mysteries (.com) 1430–99999 lowered to 1430–1432 (6/6 audited) and Start 1433
+  refused with nothing written; Reverend Insanity 14–43 stopped and resumed in the same folder
+  (30 chapters, six grouped files, audit passed).
+- **Not yet confirmed:** the clean rebuild and window checks, cache refresh, new-chapter discovery and
+  whole-novel runs. v0.3.0 stays Unreleased until they are.
+
 ### Fixed — owner acceptance, round 1 (2026-10-18)
 - **Free Web Novel (.net): Lord of the Mysteries chapter 1303 is no longer missing.** The site does
   list it, but at a misspelt address (`/lord-of-the-mysteries/chaspter-1303-coming-to-life.html`),
