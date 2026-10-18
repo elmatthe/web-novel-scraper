@@ -1,106 +1,150 @@
 # webnovel-scraper - Handoff
 
-## Current Snapshot — v0.3.0 Checkpoint 01.1 complete (Light/Dark UI foundation)
+## Current Snapshot — v0.3.0 Checkpoint 02.1 complete (Activity logging + event bridge)
 **2026-10-18 · HOME-PC (Windows 11) · Claude Code (Opus 5.5) · branch
 `feature/v0.3.0-modernization`**
 
 - **Active plan:** `md-instructions/Web-Novel-Scraper-v0.3.0-Implementation-Plan.md`
-  (owner-approved; §1 "Verified baseline", §4 checkpoint 01, §8 C1–C15).
+  (owner-approved; §3 "Progress, responsiveness and platform behavior", §4
+  checkpoint 02, §8 C5/C10).
 - **Base:** `577b5db` = `main` (`e7dc407`) plus the FWN offset/duplicate-output
-  fix (owner-approved base). Checkpoint 00 = `1ab1747`; step 01.0 (flat
-  `scripts/` layout, 20 renames) = `f169565`; 01.1 is the commit after it.
-  `fix/freewebnovel-offset-and-output-collisions` stays local.
+  fix. Checkpoint 00 = `1ab1747`; 01.0 (flat `scripts/`) = `f169565`; 01.1
+  (Light/Dark UI foundation, three-section shell) = `e93c21a`; 02.1 is the commit
+  after it. `fix/freewebnovel-offset-and-output-collisions` stays local.
 - **Release state:** v0.2.0 is the latest release and tag (2026-06-30). 0.2.1 is
   merged to `main` via PR #4 but untagged. v0.3.0 supersedes it (plan §8 C3).
-- **Checkpoint 01.1 (UI only).** No scraper, pipeline, adapter, PDF, cache,
-  dependency or default changes: `DEFAULT_HEADLESS` is still `False`, output
-  folders are still `<parent>/<slug>-N`, and the catalog is unchanged.
-  - New `scripts/webnovel_scraper/ui/` package (Tk only, no scraping):
-    - `appearance.py` is adapted from PDF-Splitter `appearance.py` (local working
-      copy supplied 2026-10-17; this file is identical to GitHub `edcbd4f`), which
-      came from ACT v0.6.6. It provides the `Compact.*` clam-cloned ttk styles, the
-      Light/Dark palettes, the Aqua branch and the in-place refresh. Removed the
-      Treeview, Spinbox and Inline styles (no such widgets here). Added
-      `Compact.TMenubutton`, built from the Combobox field/arrow clones so the
-      Website picker matches the Novel dropdown, and a `menu` role for `tk.Menu`.
-    - `settings.py` is PDF-Splitter's store trimmed to schema v1 with
-      `appearance` only. It has a forgiving load, an atomic save, and keeps a
-      `settings.unusable-<stamp>.json` copy of a bad original. The file is
-      `files/runtime-data/settings.json`, now gitignored.
-  - `scripts/app.py` shell rebuilt. Every run-lifecycle method is unchanged
-    (`_on_start`, `_collect_params`, `_run_worker`, `_on_stop`, close/poll); the
-    status line updates were the only additions to them.
-    - Header (title + subtitle). Left column, three bordered sections:
-      - **1. Web Novel Selection:** Novel, Website, Start/End chapter, and the
-        no-site hint.
-      - **2. Output Options:** PDF ticked and locked, TXT visibly unavailable,
-        grouping radios "Individual chapters" / "Whole selected range" /
-        "Every X chapters per PDF" (same `OutputMode` values).
-      - **3. Run:** Output folder + Browse…, Folder name, Start/Stop,
-        Advanced Settings…, progress bar, run state and `done / total chapters`.
-    - Right: the **Activity** panel holding the existing log. Bottom status bar
-      with the Light/Dark toggle.
-    - Delay, timeout, browser mode, headless, HTTP-first and HTML cache moved,
-      unchanged, into an "Advanced Settings" window. It is built at startup and
-      only hidden, so Start, the run lock and the tests use the same widgets.
-    - `_fit_window` measures the minimum and default size: 631×571 minimum and
-      855×571 default at 100% on 1920×1080.
-  - Tests: `test_ui_settings.py` (19), `test_ui_appearance.py` (9) and
-    `test_ui_shell.py` (19). `test_phase4_gui.py`'s headless-hint test now reads
-    the hint note in the Advanced window: the same three wording assertions plus
-    its placement. `conftest.py` redirects the settings file to each test's temp
-    folder.
-  - New `files/tests/pytest.ini` sets `--capture=sys`. This fixes the
-    intermittent "no Tk display" skip seen at 01.0: with pytest's default fd
-    capture, about 1 in 300 `tk.Tk()` calls on Windows could not read Tk's own
-    `init.tcl`. With sys capture there were 0 failures in 900.
-- **Non-obvious UI decisions** (also in CHANGELOG):
-  1. Novel stays above Website because the Website menu lists the selected
-     novel's sites (current behaviour). A website-first flow is 02 wiring.
-  2. The advanced settings moved to their own window so the main window stays
-     short enough for 150% scaling on a 1080p laptop.
-  3. PDF is ticked and locked and TXT is disabled ("TXT not available yet"),
-     because both formats may never be off and neither box may pretend to change a
-     run. TXT is enabled at 05.
-  4. Activity holds the single existing log in `_activity_body`. 02 puts the
-     Summary/Detailed tabs and Clear Log there; no tabs were faked now.
-  5. Like PDF-Splitter, the process is not made DPI-aware. Windows scales the
-     whole window above 100%, so sizes stay consistent but text can look softer.
-  6. The run-state line and chapter counts come only from the existing
-     progress callback and run events.
-- **Last verification:** `scripts/verify.py` in place with `.venv` Python
-  3.13.12. **PASS: pytest 347 passed (300 baseline + 47 new), 0 skipped; deps
-  PASS; docs PASS.** Two more full runs: 347 passed, 0 skipped. The 59 GUI/UI
-  tests also pass on the existing Python 3.12.10. A mutation check confirmed the
-  tests bite: letting the controls column stretch fails 3 layout tests, and
-  resetting a value on theme switch fails the preservation test.
+- **01.1 recap:**
+  - `ui/appearance.py` and `ui/settings.py` were adapted from PDF-Splitter.
+  - Three bordered sections on the left (1. Web Novel Selection, 2. Output Options,
+    3. Run), Activity on the right, a status bar with the Light/Dark toggle, and an
+    Advanced Settings window.
+  - Geometry is measured by `_fit_window`.
+  - Appearance is saved in the ignored `files/runtime-data/settings.json`.
+  - Detail: CHANGELOG and the plan's 01.1 Result.
+- **Checkpoint 02.1 (UI/controller only).** No scraper, adapter, pipeline, PDF,
+  cache, catalog, dependency or default changes. `DEFAULT_HEADLESS` is still
+  `False`, output folders are still `<parent>/<slug>-N`, and selection is still
+  novel-first.
+  - New `scripts/webnovel_scraper/ui/activity.py` (stdlib only, no Tk), adapted
+    from PDF-Splitter `activity.py` (local working copy supplied 2026-10-17, newer
+    than `edcbd4f`), itself from ACT v0.6.6. It provides:
+    - `ActivityEvent`;
+    - a bounded, locked `ActivityChannel` (500 pending; progress coalesces by key;
+      only routine detail can be dropped from the *display*, counted and announced);
+    - a capped Summary/Detailed `ActivityModel`;
+    - `SessionLog` and `ActivityPump`.
 
-  Startup smoke test: `.venv\Scripts\pythonw.exe scripts\app.py` opened the "Web
-  Novel Scraper" window, which closed gracefully with exit 0. It wrote no settings
-  file (startup only reads) and created nothing outside the repository. Nothing
-  was installed and there was no live scraping.
+    Changed from PDF-Splitter (ADR 006):
+    - the session log is written when an event is **emitted** (locked, any
+      thread), not when the UI draws it, so it stays complete and in true order;
+    - `report()` first routes everything still queued;
+    - lines before a job event are drawn before it runs;
+    - log text is redacted (cookie/authorization values) and capped at 8,000
+      characters;
+    - the preview/job-controller/stale-event features were not taken.
+  - New `ui/run_activity.py` (no Tk):
+    - `PIPELINE_MESSAGE_RULES` is 19 literal markers copied from existing
+      pipeline/adapter messages. They lift warnings, failures, recoveries and
+      preparation milestones into Summary; every line stays in Detailed unchanged.
+      A test fails if a marker disappears from the package source.
+    - It also builds the run-start lines and the outcome from the pipeline's
+      `RunReport`: completed, completed with problems, nothing written, stopped,
+      failed, refused, or unconfirmed (no report). It never uses the progress
+      percentage.
+  - `scripts/app.py`:
+    - **Activity panel:** a note, **Clear Log**, and a Summary/Detailed
+      `Compact.TNotebook` with two read-only monospaced `tk.Text` logs.
+      - Warnings and errors are labelled in words and coloured from the palette;
+        both survive Light/Dark switching.
+      - A view follows new lines while at its end, keeps its place while the
+        user reads further up, and a tab filled while hidden opens at its newest
+        line.
+      - Ctrl+A selects all.
+      - The note wraps once, to the floor width, so it never raises the measured
+        minimum.
+    - **Worker:** it never calls Tk, not even `after`. `_thread_log` and
+      `_thread_progress` only `emit`. `_run_worker` keeps the `RunReport`, builds
+      the outcome and always emits a final `RunFinished` job event.
+    - **Pump:** an always-on `ActivityPump` on the window's real `after` drains
+      64 events per 80 ms tick, or 1 ms apart while a backlog remains.
+      `_on_job_event` routes progress and the finish.
+    - **Stop/Close:** both now report *before* signalling cancel, so the request
+      always precedes what it causes. A run that finishes during a close leaves
+      Start locked.
+    - **Shutdown:** `destroy()` runs `_shutdown()`, which stops the pump and
+      closes the Activity and session log; later events are refused.
+      `flush_activity()` drains the queue now (tests use it).
+  - Session log: one `session-YYYYMMDD-HHMMSS[-N].log` per window under
+    `files/runtime-data/logs/` (`ui/settings.LOGS_DIR`, gitignored with its
+    parent). It holds UTF-8 timestamped lines and is flushed line by line. Started
+    and closed lines frame it, and Detailed shows its path at startup. If the
+    folder is unwritable, or a write fails, Summary shows one warning, writing
+    stops, and the scraper keeps running. Clear Log never touches the file.
+  - Tests: `test_ui_activity.py` (33, pure), `test_ui_run_activity.py` (41,
+    pure) and `test_ui_activity_panel.py` (16, Tk).
+    - `test_ui_shell.py`'s five Activity-touching tests now read the two tabs;
+      the worker test is stricter (no `after` from the worker at all).
+    - `conftest.py` also redirects `LOGS_DIR`.
+    - The shell and panel `_make_app` helpers run `gc.collect()` first: earlier
+      tests' destroyed windows are cyclic garbage, and if the worker thread
+      collected them, each Tk `__del__` would wait about 1 s for a main loop. This
+      is a suite artefact; the app has one window.
+    - `test_phase4_gui.py` and `test_phase8_gui.py` are unchanged and pass.
+- **Bugs found and fixed while testing (none shipped):**
+  - Stop/Close used to signal cancel before reporting, so a fast worker's outcome
+    could appear before "Stop requested".
+  - A hidden Detailed tab used to open at its top.
+  - Shrinking the window used to stop a following view following.
+  - A message starting with the word "warning" lost its label.
+- **Last verification:** `scripts/verify.py` in place with `.venv` Python
+  3.13.12. **PASS: pytest 437 passed (347 + 90 new), 0 skipped; deps PASS; docs
+  PASS**, three consecutive runs.
+  - The 149 GUI/UI/Activity tests also pass on the existing Python 3.12.10.
+  - The window tests passed 15 loops in a row after the close-test race fix.
+  - A mutation check caught all 11 mutations, including: the worker using
+    `after`, report not draining first, important events droppable, log written
+    only at draw time, Clear Log deleting the log, everything to Summary, success
+    from the percentage, pump surviving destroy, stop reported after cancel, and
+    the note widening the window (two variants).
+  - Startup smoke test: `.venv\Scripts\pythonw.exe scripts\app.py` opened "Web
+    Novel Scraper" (base `Python313\pythonw.exe`), closed via WM_CLOSE, exit 0,
+    and wrote `files/runtime-data/logs/session-20261017-191735.log` (started,
+    path, closed; ignored by Git).
+  - Measured window: 635×571 minimum and 859×571 default at 100% (01.1:
+    631×571; the notebook border adds 4 px). At a simulated 150% scaling it is
+    902×784.
+  - Nothing was installed and there was no live scraping.
 - **Pending manual tests (owner):**
-  - Windows UI visual gate: Light/Dark, restored and maximized, minimum size,
-    125%/150% display scaling, every section legible, and the Website menu's
-    colours in Dark mode.
-  - Double-click `Setup_and_Run-Web-Novel-Scraper.bat` once.
-  - macOS: run the `.command` and check the Aqua look when a Mac is available.
-- **Next exact action:** owner review of the 01.1 UI foundation. Do not start
-  Checkpoint 02 until it is approved. Checkpoint 02 then covers:
-  - Activity Summary/Detailed tabs, Clear Log, PDF-Splitter's `ActivityPump`
-    queue and session logs;
-  - phase-aware progress and ETA;
-  - the website-first selection flow and Resume affordance;
-  - ordinary preference persistence.
+  - Windows visual gate for Activity: both tabs in Light and Dark, warning and
+    error colours, Clear Log, minimum and maximized, and 125%/150% scaling.
+  - One real FWN run to see the Summary/Detailed split on live messages.
+  - Double-click the `.bat` once.
+  - macOS `.command` and the Aqua notebook when a Mac is available.
+  - The 01.1 visual items still apply.
+- **Next exact action:** owner review of 02.1. Do not start 02.2 until approved.
+  02.2 (plan §3, §4 02):
+  - phase-aware progress: stages `Preparing chapter list / Scraping / Building
+    output / Complete`;
+  - completed/selected, failed/skipped/resumed counts, percentage, current
+    chapter, and an ETA that shows `—` when unknown (PDF-Splitter
+    `jobs.format_eta`/`format_counts`);
+  - run states that tell "100% processed with failures" from "100% successful",
+    built on 02.1's `ProgressUpdate`/`RunFinished` events and the `RunReport`
+    outcome.
+
+  The website-first selection, Resume Existing Run affordance and broader
+  preference persistence remain for later 02 steps. Delete the reference folder
+  only after the 02 borrowing is complete.
 
 ### Uncommitted local state (deliberately NOT committed)
 - `md-instructions/0.2.1_release_plan.md`, `0.2.1_bug-hunt.md` and
   `Decisions-template.md` are deleted locally. **The owner deferred these to a
   separate documentation-cleanup decision**, so they were left unstaged in 01.0.
 - `scripts/scripts-to-use-from-my-other-repo's-GUIs/` holds owner-supplied
-  ACT/PDF-Splitter reference copies. It is untracked: **never commit it**, and
-  delete it after the 02 borrowing. The PDF-Splitter copies are newer than GitHub
-  `edcbd4f`.
+  ACT/PDF-Splitter reference copies. It is untracked: **never commit it**. Keep it
+  for the remaining Checkpoint 02 work and delete it after the 02 borrowing.
+  The PDF-Splitter copies are newer than GitHub `edcbd4f`.
+- `files/runtime-data/logs/` holds the smoke tests' session logs (ignored).
 - `AI-WORKSPACE.md` is local and gitignored by design.
 
 ### Open issues carried forward
@@ -115,6 +159,12 @@
   Briefing/handoff and handoff length are docs debt for 07 (C14).
 
 ### Log (newest first)
+- 2026-10-18 — Checkpoint 02.1: Activity Summary/Detailed tabs, Clear Log and
+  per-session logs in ignored `files/runtime-data/logs/`; PDF-Splitter's
+  Activity channel/pump adapted (log written at emit; ADR 006); the worker no
+  longer calls Tk at all; the outcome comes from `RunReport`; a 19-marker
+  bridge for pipeline strings. 90 tests added. Verify PASS (437, 0 skipped).
+  No scraper, pipeline, PDF, dependency or default changes.
 - 2026-10-18 — Checkpoint 01.1: Light/Dark appearance (adapted from
   PDF-Splitter) and the three-section + Activity window shell with measured
   geometry; advanced fetch settings moved, unchanged, to an Advanced Settings

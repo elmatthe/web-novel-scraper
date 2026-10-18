@@ -5,6 +5,67 @@ See AI-WORKSPACE.md for how this fits alongside Briefing, Changelog, and Handoff
 
 ---
 
+## 006 — Activity: log at emit, Tk only on the UI thread, and a literal-marker bridge for pipeline text — 2026-10-18 — Claude (Opus 5.5)
+
+**Status:** Accepted (v0.3.0 Checkpoint 02.1)
+
+**Context:** v0.3.0 replaces the single GUI log with PDF-Splitter's Summary/Detailed
+Activity (plan §3, §8 C5).
+- Until now the worker marshalled every line, progress update and the run's end
+  through `self.after(0, …)`: a Tk call from a non-Tk thread.
+- The pipeline speaks only through `log(str)` and `progress_cb(done, total)`. The
+  checkpoint forbids pipeline changes and a large regex classifier, yet the
+  warnings must reach Summary.
+- PDF-Splitter's `activity.py` writes its session log as the UI thread *draws*
+  events. Its bounded channel may drop routine detail from a flooded queue, so
+  such a line never reaches the log either.
+
+**Decision:**
+1. The worker only calls `Activity.emit` (a locked, bounded queue). A pump owned
+   by the Tk thread, scheduled with the window's real `after` and always on while
+   the window lives, drains it in bounded slices. `destroy()` stops the pump and
+   closes the Activity, so late events are refused.
+2. The session log is written when an event is emitted (`SessionLog` is locked;
+   any thread may write), not when it is drawn. Display drops then cost only
+   display lines, which are counted and announced, and the log keeps true
+   emission order across threads.
+3. A UI-thread `report` first routes everything still queued, and every line
+   queued before a job event (progress, run finished) is drawn before that event
+   is handled.
+4. Pipeline text is classified by `run_activity.PIPELINE_MESSAGE_RULES`: 19
+   literal prefix/substring markers, each copied from an existing message. A test
+   asserts that every marker still occurs in the package source. Unmatched lines
+   go to Detailed only.
+5. The run outcome comes from the returned `RunReport`, never from the progress
+   count.
+
+**Alternatives considered:**
+- (a) Keep `after(0, …)` from the worker. Rejected: it is a Tk call off the Tk
+  thread, the very thing the plan forbids.
+- (b) PDF-Splitter's draw-time logging. Rejected: a dropped or still-queued line
+  would be missing from the diagnostic log.
+- (c) A regex classifier for arbitrary log text. Rejected by the checkpoint, and
+  it would drift silently.
+- (d) Make the pipeline emit structured events. Rejected: no pipeline changes in
+  this checkpoint. The marker table is the documented bridge until a later
+  checkpoint does that.
+- (e) Start and stop the pump per run, as PDF-Splitter does without an adapter.
+  Rejected: a pipeline helper thread may still log after the worker returns.
+
+**Consequences:**
+- The worker-side code reads only the queue, the cancel flag and its two
+  enqueue-only callbacks (an AST test pins this).
+- Writing to disk on the producer thread costs one line-buffered write per
+  message, negligible at scraper pace.
+- A reworded pipeline message fails `test_every_marker_still_occurs_in_the_pipeline_source`
+  instead of silently disappearing from Summary.
+- Stop/Close report before signalling cancel, so the request always precedes what
+  it causes.
+- When 02.2 adds phase-aware progress and ETA, it builds on the same
+  `ProgressUpdate`/`RunFinished` job events.
+
+---
+
 ## 005 — Bounded-window TOC hints threaded via signature introspection, not the adapter contract — 2026-07-20 — Claude (Fable 5)
 
 **Status:** Accepted

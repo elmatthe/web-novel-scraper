@@ -9,8 +9,16 @@ close polls until the worker exits before destroying the Tk root.
 
 No scraping, parsing, or PDF logic lives here — all of that is in the
 ``webnovel_scraper`` package and is covered by the offline test suite. The GUI
-only collects inputs, marshals every UI update back onto the Tk thread via
-``self.after(0, ...)``, and shows the log/progress the pipeline emits.
+only collects inputs and shows the log/progress the pipeline emits.
+
+Activity (v0.3.0 Checkpoint 02.1; :mod:`webnovel_scraper.ui.activity`, adapted from
+PDF-Splitter): the worker thread never calls Tk, not even ``after``. The pipeline's
+``log``/``progress_cb`` callbacks and the run outcome only *enqueue* immutable events
+on a bounded, locked channel (and write the session log); a pump owned by the Tk
+thread drains it on a timer into the Summary/Detailed tabs, the progress bar and the
+run-finished handler. Once the window is destroyed the channel refuses events, so a
+late worker line is a harmless no-op. Each application session writes one technical
+log under the ignored ``files/runtime-data/logs/``; Clear Log never touches it.
 
 Defense in depth on disabled sites: the catalog greys them in the Website menu and
 Start cannot dispatch one (this file), the pipeline refuses a disabled row
@@ -55,7 +63,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from webnovel_scraper import catalog, pipeline  # noqa: E402
 from webnovel_scraper.models import OutputMode, ScrapeJob  # noqa: E402
 from webnovel_scraper.registry import AdapterDisabledError  # noqa: E402
-from webnovel_scraper.ui import appearance  # noqa: E402
+from webnovel_scraper.ui import appearance, run_activity  # noqa: E402
+from webnovel_scraper.ui import settings as ui_settings  # noqa: E402
+from webnovel_scraper.ui.activity import (  # noqa: E402
+    ERROR, INFO, WARNING, Activity, ActivityEvent, ActivityPump, RenderUpdate, SessionLog,
+)
 from webnovel_scraper.ui.settings import SettingsStore  # noqa: E402
 
 # Adapters that can use the Playwright browser path (Cloudflare). Every other
@@ -122,6 +134,17 @@ ADVANCED_NOTE = (
     "These settings are read when you press Start and are locked while a run is "
     "in progress."
 )
+# Activity panel (Checkpoint 02.1; PDF-Splitter's Summary/Detailed notebook).
+SUMMARY_TAB = "Summary"
+DETAILED_TAB = "Detailed"
+ACTIVITY_NOTE = "Summary: progress and results.\nDetailed: every step."
+SUMMARY_PLACEHOLDER = (
+    "Choose a novel and a website, then press Start.\n"
+    "Run milestones, warnings and results will appear here.\n"
+)
+DETAILED_PLACEHOLDER = "Technical details (fetches, retries, cache, browser) will appear here.\n"
+# Lines kept in each displayed view; older lines scroll away (the session log keeps all).
+MAX_LOG_LINES = 5000
 
 # Sizing intents, expressed in characters / lines (never pixels).
 NOVEL_FIELD_CHARS = 28
@@ -138,7 +161,8 @@ class ScraperApp(tk.Tk):
     """The single scraper window. All real work happens on a non-daemon worker."""
 
     def __init__(
-        self, store: SettingsStore | None = None, *, platform: str | None = None
+        self, store: SettingsStore | None = None, *, platform: str | None = None,
+        logs_dir: str | Path | None = None,
     ) -> None:
         super().__init__()
         self.title(APP_TITLE)
@@ -170,6 +194,29 @@ class ScraperApp(tk.Tk):
         # Classic Tk widgets ttk styles cannot reach, with their appearance role.
         self._text_widgets: list[tuple[tk.Text, str]] = []
         self.geometry_info: dict[str, object] = {}
+        # The two Activity views, whether each still shows its placeholder, and whether
+        # each follows new lines (it stops while the user reads further up).
+        self._log_texts: dict[str, tk.Text] = {}
+        self._placeholders = {SUMMARY_TAB: True, DETAILED_TAB: True}
+        self._follow = {SUMMARY_TAB: True, DETAILED_TAB: True}
+        # Set once the window is being destroyed: the pump is stopped and the Activity
+        # channel refuses events, so nothing can touch the window afterwards.
+        self._shut_down = False
+
+        # Activity and the session log. Workers talk to them only through Activity.emit
+        # (a locked queue); the Tk thread drains it with the pump. The pump keeps the
+        # real ``after`` it was given, and runs for the window's whole life: a pipeline
+        # helper thread may still log after the worker has returned.
+        self._session_log = SessionLog(
+            ui_settings.LOGS_DIR if logs_dir is None else Path(logs_dir), app_name=APP_TITLE
+        )
+        self._events = Activity(
+            session_log=self._session_log, on_render=self._render_activity,
+            job_sink=self._on_job_event,
+        )
+        self._pump = ActivityPump(
+            self._events, self.after, self.after_cancel, lambda: True, always_on=True
+        )
 
         # Novel slug list in catalog order; titles for display.
         self._novel_slugs = catalog.all_novel_slugs()
@@ -187,10 +234,17 @@ class ScraperApp(tk.Tk):
         self._apply_bundle(self._bundle)
         self._fit_window()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
-        if store.diagnostics:
-            self._set_status(
-                f"Settings problem ({store.diagnostics[0]}); safe defaults in use."
+        # A log that cannot be created is one Summary warning; the window works without it.
+        if self._session_log.open():
+            self._events.report(
+                ActivityEvent("activity", f"Session log: {self._session_log.path}")
             )
+        self._events.note_log_open_failure()
+        if store.diagnostics:
+            problem = f"Settings problem ({store.diagnostics[0]}); safe defaults in use."
+            self._set_status(problem)
+            self._events.report(ActivityEvent("settings", problem, WARNING, summary=True))
+        self._pump.start()
 
     # ── UI construction ──────────────────────────────────────────────────────
     def _unit(self) -> int:
@@ -237,7 +291,7 @@ class ScraperApp(tk.Tk):
         )
         self._activity.grid(row=0, column=1, sticky="nsew", padx=(self._gap // 2, 0))
         self._activity.columnconfigure(0, weight=1)
-        self._activity.rowconfigure(0, weight=1)
+        self._activity.rowconfigure(1, weight=1)  # row 0: note + Clear Log; row 1: the tabs
 
         self._sections = [self._section(i) for i in range(len(SECTION_TITLES))]
         e_start, e_end = self._build_selection(self._sections[0])
@@ -490,27 +544,67 @@ class ScraperApp(tk.Tk):
         return e_folder
 
     def _build_activity(self) -> None:
-        """The working log, inside the bordered Activity panel. Checkpoint 02 puts its
-        Summary/Detailed tabs in this same body frame; the panel, its grid weight and
-        the window fit stay as they are."""
-        s = self._bundle["styles"]
-        self._activity_body = ttk.Frame(self._activity, style=s["surface"])
-        self._activity_body.grid(row=0, column=0, sticky="nsew")
-        self._activity_body.columnconfigure(0, weight=1)
-        self._activity_body.rowconfigure(0, weight=1)
-        self._log_text = tk.Text(
-            self._activity_body, width=ACTIVITY_FLOOR_CHARS, height=LOG_FLOOR_LINES,
-            wrap="word", state="disabled", font=self._bundle["fonts"]["mono"],
-            padx=6, pady=4,
+        """The Activity panel (PDF-Splitter's design): a short note and Clear Log, then
+        a Summary/Detailed notebook of read-only, monospaced, scrollable logs. Each tab
+        keeps its own history, so switching tabs or appearance loses nothing."""
+        s, m = self._bundle["styles"], self._bundle["metrics"]
+        top = ttk.Frame(self._activity, style=s["surface"])
+        top.grid(row=0, column=0, sticky="ew", pady=(0, m["gap_sm"]))
+        top.columnconfigure(0, weight=1)
+        # Wrapped once, to the room the panel has at the window minimum (_fit_window).
+        # PDF-Splitter re-wraps it on every resize; here a wider wrap would let the note
+        # raise the window's requested width above its measured minimum.
+        self._activity_note = ttk.Label(
+            top, text=ACTIVITY_NOTE, style=s["secondary_label"],
+            wraplength=16 * self._unit(), justify="left",
         )
-        self._log_text.grid(row=0, column=0, sticky="nsew")
-        bar = ttk.Scrollbar(
-            self._activity_body, orient="vertical", command=self._log_text.yview,
-            style=s["vscrollbar"],
+        self._activity_note.grid(row=0, column=0, sticky="w")
+        self._clear_log_btn = ttk.Button(
+            top, text="Clear Log", style=s["button"], command=self.clear_log
         )
-        bar.grid(row=0, column=1, sticky="ns")
-        self._log_text.configure(yscrollcommand=bar.set)
-        self._text_widgets.append((self._log_text, "log"))
+        self._clear_log_btn.grid(row=0, column=1, sticky="ne", padx=(m["gap_md"], 0))
+
+        self._notebook = ttk.Notebook(self._activity, style=s["notebook"])
+        self._notebook.grid(row=1, column=0, sticky="nsew")
+        for title, placeholder in (
+            (SUMMARY_TAB, SUMMARY_PLACEHOLDER), (DETAILED_TAB, DETAILED_PLACEHOLDER)
+        ):
+            page = ttk.Frame(self._notebook, style=s["surface"])
+            page.columnconfigure(0, weight=1)
+            page.rowconfigure(0, weight=1)
+            text = tk.Text(
+                page, width=ACTIVITY_FLOOR_CHARS, height=LOG_FLOOR_LINES, wrap="word",
+                font=self._bundle["fonts"]["mono"], padx=6, pady=4,
+            )
+            text.grid(row=0, column=0, sticky="nsew")
+            bar = ttk.Scrollbar(
+                page, orient="vertical", command=text.yview, style=s["vscrollbar"]
+            )
+            bar.grid(row=0, column=1, sticky="ns")
+            text.configure(
+                yscrollcommand=lambda first, last, view=title, bar=bar:
+                self._on_log_scrolled(view, bar, first, last)
+            )
+            text.insert("1.0", placeholder)
+            text.configure(state="disabled")
+            self._notebook.add(page, text=title)
+            self._log_texts[title] = text
+            self._text_widgets.append((text, "log"))
+            self._enable_native_select_all(text)
+            # A tab filled while hidden opens at its newest line, and a resize (which Tk
+            # makes from the top line) keeps a following view at its newest line.
+            for sequence in ("<Map>", "<Configure>"):
+                text.bind(sequence, lambda _e, view=title: self._keep_following(view))
+
+    def _enable_native_select_all(self, widget: tk.Misc) -> None:
+        """Make Control+A select all text in a log on Windows/Linux, where Tk has no class
+        binding for it (Aqua already maps Command+A). From PDF-Splitter."""
+        if self._platform == "darwin":
+            return
+        for sequence in ("<Control-a>", "<Control-A>"):
+            widget.bind(
+                sequence, lambda _e, w=widget: (w.event_generate("<<SelectAll>>"), "break")[1]
+            )
 
     def _build_status_bar(self) -> None:
         s, m = self._bundle["styles"], self._bundle["metrics"]
@@ -668,6 +762,10 @@ class ScraperApp(tk.Tk):
             # On Aqua the Website menu and the dropdown list stay native.
             appearance.style_tk_widget(self._site_menu, bundle, "menu")
             appearance.style_combobox_popdown(self._novel_combo, bundle)
+        # Warnings and errors are told apart from ordinary lines by colour as well as words.
+        for widget in self._log_texts.values():
+            widget.tag_configure(WARNING, foreground=colors["warning"])
+            widget.tag_configure(ERROR, foreground=colors["danger"])
         other = "Light" if bundle["appearance"] == appearance.DARK else "Dark"
         self._appearance_btn.configure(text=f"{other} mode")
 
@@ -675,7 +773,8 @@ class ScraperApp(tk.Tk):
         self._status_var.set(message)
 
     def _set_log_size(self, *, chars: int, lines: int) -> None:
-        self._log_text.configure(width=chars, height=lines)
+        for text in self._log_texts.values():
+            text.configure(width=chars, height=lines)
 
     def _fit_window(self) -> None:
         """Derive the minimum and default geometry from measured widget sizes
@@ -689,6 +788,12 @@ class ScraperApp(tk.Tk):
         self._site_hint.configure(text=NO_SITE_HINT)
         self._site_hint.grid()
         self._set_log_size(chars=ACTIVITY_FLOOR_CHARS, lines=LOG_FLOOR_LINES)
+        self.update_idletasks()
+        # The Activity note wraps beside Clear Log within the tabs' floor width, so it
+        # never widens the panel.
+        note_room = (self._notebook.winfo_reqwidth() - self._clear_log_btn.winfo_reqwidth()
+                     - int(m["gap_md"]))
+        self._activity_note.configure(wraplength=max(8 * unit, note_room))
         self.update_idletasks()
         left_width = self._left.winfo_reqwidth()
         self._body.columnconfigure(0, weight=0, minsize=left_width)
@@ -942,13 +1047,19 @@ class ScraperApp(tk.Tk):
         self._progress.configure(value=0, maximum=1)
         self._run_status_var.set("Running…")
         self._counts_var.set("—")
-        self._append_log("─" * 50)
-        self._append_log(
-            f"Starting: {spec.novel_title} via {spec.display_name} "
-            f"(chapters {start}-{'all' if end >= ALL_CHAPTERS else end}, "
-            f"{mode.value}{', browser' if use_browser else ''})"
-        )
-        self._append_log(f"Output: {output_dir}")
+        browser = "off"
+        if use_browser:
+            browser = f"on ({'headless' if job.headless else 'visible'} primary)"
+        self._events.report_many(run_activity.run_started_events(
+            novel=spec.novel_title, site=spec.display_name, start=start,
+            end=None if end >= ALL_CHAPTERS else end,
+            grouping=_grouping_text(mode, chunk), output_dir=output_dir,
+            settings=(
+                f"delay {delay:g} s, timeout {timeout} s, browser mode {browser}, "
+                f"HTTP first {'on' if http_first else 'off'}, "
+                f"HTML cache {'on' if job.use_cache else 'off'}."
+            ),
+        ))
 
         # Non-daemon (§4.4): a daemon worker could be killed at interpreter exit
         # before the pipeline's teardown ``finally`` closes the browser / rescue
@@ -1026,62 +1137,155 @@ class ScraperApp(tk.Tk):
     def _run_worker(self, job: ScrapeJob) -> None:
         """Worker-thread body: drive the pipeline. The pipeline now OWNS and tears
         down the request manager(s) itself (§3.15) — the GUI no longer pre-builds
-        one. Every UI touch goes through ``self.after`` via the callbacks, which are
-        no-ops once the window is being destroyed, so a late finish never raises."""
+        one. This thread never touches Tk: the callbacks and the outcome below only
+        enqueue Activity events, which the window's pump draws on the Tk thread. They
+        are refused once the window is destroyed, so a late finish never raises.
+
+        The outcome is read from the pipeline's RunReport (or the exception), never
+        from the progress count, and it is always followed by the run-finished event."""
+        processed: list[tuple[int, int]] = []
+
+        def progress(done: int, total: int) -> None:
+            processed[:] = [(done, total)]
+            self._thread_progress(done, total)
+
+        report = error = refused = None
         try:
-            pipeline.run_scrape(
+            report = pipeline.run_scrape(
                 job,
                 log=self._thread_log,
                 cancel_event=self._cancel_event,
-                progress_cb=self._thread_progress,
+                progress_cb=progress,
             )
         except AdapterDisabledError as exc:
-            self._thread_log(f"Refused: {exc}")
+            refused = exc
         except Exception as exc:  # never let the worker thread die silently
-            self._thread_log(f"ERROR: {exc}")
+            error = exc
         finally:
+            outcome = "failed"
             try:
-                self.after(0, self._on_run_finished)
-            except Exception:
-                pass  # window already closing/destroyed — nothing to update
+                outcome, events = run_activity.outcome_events(
+                    report, processed=processed[0] if processed else None,
+                    error=error, refused=refused,
+                )
+            except Exception as exc:  # noqa: BLE001 - the end of the run must still show
+                events = [ActivityEvent(
+                    run_activity.ORIGIN_RUN,
+                    f"The run outcome could not be summarised: {type(exc).__name__}: {exc}",
+                    ERROR, summary=True,
+                )]
+            for event in events:
+                self._events.emit(event)
+            self._events.emit(run_activity.finished_event(outcome))
 
     def _on_stop(self) -> None:
+        # Show what the run has already said first; it may have just finished.
+        self.flush_activity()
+        if not self._running:
+            return
+        # Reported before the cancel is signalled, so the request always precedes
+        # whatever the stop causes, on screen and in the session log.
+        self._events.report(ActivityEvent(
+            run_activity.ORIGIN_RUN,
+            "Stop requested — finishing the current chapter, then halting…", summary=True,
+        ))
         if self._cancel_event is not None:
             self._cancel_event.set()
-        self._append_log(
-            "Stop requested — finishing the current chapter, then halting…"
-        )
         self._run_status_var.set("Stopping after the current chapter…")
         self._stop_btn.configure(state="disabled")
 
     def _on_run_finished(self) -> None:
-        self._append_log("— run ended —")
+        if self._closing:
+            # The close poll destroys the window once the worker has exited; keep Start
+            # locked rather than offering a new run in the meantime.
+            self._running = False
+            return
         self._set_running(False)
         self._run_status_var.set("Run ended.")
         # The run created its {name}-N folder; refresh the preview so the next run
         # shows the next free -N (still a sibling under the same parent).
         self._refresh_output_preview()
 
-    # ── Thread-safe UI callbacks (called from the worker thread) ─────────────
+    # ── Worker-thread callbacks: enqueue only, never Tk ──────────────────────
     def _thread_log(self, msg: str) -> None:
-        # Marshalled onto the Tk thread; swallow the error if the window has been
-        # destroyed mid-close so a late worker/rescue log line never crashes it.
+        """The pipeline's ``log`` callback (worker or pipeline helper threads). After
+        the window is destroyed the channel refuses the line, so it is a no-op."""
         try:
-            self.after(0, self._append_log, str(msg))
-        except Exception:
+            self._events.emit(run_activity.pipeline_event(str(msg)))
+        except Exception:  # noqa: BLE001 - a log line must never break the scrape
             pass
 
     def _thread_progress(self, done: int, total: int) -> None:
+        """The pipeline's ``progress_cb``; a pending update is replaced by a newer one."""
         try:
-            self.after(0, self._set_progress, done, total)
-        except Exception:
+            self._events.emit(run_activity.progress_event(done, total))
+        except Exception:  # noqa: BLE001
             pass
 
-    def _append_log(self, msg: str) -> None:
-        self._log_text.configure(state="normal")
-        self._log_text.insert("end", msg + "\n")
-        self._log_text.see("end")
-        self._log_text.configure(state="disabled")
+    # ── Activity (Tk thread) ─────────────────────────────────────────────────
+    def _on_job_event(self, event: ActivityEvent) -> None:
+        """Progress and run-finished events, in order with the log lines around them."""
+        payload = event.payload
+        if isinstance(payload, run_activity.ProgressUpdate):
+            self._set_progress(payload.done, payload.total)
+        elif isinstance(payload, run_activity.RunFinished):
+            self._on_run_finished()
+
+    def _render_activity(self, update: RenderUpdate) -> None:
+        """Draw an Activity update into the two read-only views. A view follows new
+        lines while it is scrolled to the end; scrolled up, it stays where it is. Only
+        a visible view can tell (a hidden Text has no real scroll position), so a
+        hidden tab keeps what it was doing when last shown."""
+        if self._shut_down:
+            return
+        for view, lines in ((SUMMARY_TAB, update.summary), (DETAILED_TAB, update.detailed)):
+            if not (lines or update.cleared):
+                continue
+            widget = self._log_texts[view]
+            try:
+                if widget.winfo_ismapped():
+                    self._follow[view] = widget.yview()[1] >= 0.999
+                widget.configure(state="normal")
+                if update.cleared or self._placeholders[view]:
+                    # A clear, or the first real line, replaces the placeholder.
+                    widget.delete("1.0", "end")
+                    self._placeholders[view] = False
+                    self._follow[view] = True
+                for line in lines:
+                    tags = () if line.severity == INFO else (line.severity,)
+                    widget.insert("end", line.text + "\n", tags)
+                overflow = int(widget.index("end-1c").split(".")[0]) - MAX_LOG_LINES
+                if overflow > 0:
+                    widget.delete("1.0", f"{overflow + 1}.0")
+                if self._follow[view]:
+                    widget.see("end")
+                widget.configure(state="disabled")
+            except tk.TclError:
+                return
+
+    def _keep_following(self, view: str) -> None:
+        """A log tab was shown or resized: keep its newest line in view if it is
+        following them (before Tk redraws it, so the follow state survives)."""
+        if not self._shut_down and self._follow[view]:
+            self._log_texts[view].see("end")
+
+    def _on_log_scrolled(self, view: str, bar: ttk.Scrollbar, first: str, last: str) -> None:
+        """The view moved (the user scrolled, or new lines were drawn): update its
+        scrollbar and, while it is visible, whether it is following the end."""
+        bar.set(first, last)
+        if self._log_texts[view].winfo_ismapped():
+            self._follow[view] = float(last) >= 0.999
+
+    def flush_activity(self) -> int:
+        """Tk thread: draw every queued Activity event now (the pump does this on its
+        timer). Returns how many events were routed."""
+        return self._events.pump_all()
+
+    def clear_log(self) -> None:
+        """Clear Log: empty the displayed Summary and Detailed history only. The session
+        log on disk and any running scrape are untouched."""
+        self._events.clear_display()
+        self._set_status("Activity display cleared. The session log on disk is unchanged.")
 
     def _set_progress(self, done: int, total: int) -> None:
         self._progress.configure(maximum=max(total, 1), value=done)
@@ -1123,9 +1327,13 @@ class ScraperApp(tk.Tk):
         worker thread exits. Separated from ``_on_close`` so a test can drive the
         poll loop without the modal confirm dialog."""
         self._closing = True
+        # Reported before the cancel is signalled (see _on_stop).
+        self._events.report(ActivityEvent(
+            run_activity.ORIGIN_RUN,
+            "Closing — waiting for the current chapter to finish…", summary=True,
+        ))
         if self._cancel_event is not None:
             self._cancel_event.set()
-        self._append_log("Closing — waiting for the current chapter to finish…")
         self._run_status_var.set("Closing after the current chapter…")
         # Lock the buttons; the window stays up (responsive) while we wait.
         for btn in (self._stop_btn, self._start_btn):
@@ -1144,6 +1352,31 @@ class ScraperApp(tk.Tk):
             self.destroy()
             return
         self.after(CLOSE_POLL_MS, self._poll_close)
+
+    def _shutdown(self) -> None:
+        """Retire everything that could touch the window later. Idempotent. The worker's
+        final lines are already in the session log (it is written as events are emitted),
+        so closing it here loses nothing; later events are refused."""
+        if self._shut_down:
+            return
+        self._shut_down = True
+        self._pump.stop()
+        self._events.close()  # refuses later events and closes the session log
+
+    def destroy(self) -> None:
+        """Every route that closes the window (idle close, the close poll, tests) comes
+        through here, so the pump never fires on a destroyed window."""
+        self._shutdown()
+        super().destroy()
+
+
+def _grouping_text(mode: OutputMode, chunk: int) -> str:
+    """The grouping as the Activity 'Output' line words it."""
+    if mode is OutputMode.CHUNKED:
+        return f"every {chunk} chapters per PDF"
+    if mode is OutputMode.SINGLE:
+        return "the whole selected range in one PDF"
+    return "one PDF per chapter"
 
 
 def main() -> None:

@@ -26,9 +26,9 @@ reference) lives under `files/` and never ships. The pytest suite is at
 `files/tests/`, its fixtures at `files/test-files/`. The app's own runtime state
 stays inside the repository in designated, gitignored locations under `files/`:
 the HTML cache `files/cache/`, the contained browsers `files/bin/`, and (since
-v0.3.0 Checkpoint 01.1) `files/runtime-data/` for GUI preferences
-(`settings.json`); later checkpoints add session logs and chapter-list overlays
-there (plan §8 C6). Clean module boundaries under `scripts/webnovel_scraper/`:
+v0.3.0) `files/runtime-data/` for GUI preferences (`settings.json`, Checkpoint
+01.1) and one technical log per app session (`logs/session-*.log`, Checkpoint
+02.1); a later checkpoint adds chapter-list overlays there (plan §8 C6). Clean module boundaries under `scripts/webnovel_scraper/`:
 - `models.py` â€” normalized dataclasses (`SiteSpec`, `ChapterMeta`, `ChapterContent`,
   plus `OutputMode` and `ScrapeJob`). **0.2.1:** `ChapterMeta`/`ChapterContent.index`
   mean the site's DISPLAYED chapter number (`int | float`, fractional for FWN's
@@ -110,16 +110,29 @@ there (plan §8 C6). Clean module boundaries under `scripts/webnovel_scraper/`:
   travels on an immutable `ScrapeJob` (`use_browser` / `headless` / `request_timeout` /
   `rescue_workers == 1`) + a per-run `runtime_site_spec` copy; the pipeline owns/replaces
   the active manager (no GUI-prebuilt manager, no mutated catalog row).
-- `ui/` — GUI support only, no scraping (v0.3.0 Checkpoint 01.1): `appearance.py`
-  (compact `Compact.*` ttk styles, Light/Dark palettes, native Aqua branch,
-  in-place switch; adapted from PDF-Splitter) and `settings.py` (validated,
-  atomic `files/runtime-data/settings.json` store; appearance only for now).
-- `app.py` — the tkinter GUI entry point. Since v0.3.0 Checkpoint 01.1 the window
-  has three bordered sections on the left (1. Web Novel Selection, 2. Output
-  Options, 3. Run), the Activity log on the right, a status bar with the
-  Light/Dark toggle, and an Advanced Settings window (delay, timeout, browser,
-  headless, HTTP-first, cache). Its size is measured from the widgets
-  (`_fit_window`), not fixed.
+- `ui/` — GUI support only, no scraping. All four modules are adapted from
+  PDF-Splitter where noted.
+  - `appearance.py` (Checkpoint 01.1, PDF-Splitter): compact `Compact.*` ttk
+    styles, Light/Dark palettes, the native Aqua branch and the in-place switch.
+  - `settings.py` (01.1, PDF-Splitter): the validated, atomic
+    `files/runtime-data/settings.json` store (appearance only for now), plus
+    `LOGS_DIR`.
+  - `activity.py` (02.1, PDF-Splitter, no Tk): structured `ActivityEvent`s, a
+    bounded locked channel, the Summary/Detailed model, the per-session
+    `SessionLog` (written when an event is emitted; DECISIONS.md #006) and the
+    Tk-thread `ActivityPump`.
+  - `run_activity.py` (02.1, no Tk): the run-start lines; a 19-marker table that
+    lifts existing pipeline messages into Summary; and the run outcome built from
+    the pipeline's `RunReport`.
+- `app.py` — the tkinter GUI entry point.
+  - **Layout (since Checkpoint 01.1):** three bordered sections on the left
+    (1. Web Novel Selection, 2. Output Options, 3. Run), the Activity panel on the
+    right, a status bar with the Light/Dark toggle, and an Advanced Settings
+    window (delay, timeout, browser, headless, HTTP-first, cache). Its size is
+    measured from the widgets (`_fit_window`), not fixed.
+  - **Activity (since 02.1):** Summary/Detailed tabs and Clear Log. The scrape
+    worker never calls Tk: it only enqueues events, which an always-on pump on
+    the Tk thread draws.
 Networking never lives in parsers; parsing never lives in the GUI; the PDF builder
 knows nothing about sites. `scripts/verify.py` is the mechanical gate (pytest +
 dependency-pinning + docs-freshness) run before every phase commit; it runs the
@@ -135,9 +148,10 @@ but untagged and unreleased. v0.3.0 is in progress on
 PDF-Splitter-style UI, manifest-first chapter lists, Lord of the Mysteries 1/2 on
 validated `.net`/`.com` sources, and TXT/PDF output. See `handoff.md` and
 `Web-Novel-Scraper-v0.3.0-Implementation-Plan.md` for current state. Checkpoint
-01.1 (Light/Dark UI foundation and the three-section window shell) is complete
-and awaits owner review. The rest of this section describes 0.2.0/0.2.1 as
-built.
+01.1 (Light/Dark UI foundation and the three-section window shell) is complete,
+and so is step 02.1 (Activity Summary/Detailed logging and the thread-safe event
+bridge), which awaits owner review before 02.2. The rest of this section
+describes 0.2.0/0.2.1 as built.
 
 **0.2.0 (Unreleased — implemented, pending the user's manual live test).**
 **Fast-primary + single-lane hard-chapter rescue.** 0.1.3 ran one persistent VISIBLE

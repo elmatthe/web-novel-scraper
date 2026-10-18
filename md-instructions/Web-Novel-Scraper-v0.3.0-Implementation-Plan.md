@@ -1,6 +1,6 @@
 # Web Novel Scraper — v0.3.0 Implementation Plan
 
-**Status:** Approved product requirements. Checkpoint 00 (planning/baseline) complete 2026-10-17 on `feature/v0.3.0-modernization`; Checkpoint 01 step 01.0 (flat `scripts/` layout) complete 2026-10-17; step 01.1 (Light/Dark UI foundation and three-section window shell) complete 2026-10-18 and awaits owner review and the Windows UI visual gate before 02. Technical clarifications from Checkpoint 00 are in §8 and do not change owner decisions.  
+**Status:** Approved product requirements. Checkpoint 00 (planning/baseline) complete 2026-10-17 on `feature/v0.3.0-modernization`; Checkpoint 01 step 01.0 (flat `scripts/` layout) complete 2026-10-17; step 01.1 (Light/Dark UI foundation and three-section window shell) complete 2026-10-18; step 02.1 (Activity Summary/Detailed logging and thread-safe event bridge) complete 2026-10-18 and awaits owner review before 02.2. Technical clarifications from Checkpoint 00 are in §8 and do not change owner decisions.  
 **Created:** 2026-10-14  
 **Planning / review:** ChatGPT; **execution:** Claude Code in the local repository.  
 **Target repository:** `https://github.com/elmatthe/web-novel-scraper`  
@@ -107,6 +107,18 @@ Supersedes the read-only GitHub snapshot above wherever they differ.
 ### 02 — Functional UI, logs and progress (UI/CONTROLLER ONLY)
 - Wire site/novel/range selections, independent format selections (PDF default; TXT may be disabled with explanation until 05), mutually exclusive grouping, source availability, output preview, normal Start/Cancel and explicit Resume affordance. Implement Activity Summary/Detailed + technical logging, styled phase-aware progress, safe thread-pump and persistence. An unimplemented control must be visibly disabled, not pretend to work.
 - **Verify:** UI/controller tests for event ordering, log filtering, no Tk calls off-thread, invalid selections, theme state retention, close/cancel, resize/compact layout, no fabricated successful TXT output. **Second manual UI approval gate**. Do not start checkpoints 03–05 before approval.
+
+- **02.1 Result (2026-10-18): COMPLETE, awaiting owner review.** UI/controller only. No scraper, adapter, pipeline, PDF, cache, catalog, dependency or default changes.
+  - **Activity:** Summary/Detailed `Compact.TNotebook` with Clear Log (display only). Warnings and errors are labelled and coloured in Light and Dark. A view follows new lines unless the user has scrolled up, and each tab keeps its history across tab and appearance switches.
+  - **Event bridge:** new `ui/activity.py`, adapted from the PDF-Splitter local copy (C5). The worker never calls Tk: the pipeline's `log`/`progress_cb` and the outcome only `emit` onto a bounded locked channel, which an always-on Tk-thread `ActivityPump` drains in bounded slices. Progress coalesces; warnings, errors, Summary lines and the run's finish are never dropped. `destroy()` stops the pump and refuses later events.
+  - **Pipeline text:** new `ui/run_activity.py`. 19 literal markers, copied from existing messages and guarded by a source-drift test, lift warnings, recoveries and milestones into Summary; every raw line stays in Detailed.
+  - **Outcome:** built from the returned `RunReport`, never the percentage.
+  - **Session logs:** one per session in ignored `files/runtime-data/logs/` (C6). Written at emit, so the log is complete and in true order (ADR 006). Redacted and capped; a failure is one warning.
+  - **Fixes:** Stop and Close report before signalling cancel.
+  - **Tests:** 90 added; C10 guarantees unchanged and passing; the shell's worker check is stricter.
+  - **Gate:** 437 passed, 0 skipped (three runs); 149 GUI/UI tests pass on 3.12.10; 11/11 mutations caught; startup smoke test passed (session log created and closed).
+  - **Pending:** the Activity visual check and one live run (owner).
+  - **Next (02.2):** phase-aware progress, counts, ETA (`—` when unknown) and run states that tell "100% processed with failures" from "100% successful".
 
 ### 03 — Manifest-first cache and resume architecture
 - Implement per-site tracked baseline manifests in `scripts/` and untracked mutable runtime overlays/cache, provenance, schema and migration, preflight coverage/extend/refresh, chapter identity/offset guards, and safe output allocation/resume journal. Existing site adapters and output behavior remain functional.

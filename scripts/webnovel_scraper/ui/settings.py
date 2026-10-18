@@ -12,7 +12,9 @@ processing, output, content-removal and run groups do not apply here. Later chec
 may add stable ordinary preferences; sensitive browser/session data is never stored.
 
 Settings live in ``files/runtime-data/settings.json`` (ignored by Git, inside the
-repository). This module imports no Tk and performs no I/O at import time.
+repository); the per-session technical logs live beside them in ``files/runtime-data/logs/``
+(``LOGS_DIR``, written by :mod:`webnovel_scraper.ui.activity`). This module imports no Tk
+and performs no I/O at import time.
 """
 
 from __future__ import annotations
@@ -26,7 +28,7 @@ from datetime import datetime
 from pathlib import Path
 
 __all__ = [
-    "REPO_ROOT", "RUNTIME_DIR", "SETTINGS_PATH", "SCHEMA_VERSION",
+    "REPO_ROOT", "RUNTIME_DIR", "SETTINGS_PATH", "LOGS_DIR", "SCHEMA_VERSION",
     "LIGHT", "DARK", "APPEARANCES", "DEFAULT_APPEARANCE",
     "Settings", "LoadResult", "SaveResult", "SettingsStore", "validate_settings",
 ]
@@ -35,6 +37,7 @@ __all__ = [
 REPO_ROOT = Path(__file__).resolve().parents[3]
 RUNTIME_DIR = REPO_ROOT / "files" / "runtime-data"
 SETTINGS_PATH = RUNTIME_DIR / "settings.json"
+LOGS_DIR = RUNTIME_DIR / "logs"
 
 SCHEMA_VERSION = 1
 

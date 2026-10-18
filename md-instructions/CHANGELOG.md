@@ -5,6 +5,90 @@ versioning.
 
 ## [Unreleased] — v0.3.0 (in progress on `feature/v0.3.0-modernization`)
 
+### Added / Changed — Activity Summary/Detailed logging and thread-safe event bridge (Checkpoint 02.1, UI/controller only)
+- **Summary and Detailed Activity tabs with Clear Log** (`scripts/app.py`,
+  PDF-Splitter's Activity design).
+  - **Summary** shows:
+    - the run start: novel and website, chapter range, output and folder;
+    - preparation milestones;
+    - warnings and recoveries;
+    - Stop and Close requests;
+    - the final outcome and counts.
+  - **Detailed** shows all of that plus every existing technical line, unchanged
+    (fetches, retries, cache, browser and recovery, failures, and a traceback for
+    an unexpected error).
+  - Warnings and errors are labelled in words and coloured, in Light and Dark.
+  - Both logs are read-only, monospaced and scrollable. A view follows new lines
+    unless you have scrolled up to read, and a tab opened later starts at its
+    newest line.
+  - Switching tabs or appearance keeps each history and the selected tab.
+  - Clear Log empties the display only.
+- **Run outcome from the run report, not the percentage.** A new
+  `scripts/webnovel_scraper/ui/run_activity.py` turns the pipeline's `RunReport`
+  into the final Summary lines: Completed, Finished with problems (listing failed,
+  not-found and empty chapters), Finished but nothing written, Stopped, Failed
+  (unexpected error), or Refused. A run that processed every chapter but lost some
+  is never called a success. The pipeline's existing text messages reach Summary
+  through a short table of literal markers copied from those messages, guarded by
+  a test that fails if a message is reworded. Every line still reaches Detailed
+  unchanged.
+- **Thread-safe event bridge.** A new `scripts/webnovel_scraper/ui/activity.py` is
+  adapted from PDF-Splitter `scripts/pdf_splitter/activity.py` (the author's local
+  working copy supplied 2026-10-17, newer than GitHub `edcbd4f`), itself from the
+  Audiobook Creation Tool v0.6.6. It provides structured events, a bounded locked
+  channel, a capped display model, the session log and a Tk-thread pump.
+  - **No Tk from the worker.** The scrape worker no longer calls Tk at all, not
+    even `after`: the pipeline's `log`/`progress_cb` callbacks and the outcome
+    only queue events, and the window drains them on its own timer in bounded
+    slices.
+  - **What can be coalesced or dropped.** Progress updates replace each other
+    while queued. Warnings, errors, Summary lines and the run's finish are never
+    dropped; routine detail left out of a flooded display is counted and
+    announced.
+  - **After the window closes,** late events are refused, so nothing touches it.
+  - **Changes from PDF-Splitter:** the session log is written when an event is
+    emitted, not when it is drawn, so it stays complete and in true order (ADR
+    006). A Tk-thread report first shows everything already queued.
+- **Per-session technical logs.** Each window session writes one UTF-8 log under
+  `files/runtime-data/logs/` (gitignored), named `session-YYYYMMDD-HHMMSS.log`.
+  - Each line is timestamped and flushed as written; the log is closed on exit.
+  - It holds message text only: no chapter text, and cookie or authorization
+    values are redacted. Overlong messages are capped.
+  - An unwritable folder or a failed write shows one Summary warning and the
+    scraper carries on.
+  - Clear Log never deletes it.
+- **Behaviour fixes in the run controls:**
+  - Stop and Close now report their request before signalling cancel, so it
+    always appears before what it causes.
+  - A run that ends while the window is closing no longer re-enables Start.
+- **Unchanged:**
+  - the three sections, Light/Dark switching, measured geometry (minimum
+    635×571 at 100%; the tabs add 4 px), Start/Stop, validation and progress;
+  - the Advanced Settings window, output naming and `DEFAULT_HEADLESS = False`;
+  - every scraper, adapter, pipeline and PDF module.
+
+  Not in this step: phase-aware progress and ETA, run-state redesign,
+  website-first selection and Resume Existing Run (later Checkpoint 02 steps).
+- **Tests:** 90 new offline tests in `test_ui_activity.py`,
+  `test_ui_run_activity.py` and `test_ui_activity_panel.py`. They cover:
+  - Summary/Detailed routing and severity;
+  - ordering across threads;
+  - queue capacity and coalescing;
+  - completion under load;
+  - no Tk from the worker (by spy and by source inspection);
+  - Stop and graceful-close order;
+  - nothing after destroy;
+  - session-log naming, redaction, concurrency and failure;
+  - Clear Log keeping the log;
+  - both tabs across Light/Dark;
+  - following new lines;
+  - layout at the minimum size;
+  - a full offline run through the real pipeline.
+
+  `test_ui_shell.py` now reads the two tabs, and its worker check is stricter;
+  `test_phase4_gui.py`/`test_phase8_gui.py` are unchanged. Suite: 437 passed,
+  0 skipped.
+
 ### Added / Changed — Light/Dark UI foundation and window shell (Checkpoint 01.1, UI only)
 - **Light/Dark appearance.** New `scripts/webnovel_scraper/ui/appearance.py`,
   adapted from PDF-Splitter `scripts/pdf_splitter/appearance.py` (the author's

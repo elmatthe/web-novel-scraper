@@ -2,14 +2,16 @@
 measured window geometry, and the unchanged run lifecycle on the new layout.
 
 Offline and deterministic: no network, no real scrape (``pipeline.run_scrape`` is
-replaced), and ``Tk.after`` is replaced where a worker is involved so callbacks run
-when the test drains them, never on the real clock. Every test builds a real window
+replaced). Since Checkpoint 02.1 the worker only enqueues Activity events; a test
+joins the worker and then calls ``flush_activity()`` (what the Tk-thread pump does
+on its timer), so nothing waits on the real clock. Every test builds a real window
 and skips automatically when no Tk display exists (e.g. headless CI). The guarantees
 pinned by ``test_phase4_gui.py`` / ``test_phase8_gui.py`` still run unchanged.
 """
 
 from __future__ import annotations
 
+import gc
 import json
 import sys
 import threading
@@ -20,6 +22,7 @@ import app
 from webnovel_scraper import catalog
 from webnovel_scraper.models import OutputMode
 from webnovel_scraper.ui import settings as ui_settings
+from webnovel_scraper.ui.activity import ActivityEvent
 from webnovel_scraper.ui.appearance import DARK_COLORS
 from webnovel_scraper.ui.settings import SettingsStore
 
@@ -27,6 +30,7 @@ from webnovel_scraper.ui.settings import SettingsStore
 # ── Helpers ──────────────────────────────────────────────────────────────────
 def _make_app(store: SettingsStore | None = None, **kwargs):
     tk = pytest.importorskip("tkinter")
+    gc.collect()  # earlier windows' garbage, on the main thread (see test_ui_activity_panel)
     try:
         return app.ScraperApp(store, **kwargs)
     except tk.TclError as exc:  # no display (headless CI) — not applicable here
@@ -62,32 +66,10 @@ def _entry_for(win, variable):
     return matches[0]
 
 
-class _QueuedAfter:
-    """Stands in for ``Tk.after``: records which thread called it and queues the
-    callback, which the test then runs on the main thread like the real event loop."""
-
-    def __init__(self) -> None:
-        self.calls: list[tuple[str, bool]] = []
-        self._queue: list = []
-        self._lock = threading.Lock()
-
-    def __call__(self, _ms, func=None, *args):
-        with self._lock:
-            self.calls.append(
-                (getattr(func, "__name__", repr(func)),
-                 threading.current_thread() is threading.main_thread())
-            )
-            self._queue.append((func, args))
-        return "after#queued"
-
-    def drain(self) -> None:
-        assert threading.current_thread() is threading.main_thread()
-        while True:
-            with self._lock:
-                if not self._queue:
-                    return
-                func, args = self._queue.pop(0)
-            func(*args)
+def _views(win) -> tuple[str, str]:
+    """The Summary and Detailed Activity text."""
+    return (win._log_texts["Summary"].get("1.0", "end"),
+            win._log_texts["Detailed"].get("1.0", "end"))
 
 
 # ── Shell structure ──────────────────────────────────────────────────────────
@@ -112,7 +94,8 @@ def test_three_numbered_sections_on_the_left_and_activity_on_the_right() -> None
         assert int(win._body.grid_columnconfigure(1)["weight"]) == 1
         assert int(win._body.grid_rowconfigure(0)["weight"]) == 1
         assert str(win._activity.cget("text")) == "Activity"
-        assert _inside(win._log_text, win._activity)
+        assert _inside(win._notebook, win._activity)
+        assert all(_inside(text, win._notebook) for text in win._log_texts.values())
 
         selection, output, run = frames
         for widget in (win._novel_combo, win._site_menubtn, win._site_hint):
@@ -254,7 +237,8 @@ def test_switch_preserves_values_selection_focus_and_widgets(tmp_path) -> None:
         win._chunk_var.set("25")
         win._delay_var.set("4.5")
         win._headless_var.set(True)
-        win._append_log("a line that must survive the switch")
+        win._events.report(
+            ActivityEvent("test", "a line that must survive the switch", summary=True))
         entry = _entry_for(win, win._start_var)
         entry.focus_set()
         entry.selection_range(0, "end")
@@ -267,7 +251,7 @@ def test_switch_preserves_values_selection_focus_and_widgets(tmp_path) -> None:
                 win._chunk_var.get(), win._delay_var.get(), win._timeout_var.get(),
                 win._headless_var.get(), win._browser_var.get(), win._cache_var.get(),
                 win._output_target_var.get(), str(win._chunk_entry.cget("state")),
-                win._log_text.get("1.0", "end"),
+                _views(win),
             )
 
         before = snapshot()
@@ -281,7 +265,8 @@ def test_switch_preserves_values_selection_focus_and_widgets(tmp_path) -> None:
         assert win._style.lookup("Compact.TFrame", "background") == DARK_COLORS["surface"]
         assert str(win.cget("background")) == DARK_COLORS["window"]
         assert str(win._advanced.cget("background")) == DARK_COLORS["window"]
-        assert str(win._log_text.cget("background")) == DARK_COLORS["field"]
+        for text in win._log_texts.values():
+            assert str(text.cget("background")) == DARK_COLORS["field"]
         assert str(win._site_menu.cget("background")) == DARK_COLORS["field"]
         assert str(win._appearance_btn.cget("text")) == "Light mode"
         assert snapshot() == before
@@ -432,7 +417,8 @@ def test_nothing_is_clipped_at_the_minimum_size() -> None:
         bottom = win.winfo_rooty() + win.winfo_height()
         for widget in (*win._sections, win._activity, win._novel_combo, win._site_menubtn,
                        win._browse_btn, win._start_btn, win._stop_btn, win._advanced_btn,
-                       win._progress, win._log_text, win._appearance_btn):
+                       win._progress, win._activity_note, win._clear_log_btn, win._notebook,
+                       win._log_texts["Summary"], win._appearance_btn):
             assert widget.winfo_ismapped(), widget
             assert widget.winfo_rootx() + widget.winfo_width() <= right, widget
             assert widget.winfo_rooty() + widget.winfo_height() <= bottom, widget
@@ -452,7 +438,7 @@ def test_activity_absorbs_extra_width_and_height() -> None:
         left = win._left.winfo_width()
         sections = [s.winfo_width() for s in win._sections]
         activity = (win._activity.winfo_width(), win._activity.winfo_height())
-        log_height = win._log_text.winfo_height()
+        log_height = win._log_texts["Summary"].winfo_height()
 
         win.geometry(f"{min_w + 300}x{min_h + 150}")
         win.update()
@@ -462,7 +448,7 @@ def test_activity_absorbs_extra_width_and_height() -> None:
         assert [s.winfo_width() for s in win._sections] == sections
         assert win._activity.winfo_width() == activity[0] + 300
         assert win._activity.winfo_height() == activity[1] + 150
-        assert win._log_text.winfo_height() > log_height
+        assert win._log_texts["Summary"].winfo_height() > log_height
     finally:
         win.destroy()
 
@@ -514,8 +500,6 @@ def test_maximize_and_restore_keep_the_controls_column_fixed() -> None:
 # ── Run lifecycle on the new shell ───────────────────────────────────────────
 def test_start_and_stop_drive_the_unchanged_run_lifecycle(monkeypatch, tmp_path) -> None:
     win = _make_app()
-    pump = _QueuedAfter()
-    monkeypatch.setattr(win, "after", pump)
     started = threading.Event()
 
     def fake_run_scrape(job, *, log, cancel_event, progress_cb):
@@ -524,6 +508,7 @@ def test_start_and_stop_drive_the_unchanged_run_lifecycle(monkeypatch, tmp_path)
         started.set()
         cancel_event.wait(5)
         log("stopped cleanly")
+        return app.pipeline.RunReport(output_dir=job.output_dir, cancelled=cancel_event.is_set())
 
     monkeypatch.setattr(app.pipeline, "run_scrape", fake_run_scrape)
     try:
@@ -536,10 +521,11 @@ def test_start_and_stop_drive_the_unchanged_run_lifecycle(monkeypatch, tmp_path)
         assert win._run_status_var.get() == "Running…"
         assert all(str(w.cget("state")) == "disabled" for w, _ in win._locked_inputs)
 
-        pump.drain()
-        log = win._log_text.get("1.0", "end")
-        assert "Starting: Shadow Slave via Free Web Novel" in log
-        assert "fetching chapter 1" in log
+        win.flush_activity()  # what the Tk-thread pump does on its timer
+        summary, detailed = _views(win)
+        assert "Run started: Shadow Slave from Free Web Novel." in summary
+        assert "fetching chapter 1" in detailed
+        assert "fetching chapter 1" not in summary  # a routine line is Detailed only
         assert win._counts_var.get() == "1 / 5 chapters"
         assert float(str(win._progress.cget("value"))) == 1.0
         assert float(str(win._progress.cget("maximum"))) == 5.0
@@ -551,13 +537,15 @@ def test_start_and_stop_drive_the_unchanged_run_lifecycle(monkeypatch, tmp_path)
         win._worker.join(5)
         assert not win._worker.is_alive()
 
-        pump.drain()
+        win.flush_activity()
         assert win._running is False
         assert str(win._start_btn.cget("state")) == "normal"
         assert all(str(w.cget("state")) == normal for w, normal in win._locked_inputs)
         assert win._run_status_var.get() == "Run ended."
-        log = win._log_text.get("1.0", "end")
-        assert "stopped cleanly" in log and "— run ended —" in log
+        summary, detailed = _views(win)
+        assert "Stop requested" in summary
+        assert "Stopped before the end of the selected range, as requested." in summary
+        assert "stopped cleanly" in detailed and "— run ended —" in detailed
     finally:
         if win._cancel_event is not None:
             win._cancel_event.set()
@@ -567,11 +555,11 @@ def test_start_and_stop_drive_the_unchanged_run_lifecycle(monkeypatch, tmp_path)
 
 
 def test_worker_thread_never_touches_tk(monkeypatch, tmp_path) -> None:
-    """Every UI update from the worker goes through the marshalling ``after``; no
-    widget or Tk variable is touched off the main thread, including on the error path."""
+    """The worker only enqueues Activity events: it never calls ``after`` or any other
+    Tk method, and no widget or Tk variable is touched off the main thread, including
+    on the error path. (Checkpoint 01 still let the worker schedule three callbacks
+    through ``after``; since 02.1 even that is gone, so this check is stricter.)"""
     win = _make_app()
-    pump = _QueuedAfter()
-    monkeypatch.setattr(win, "after", pump)
     touched: list[tuple[str, bool]] = []
 
     def spy(obj, name: str) -> None:
@@ -583,10 +571,13 @@ def test_worker_thread_never_touches_tk(monkeypatch, tmp_path) -> None:
 
         monkeypatch.setattr(obj, name, wrapper)
 
-    for obj, name in ((win._log_text, "insert"), (win._log_text, "configure"),
-                      (win._progress, "configure"), (win._start_btn, "configure"),
-                      (win._stop_btn, "configure"), (win._counts_var, "set"),
-                      (win._run_status_var, "set")):
+    targets = [(win, "after"), (win, "after_idle"), (win, "event_generate"),
+               (win._progress, "configure"), (win._start_btn, "configure"),
+               (win._stop_btn, "configure"), (win._counts_var, "set"),
+               (win._run_status_var, "set")]
+    targets += [(text, method) for text in win._log_texts.values()
+                for method in ("insert", "configure", "delete", "see")]
+    for obj, name in targets:
         spy(obj, name)
 
     def fake_run_scrape(job, *, log, cancel_event, progress_cb):
@@ -601,15 +592,16 @@ def test_worker_thread_never_touches_tk(monkeypatch, tmp_path) -> None:
         win._on_start()
         win._worker.join(5)
         assert not win._worker.is_alive()
-
-        from_worker = {name for name, on_main in pump.calls if not on_main}
-        assert from_worker == {"_append_log", "_set_progress", "_on_run_finished"}
+        # Start's own updates only, all on the main thread; nothing from the worker.
         assert touched and all(on_main for _, on_main in touched)
 
         touched.clear()
-        pump.drain()
+        win.flush_activity()
         assert touched and all(on_main for _, on_main in touched)
-        assert "ERROR: boom" in win._log_text.get("1.0", "end")
+        summary, detailed = _views(win)
+        assert ("Error: The run stopped because of an unexpected error: RuntimeError: boom"
+                in summary)
+        assert "Traceback (most recent call last)" in detailed
         assert win._counts_var.get() == "3 / 3 chapters"
         assert win._running is False
     finally:

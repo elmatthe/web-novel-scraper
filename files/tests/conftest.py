@@ -27,11 +27,13 @@ if str(_SCRIPTS) not in sys.path:
 
 @pytest.fixture(autouse=True)
 def _isolated_gui_settings(tmp_path, monkeypatch):
-    """Point the GUI preferences file at this test's temp folder, so a window built
-    without an explicit store (``app.ScraperApp()``) never reads or writes the real
-    ``files/runtime-data/settings.json`` (v0.3.0 Checkpoint 01)."""
+    """Point the GUI preferences file and session-log folder at this test's temp
+    folder, so a window built without explicit paths (``app.ScraperApp()``) never
+    reads or writes the real ``files/runtime-data/settings.json`` (v0.3.0 Checkpoint
+    01) or ``files/runtime-data/logs/`` (Checkpoint 02.1)."""
     from webnovel_scraper.ui import settings as ui_settings
 
     monkeypatch.setattr(
         ui_settings, "SETTINGS_PATH", tmp_path / "runtime-data" / "settings.json"
     )
+    monkeypatch.setattr(ui_settings, "LOGS_DIR", tmp_path / "runtime-data" / "logs")
