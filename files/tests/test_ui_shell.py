@@ -113,17 +113,19 @@ def test_three_numbered_sections_on_the_left_and_activity_on_the_right() -> None
         win.destroy()
 
 
-def test_selection_keeps_the_existing_novel_and_website_behaviour() -> None:
+def test_selection_is_website_first_and_keeps_the_existing_catalog_behaviour() -> None:
     win = _make_app()
     try:
-        assert win._current_slug() == win._novel_slugs[0]
+        # Website comes first, then Novel, then the chapter range (02.3).
+        assert win._site_menubtn.grid_info()["row"] < win._novel_combo.grid_info()["row"]
+        assert win._website_var.get() == "freewebnovel.com"
+        assert win._current_slug() == "shadow-slave"
+        assert str(win._site_menubtn.cget("text")) == "Free Web Novel"
         menu = win._site_menu
         entries = [
             (str(menu.entrycget(i, "label")), str(menu.entrycget(i, "state")))
             for i in range(menu.index("end") + 1)
         ]
-        assert win._site_key.get() == "freewebnovel"
-        assert str(win._site_menubtn.cget("text")) == "Free Web Novel"
         stubs = [state for label, state in entries if label.endswith("(coming soon)")]
         assert stubs and all(state == "disabled" for state in stubs)
         assert str(win._start_btn.cget("state")) == "normal"
@@ -131,9 +133,10 @@ def test_selection_keeps_the_existing_novel_and_website_behaviour() -> None:
         assert win._site_hint.grid_info() == {}  # hidden: there is a runnable site
 
         # The Noble Queen runs over plain HTTP, so the browser options are inert.
-        win._novel_combo.current(win._novel_slugs.index("the-noble-queen"))
-        win._on_novel_change()
-        assert win._site_key.get() == "webnovel_dynamic"
+        win._website_var.set("dynamic.webnovel.com")
+        win._on_website_change()
+        assert win._current_slug() == "the-noble-queen"
+        assert win._current_spec().adapter_key == "webnovel_dynamic"
         assert str(win._browser_check.cget("state")) == "disabled"
         assert str(win._headless_check.cget("state")) == "disabled"
         assert str(win._start_btn.cget("state")) == "normal"
@@ -141,14 +144,13 @@ def test_selection_keeps_the_existing_novel_and_website_behaviour() -> None:
         win.destroy()
 
 
-def test_no_runnable_site_shows_the_hint_and_blocks_start(monkeypatch) -> None:
+def test_no_runnable_site_shows_the_hint_and_blocks_start() -> None:
     win = _make_app()
     try:
-        slug = win._current_slug()
-        disabled_only = [s for s in catalog.get_adapters_for_novel(slug) if not s.enabled]
-        monkeypatch.setattr(app.catalog, "get_adapters_for_novel", lambda _slug: disabled_only)
-        win._on_novel_change()
-        assert win._site_key.get() == ""
+        disabled_only = [s for s in catalog.all_specs() if not s.enabled]
+        win._load_catalog(disabled_only)
+        assert win._website_var.get() == ""
+        assert win._current_spec() is None
         assert win._site_hint.grid_info() != {}
         assert str(win._site_hint.cget("text")) == app.NO_SITE_HINT
         assert str(win._start_btn.cget("state")) == "disabled"
@@ -227,8 +229,8 @@ def test_advanced_settings_window_keeps_every_existing_control() -> None:
 def test_switch_preserves_values_selection_focus_and_widgets(tmp_path) -> None:
     win = _make_app(_store(tmp_path))
     try:
-        win._novel_combo.current(2)
-        win._on_novel_change()
+        win._website_var.set("dynamic.webnovel.com")
+        win._on_website_change()
         win._start_var.set("5")
         win._end_var.set("9")
         win._folder_name_var.set("my-run")
@@ -246,7 +248,7 @@ def test_switch_preserves_values_selection_focus_and_widgets(tmp_path) -> None:
 
         def snapshot():
             return (
-                win._novel_combo.current(), win._site_key.get(), win._start_var.get(),
+                win._novel_combo.current(), win._website_var.get(), win._start_var.get(),
                 win._end_var.get(), win._folder_name_var.get(), win._mode_var.get(),
                 win._chunk_var.get(), win._delay_var.get(), win._timeout_var.get(),
                 win._headless_var.get(), win._browser_var.get(), win._cache_var.get(),

@@ -27,6 +27,16 @@ Run section (v0.3.0 Checkpoint 02.2; :mod:`webnovel_scraper.ui.run_progress`): a
 the monotonic clock; the final state comes from the returned ``RunReport``, never from the
 percentage, and nothing that arrives after the run's end can change it.
 
+Website-first selection and preferences (v0.3.0 Checkpoint 02.3;
+:mod:`webnovel_scraper.ui.selection`, :mod:`webnovel_scraper.ui.settings`): Section 1 asks for
+the Website first, then a Novel that website can run, both taken from the unchanged catalog;
+Start still passes the resolved catalog row's novel and adapter to the pipeline. The stable
+choices (website and novel, grouping, chunk size, delay, timeout, the browser, headless,
+HTTP-first and cache switches) are restored from the settings file at start-up and saved at
+discrete moments (a selection or grouping change, closing Advanced Settings, Start, closing the
+window) — never per keystroke. "Resume Existing Run" is shown disabled; it does nothing until
+Checkpoint 03 provides the validation it needs.
+
 Defense in depth on disabled sites: the catalog greys them in the Website menu and
 Start cannot dispatch one (this file), the pipeline refuses a disabled row
 before building an adapter, and the stub adapter raises as a final backstop.
@@ -58,6 +68,7 @@ from __future__ import annotations
 import sys
 import threading
 import tkinter as tk
+from dataclasses import replace
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from tkinter import font as tkfont
@@ -70,7 +81,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from webnovel_scraper import catalog, pipeline  # noqa: E402
 from webnovel_scraper.models import OutputMode, ScrapeJob  # noqa: E402
 from webnovel_scraper.registry import AdapterDisabledError  # noqa: E402
-from webnovel_scraper.ui import appearance, run_activity, run_progress  # noqa: E402
+from webnovel_scraper.ui import appearance, run_activity, run_progress, selection  # noqa: E402
 from webnovel_scraper.ui import settings as ui_settings  # noqa: E402
 from webnovel_scraper.ui.activity import (  # noqa: E402
     ERROR, INFO, WARNING, Activity, ActivityEvent, ActivityPump, RenderUpdate, SessionLog,
@@ -127,7 +138,12 @@ GROUPING_LABELS = {
     OutputMode.CHUNKED: "Every",  # followed by the chapters-per-PDF field
 }
 FORMAT_NOTE = "(TXT not available yet)"
-NO_SITE_HINT = "All sources for this novel are coming soon — nothing to run yet."
+NO_SITE_HINT = "No website is available yet — nothing to run."
+NO_WEBSITE_TEXT = "(no website available)"
+# Resume Existing Run (Checkpoint 03 builds it): shown so the final layout is visible, kept
+# disabled and wired to nothing, so it can neither start a normal scrape nor reuse a folder.
+RESUME_LABEL = "Resume Existing Run"
+RESUME_NOTE = "Available after resume support is implemented."
 FOLDER_HINT = "Blank = novel name. A number is added so nothing is overwritten."
 BROWSER_HINT = "Opens a visible browser window, which clears Cloudflare."
 # The accurate Headless description (0.2.0 §4.2): the breaker may switch a headless
@@ -146,12 +162,18 @@ SUMMARY_TAB = "Summary"
 DETAILED_TAB = "Detailed"
 ACTIVITY_NOTE = "Summary: progress and results.\nDetailed: every step."
 SUMMARY_PLACEHOLDER = (
-    "Choose a novel and a website, then press Start.\n"
+    "Choose a website and a novel, then press Start.\n"
     "Run milestones, warnings and results will appear here.\n"
 )
 DETAILED_PLACEHOLDER = "Technical details (fetches, retries, cache, browser) will appear here.\n"
 # Lines kept in each displayed view; older lines scroll away (the session log keeps all).
 MAX_LOG_LINES = 5000
+
+# The longest final counter line (every counter present, large numbers) and the widest ETA,
+# used only to reserve room in the measured minimum window size.
+WORST_CASE_DETAIL = run_progress.format_final_counts(run_progress.FinalCounts(
+    pdfs=9999, already_present=999, failed=999, recovered=999, not_listed=999))
+WIDEST_ETA = "ETA: 99 h 59 min"
 
 # Sizing intents, expressed in characters / lines (never pixels).
 NOVEL_FIELD_CHARS = 28
@@ -201,6 +223,9 @@ class ScraperApp(tk.Tk):
         # Classic Tk widgets ttk styles cannot reach, with their appearance role.
         self._text_widgets: list[tuple[tk.Text, str]] = []
         self.geometry_info: dict[str, object] = {}
+        # Room (px) the Run section's counters may wrap into; measured in ``_fit_window``.
+        self._run_interior = 16 * self._unit()
+        self._eta_reserve = 0
         # The two Activity views, whether each still shows its placeholder, and whether
         # each follows new lines (it stops while the user reads further up).
         self._log_texts: dict[str, tk.Text] = {}
@@ -227,8 +252,20 @@ class ScraperApp(tk.Tk):
             self._events, self.after, self.after_cancel, lambda: True, always_on=True
         )
 
-        # Novel slug list in catalog order; titles for display.
-        self._novel_slugs = catalog.all_novel_slugs()
+        # The catalog rows the Website and Novel choices are built from (read once, so a
+        # test can substitute a catalog with ``_load_catalog``), the websites they define,
+        # and the novels the chosen website offers.
+        self._specs: list = []
+        self._websites: list[selection.Website] = []
+        self._novels: list[selection.NovelChoice] = []
+        # Set once a save has failed, so the status bar names the problem only once.
+        self._prefs_warned = False
+        # Menu positions of the "coming soon" websites (see ``_style_unavailable_entries``).
+        self._unavailable_entries: list[int] = []
+        # Whether the user has chosen a website or novel this session. Until then the saved
+        # choice (possibly empty, or no longer runnable) is left exactly as it is, so merely
+        # opening and closing the window rewrites nothing.
+        self._selection_chosen = False
 
         # The chosen output PARENT directory. Defaults to ~/Downloads and is only
         # ever changed by the Browse… picker — never by a resolved output dir, so a
@@ -238,8 +275,7 @@ class ScraperApp(tk.Tk):
         self._output_parent: Path = DEFAULT_OUTPUT_PARENT
 
         self._build_ui()
-        self._novel_combo.current(0)
-        self._on_novel_change()
+        self._restore_preferences()
         self._apply_bundle(self._bundle)
         self._fit_window()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -360,38 +396,29 @@ class ScraperApp(tk.Tk):
         s, m = self._bundle["styles"], self._bundle["metrics"]
         row_pad = (m["gap_sm"], 0)
 
-        # Novel dropdown. A fixed character width: a long title never widens the window.
-        self._field_label(frame, "Novel", 0)
-        self._novel_combo = ttk.Combobox(
-            frame,
-            state="readonly",
-            style=s["combobox"],
-            width=NOVEL_FIELD_CHARS,
-            values=[
-                catalog.get_adapters_for_novel(slug)[0].novel_title
-                for slug in self._novel_slugs
-            ],
-        )
-        self._novel_combo.grid(row=0, column=1, sticky="ew")
-        self._novel_combo.bind(
-            "<<ComboboxSelected>>", lambda _e: self._on_novel_change()
-        )
-
-        # Website selector (a Menubutton + Menu so individual disabled sites can be
-        # greyed and made non-selectable — a Combobox can't disable single items).
-        # It lists the sites for the selected novel, so it sits below Novel.
-        self._field_label(frame, "Website", 1)
-        self._site_key = tk.StringVar(value="")
-        # A fixed character width, like the Novel field: a long site name is clipped
-        # inside the picker and never widens the window.
+        # Website selector (a Menubutton + Menu so individual disabled websites can be
+        # greyed and made non-selectable — a Combobox can't disable single items). The
+        # website comes first: it decides which novels can be offered below it. A fixed
+        # character width: a long website name is clipped and never widens the window.
+        self._field_label(frame, "Website", 0)
+        self._website_var = tk.StringVar(value="")
         self._site_menubtn = ttk.Menubutton(
-            frame, text="(select a novel)", style=s["menubutton"], width=NOVEL_FIELD_CHARS
+            frame, text=NO_WEBSITE_TEXT, style=s["menubutton"], width=NOVEL_FIELD_CHARS
         )
         self._site_menu = tk.Menu(self._site_menubtn, tearoff=0)
         self._site_menubtn["menu"] = self._site_menu
-        self._site_menubtn.grid(row=1, column=1, sticky="ew", pady=row_pad)
+        self._site_menubtn.grid(row=0, column=1, sticky="ew")
 
-        # Shown only when the novel has no runnable site (gridded on demand).
+        # Novel dropdown: only the novels the chosen website can run. A fixed character
+        # width: a long title never widens the window.
+        self._field_label(frame, "Novel", 1)
+        self._novel_combo = ttk.Combobox(
+            frame, state="readonly", style=s["combobox"], width=NOVEL_FIELD_CHARS, values=[],
+        )
+        self._novel_combo.grid(row=1, column=1, sticky="ew", pady=row_pad)
+        self._novel_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_novel_change())
+
+        # Shown only when no website can run (gridded on demand).
         self._site_hint = self._note(frame, "", "warning_label")
         self._site_hint.grid(row=2, column=0, columnspan=2, sticky="w", pady=(m["gap_xs"], 0))
         self._site_hint.grid_remove()
@@ -450,13 +477,13 @@ class ScraperApp(tk.Tk):
         rb_sep = ttk.Radiobutton(
             frame, text=GROUPING_LABELS[OutputMode.SEPARATE],
             value=OutputMode.SEPARATE.value, variable=self._mode_var,
-            command=self._on_mode_change, style=s["radiobutton"],
+            command=self._on_grouping_picked, style=s["radiobutton"],
         )
         rb_sep.grid(row=1, column=1, sticky="w", pady=(m["gap_sm"], 0))
         rb_single = ttk.Radiobutton(
             frame, text=GROUPING_LABELS[OutputMode.SINGLE],
             value=OutputMode.SINGLE.value, variable=self._mode_var,
-            command=self._on_mode_change, style=s["radiobutton"],
+            command=self._on_grouping_picked, style=s["radiobutton"],
         )
         rb_single.grid(row=2, column=1, sticky="w")
         chunk_row = ttk.Frame(frame, style=s["surface"])
@@ -464,7 +491,7 @@ class ScraperApp(tk.Tk):
         rb_chunk = ttk.Radiobutton(
             chunk_row, text=GROUPING_LABELS[OutputMode.CHUNKED],
             value=OutputMode.CHUNKED.value, variable=self._mode_var,
-            command=self._on_mode_change, style=s["radiobutton"],
+            command=self._on_grouping_picked, style=s["radiobutton"],
         )
         rb_chunk.grid(row=0, column=0, sticky="w")
         self._chunk_var = tk.StringVar(value=DEFAULT_CHUNK)
@@ -539,7 +566,7 @@ class ScraperApp(tk.Tk):
             frame, mode="determinate", maximum=1, style=s["progressbar"]
         )
         self._progress.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(m["gap_md"], 0))
-        info = ttk.Frame(frame, style=s["surface"])
+        info = self._run_info = ttk.Frame(frame, style=s["surface"])
         info.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(m["gap_xs"], 0))
         info.columnconfigure(0, weight=1)
         # Two compact rows (PDF-Splitter's status / counts / ETA, split so each fits the
@@ -554,14 +581,35 @@ class ScraperApp(tk.Tk):
         self._counts_label = ttk.Label(info, textvariable=self._counts_var,
                                        style=s["secondary_label"])
         self._counts_label.grid(row=0, column=1, sticky="e", padx=(m["gap_md"], 0))
+        # The counters wrap onto further lines instead of clipping (the worst case is
+        # reserved in the measured minimum height, see ``_fit_window``). While an ETA is
+        # showing the counters share its row; once the run has ended it is blank and they
+        # use the full width (``_render_run``).
         self._detail_var = tk.StringVar(value="")
         self._detail_label = ttk.Label(
-            info, textvariable=self._detail_var, style=s["secondary_label"], width=1
+            info, textvariable=self._detail_var, style=s["secondary_label"],
+            wraplength=16 * self._unit(), justify="left", anchor="nw",
         )
-        self._detail_label.grid(row=1, column=0, sticky="ew")
+        self._detail_label.grid(row=1, column=0, sticky="nw")
         self._eta_var = tk.StringVar(value=run_progress.format_eta(None))
         self._eta_label = ttk.Label(info, textvariable=self._eta_var, style=s["secondary_label"])
-        self._eta_label.grid(row=1, column=1, sticky="e", padx=(m["gap_md"], 0))
+        self._eta_label.grid(row=1, column=1, sticky="ne", padx=(m["gap_md"], 0))
+
+        # Resume Existing Run: the intended control in its final place, disabled and wired
+        # to nothing until Checkpoint 03 adds the validation resuming needs. It must never
+        # start an ordinary scrape or reuse a folder in the meantime.
+        resume = ttk.Frame(frame, style=s["surface"])
+        resume.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(m["gap_md"], 0))
+        resume.columnconfigure(1, weight=1)
+        self._resume_btn = ttk.Button(
+            resume, text=RESUME_LABEL, state="disabled", style=s["button"]
+        )
+        self._resume_btn.grid(row=0, column=0, sticky="nw")
+        self._resume_note = ttk.Label(
+            resume, text=RESUME_NOTE, style=s["secondary_label"],
+            wraplength=8 * self._unit(), justify="left",
+        )
+        self._resume_note.grid(row=0, column=1, sticky="w", padx=(m["gap_md"], 0))
         return e_folder
 
     def _build_activity(self) -> None:
@@ -783,6 +831,7 @@ class ScraperApp(tk.Tk):
             # On Aqua the Website menu and the dropdown list stay native.
             appearance.style_tk_widget(self._site_menu, bundle, "menu")
             appearance.style_combobox_popdown(self._novel_combo, bundle)
+            self._style_unavailable_entries()
         # Warnings and errors are told apart from ordinary lines by colour as well as words.
         for widget in self._log_texts.values():
             widget.tag_configure(WARNING, foreground=colors["warning"])
@@ -804,10 +853,15 @@ class ScraperApp(tk.Tk):
         m = self._bundle["metrics"]
         hint_text = str(self._site_hint.cget("text"))
 
-        # Minimum: the log at its floor and the no-site hint shown, so showing that
-        # hint later can never clip the Run section.
+        # Minimum: the log at its floor, the no-site hint shown and the longest final
+        # counter line (wrapped) in place, so showing either later can never clip the Run
+        # section. The ETA text is measured at its widest to know how much room the
+        # counters share a row with while a run is going.
         self._site_hint.configure(text=NO_SITE_HINT)
         self._site_hint.grid()
+        detail_text, eta_text = self._detail_var.get(), self._eta_var.get()
+        self._detail_var.set(WORST_CASE_DETAIL)
+        self._eta_var.set(WIDEST_ETA)
         self._set_log_size(chars=ACTIVITY_FLOOR_CHARS, lines=LOG_FLOOR_LINES)
         self.update_idletasks()
         # The Activity note wraps beside Clear Log within the tabs' floor width, so it
@@ -822,10 +876,21 @@ class ScraperApp(tk.Tk):
         interior = left_width - 2 * (int(m["card_pad"]) + int(m["border_width"]) + 1)
         for label in self._wrap_labels:
             label.configure(wraplength=max(8 * unit, interior))
+        self._run_interior = interior
+        self._eta_reserve = self._eta_label.winfo_reqwidth() + int(m["gap_md"])
+        self._wrap_run_detail(with_eta=False)
+        # Hold that row's height in every state, so nothing below it moves when the
+        # counters appear or wrap.
+        self.update_idletasks()
+        self._run_info.rowconfigure(1, minsize=self._detail_label.winfo_reqheight())
+        self._resume_note.configure(wraplength=max(
+            6 * unit, interior - self._resume_btn.winfo_reqwidth() - int(m["gap_md"])))
         self.update_idletasks()
         min_width, min_height = self.winfo_reqwidth(), self.winfo_reqheight()
 
         # Default: a roomier log; the hint as the current selection needs it.
+        self._detail_var.set(detail_text)
+        self._eta_var.set(eta_text)
         self._set_site_hint(hint_text)
         self._set_log_size(chars=ACTIVITY_PREFERRED_CHARS, lines=LOG_PREFERRED_LINES)
         self.update_idletasks()
@@ -872,57 +937,107 @@ class ScraperApp(tk.Tk):
 
     def close_advanced_settings(self) -> None:
         self._advanced.withdraw()
+        self._save_preferences()  # the one moment its values are known to be settled
 
     # ── Selection handlers ───────────────────────────────────────────────────
     def _current_slug(self) -> str:
+        """The selected novel's slug, or "" when the website offers no novel."""
         idx = self._novel_combo.current()
-        return self._novel_slugs[idx if idx >= 0 else 0]
+        if not self._novels:
+            return ""
+        return self._novels[idx if 0 <= idx < len(self._novels) else 0].slug
 
     def _current_spec(self):
-        """The resolved SiteSpec for the current novel+site, or None if no
-        enabled site is selected."""
-        key = self._site_key.get()
+        """The catalog row for the current website and novel, or None when there is no
+        runnable combination. This row, and nothing the screen merely displays, is what
+        Start passes on."""
+        key = self._website_var.get()
         if not key:
             return None
-        try:
-            return catalog.get_spec(self._current_slug(), key)
-        except KeyError:
-            return None
+        return selection.resolve(key, self._current_slug(), self._specs)
 
-    def _on_novel_change(self) -> None:
-        """Repopulate the Website menu for the newly selected novel."""
+    def _load_catalog(self, specs, website: str = "", novel: str = "") -> None:
+        """Build the Website menu from *specs* (the unchanged catalog rows) and settle on
+        the nearest valid (website, novel) to the one asked for; no preference is saved."""
+        self._specs = list(specs)
+        self._websites = selection.websites(self._specs)
         self._site_menu.delete(0, "end")
-        specs = catalog.get_adapters_for_novel(self._current_slug())
-        first_enabled: str | None = None
-        for spec in specs:
-            if spec.enabled:
+        self._unavailable_entries = []
+        for site in self._websites:
+            if site.enabled:
                 self._site_menu.add_radiobutton(
-                    label=spec.display_name,
-                    value=spec.adapter_key,
-                    variable=self._site_key,
-                    command=self._on_site_change,
+                    label=site.label, value=site.key, variable=self._website_var,
+                    command=self._on_website_change,
                 )
-                if first_enabled is None:
-                    first_enabled = spec.adapter_key
             else:
                 # Greyed + non-selectable: visible but unrunnable.
                 self._site_menu.add_command(
-                    label=f"{spec.display_name} (coming soon)", state="disabled"
+                    label=f"{site.label} (coming soon)", state="disabled", command=_ignore
                 )
-        self._site_key.set(first_enabled or "")
-        self._on_site_change()
-        self._refresh_output_preview()
+                self._unavailable_entries.append(self._site_menu.index("end"))
+        self._style_unavailable_entries()
+        self._select(website, novel)
 
-    def _on_site_change(self) -> None:
-        spec = self._current_spec()
-        if spec is not None:
-            self._site_menubtn.configure(text=spec.display_name)
-            self._set_site_hint("")
+    def _style_unavailable_entries(self) -> None:
+        """Keep the "coming soon" entries clearly dimmer than the real choices. Windows draws
+        a disabled menu entry embossed, which in Dark mode reads brighter and bolder than an
+        enabled one, so there (Dark only) they are drawn as dim entries that do nothing when
+        chosen; everywhere else they are ordinary disabled entries."""
+        colors = self._bundle["colors"]
+        dim = (self._platform == "win32" and self._bundle.get("ttk_active")
+               and self._bundle["appearance"] == appearance.DARK)
+        for index in self._unavailable_entries:
+            if dim:
+                self._site_menu.entryconfigure(
+                    index, state="normal", foreground=colors["disabled"],
+                    activeforeground=colors["disabled"], activebackground=colors["field"],
+                )
+            else:
+                self._site_menu.entryconfigure(
+                    index, state="disabled", foreground="", activeforeground="",
+                    activebackground="",
+                )
+
+    def _select(self, website: str, novel: str) -> None:
+        """Show the nearest valid (website, novel) to the one asked for: a website that
+        cannot run gives way to the first that can, and the novel is kept if that website
+        offers it (otherwise its first). Refreshes everything that depends on the choice."""
+        pair = selection.settle(website, novel, self._specs)
+        if pair is None:
+            self._website_var.set("")
+            self._novels = []
+            self._novel_combo.configure(values=[])
+            self._novel_combo.set("")
         else:
-            self._site_menubtn.configure(text="(no site available)")
-            self._set_site_hint(NO_SITE_HINT)
+            self._website_var.set(pair[0])
+            self._novels = selection.novels_for(pair[0], self._specs)
+            self._novel_combo.configure(values=[n.title for n in self._novels])
+            self._novel_combo.current(
+                next(i for i, n in enumerate(self._novels) if n.slug == pair[1])
+            )
+        self._on_selection_changed()
+
+    def _on_website_change(self) -> None:
+        """A website was picked: keep the novel if it offers it, else its first novel."""
+        self._selection_chosen = True
+        self._select(self._website_var.get(), self._current_slug())
+        self._save_preferences()
+
+    def _on_novel_change(self) -> None:
+        """A novel was picked from the list of the current website."""
+        self._selection_chosen = True
+        self._select(self._website_var.get(), self._current_slug())
+        self._save_preferences()
+
+    def _on_selection_changed(self) -> None:
+        """Refresh everything the (website, novel) choice decides."""
+        spec = self._current_spec()
+        site = next((w for w in self._websites if w.key == self._website_var.get()), None)
+        self._site_menubtn.configure(text=site.label if site else NO_WEBSITE_TEXT)
+        self._set_site_hint("" if spec is not None else NO_SITE_HINT)
         self._refresh_browser_state()
         self._refresh_start_state()
+        self._refresh_output_preview()
 
     def _set_site_hint(self, text: str) -> None:
         """Show the hint only when it has something to say (its row is reserved in
@@ -936,6 +1051,11 @@ class ScraperApp(tk.Tk):
     def _on_mode_change(self) -> None:
         chunked = self._mode_var.get() == OutputMode.CHUNKED.value
         self._chunk_entry.configure(state="normal" if chunked else "disabled")
+
+    def _on_grouping_picked(self) -> None:
+        """A grouping radio button was chosen (not merely refreshed)."""
+        self._on_mode_change()
+        self._save_preferences()
 
     def _resolve_output_dir(self) -> Path:
         """Resolve the output dir from the current parent + name. The single place
@@ -951,11 +1071,15 @@ class ScraperApp(tk.Tk):
     def _refresh_output_preview(self) -> None:
         """Update the read-only target display to where this run would write. This
         is display-only — the resolved target is NEVER passed back as a parent."""
+        slug = self._current_slug()
+        if not slug:  # nothing selected, so nothing would be written
+            self._output_target_var.set("")
+            return
         try:
             target = self._resolve_output_dir()
         except Exception:
             # Fall back to a best-effort preview if resolution ever fails.
-            target = self._output_parent / self._current_slug()
+            target = self._output_parent / slug
         self._output_target_var.set(str(target))
 
     def _on_browse(self) -> None:
@@ -1005,6 +1129,68 @@ class ScraperApp(tk.Tk):
         can_start = spec is not None and spec.enabled and not self._running
         self._start_btn.configure(state="normal" if can_start else "disabled")
 
+    # ── Preferences ──────────────────────────────────────────────────────────
+    def _restore_preferences(self) -> None:
+        """Start-up: show the saved choices. Anything missing, invalid or no longer in the
+        catalog was already replaced by a safe default (the store) or the nearest valid
+        website and novel (``_select``). Nothing is written here."""
+        p = self._store.settings
+        self._mode_var.set(p.output_mode)
+        self._chunk_var.set(str(p.chunk_size))
+        self._delay_var.set(str(p.delay))
+        self._timeout_var.set(str(p.timeout))
+        self._browser_var.set(p.browser_mode)
+        self._headless_var.set(p.headless)
+        self._http_first_var.set(p.http_first)
+        self._cache_var.set(p.use_cache)
+        self._on_mode_change()
+        self._load_catalog(catalog.all_specs(), p.website, p.novel)
+
+    def _preferences(self) -> ui_settings.Settings:
+        """The stable choices as they stand now. A number field that is not currently a
+        valid, in-range number keeps its saved value rather than saving garbage."""
+        current = self._store.settings
+
+        def number(var: tk.StringVar, kind, bounds, saved):
+            try:
+                value = kind(var.get().strip())
+            except ValueError:
+                return saved
+            if value != value or not bounds[0] <= value <= bounds[1]:
+                return saved
+            return value
+
+        website, novel = current.website, current.novel
+        if self._selection_chosen and self._website_var.get():
+            website, novel = self._website_var.get(), self._current_slug()
+        return replace(
+            current,
+            website=website, novel=novel,
+            output_mode=self._mode_var.get(),
+            chunk_size=number(self._chunk_var, int, ui_settings.CHUNK_SIZE_RANGE,
+                              current.chunk_size),
+            delay=number(self._delay_var, float, ui_settings.DELAY_RANGE, current.delay),
+            timeout=number(self._timeout_var, int, ui_settings.TIMEOUT_RANGE, current.timeout),
+            browser_mode=bool(self._browser_var.get()),
+            headless=bool(self._headless_var.get()),
+            http_first=bool(self._http_first_var.get()),
+            use_cache=bool(self._cache_var.get()),
+        )
+
+    def _save_preferences(self) -> None:
+        """Save the stable choices (only when something changed). Called at discrete
+        moments, never per keystroke. A failed save leaves the window fully working and
+        is named once in the status bar."""
+        if self._shut_down:
+            return
+        try:
+            result = self._store.apply(self._preferences())
+        except (ValueError, tk.TclError):
+            return  # never let preferences get in the way of the window
+        if not result.ok and not self._prefs_warned:
+            self._prefs_warned = True
+            self._set_status(f"Preferences not saved: {result.message}.")
+
     # ── Run lifecycle ────────────────────────────────────────────────────────
     def _on_start(self) -> None:
         spec = self._current_spec()
@@ -1019,6 +1205,7 @@ class ScraperApp(tk.Tk):
         if params is None:
             return
         start, end, delay, timeout, mode, chunk = params
+        self._save_preferences()  # valid now; the next launch starts from these choices
 
         # The browser toggle only applies to browser-capable adapters. The choice
         # travels on the immutable ScrapeJob (the pipeline builds a per-run SiteSpec
@@ -1342,6 +1529,7 @@ class ScraperApp(tk.Tk):
         self._counts_var.set(view.counts)
         self._detail_var.set(view.detail)
         self._eta_var.set(view.eta)
+        self._wrap_run_detail(with_eta=bool(view.eta))
         bar = self._progress
         if view.indeterminate:
             # No chapter total yet (the chapter list is being prepared): no fake percentage.
@@ -1353,6 +1541,13 @@ class ScraperApp(tk.Tk):
             bar.stop()
             bar.configure(mode="determinate")
         bar.configure(maximum=max(view.total or 1, 1), value=view.done or 0)
+
+    def _wrap_run_detail(self, *, with_eta: bool) -> None:
+        """Wrap the counters to the room they have: beside the ETA while one is showing,
+        the whole row once the run has ended (and the ETA is blank)."""
+        room = max(self._run_interior - (self._eta_reserve if with_eta else 0), 8 * self._unit())
+        self._detail_label.configure(wraplength=room)
+        self._detail_label.grid_configure(columnspan=1 if with_eta else 2)
 
     def _refresh_eta(self) -> None:
         """Re-read the ETA when the window redraws anything (no timer): a long silent
@@ -1443,8 +1638,13 @@ class ScraperApp(tk.Tk):
     def destroy(self) -> None:
         """Every route that closes the window (idle close, the close poll, tests) comes
         through here, so the pump never fires on a destroyed window."""
+        self._save_preferences()
         self._shutdown()
         super().destroy()
+
+
+def _ignore() -> None:
+    """The command of a "coming soon" menu entry: choosing one does nothing."""
 
 
 def _grouping_text(mode: OutputMode, chunk: int) -> str:

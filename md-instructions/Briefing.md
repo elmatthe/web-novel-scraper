@@ -115,8 +115,9 @@ v0.3.0) `files/runtime-data/` for GUI preferences (`settings.json`, Checkpoint
   - `appearance.py` (Checkpoint 01.1, PDF-Splitter): compact `Compact.*` ttk
     styles, Light/Dark palettes, the native Aqua branch and the in-place switch.
   - `settings.py` (01.1, PDF-Splitter): the validated, atomic
-    `files/runtime-data/settings.json` store (appearance only for now), plus
-    `LOGS_DIR`.
+    `files/runtime-data/settings.json` store, plus `LOGS_DIR`. Schema 2 (02.3) holds
+    appearance, website and novel, grouping, chunk size, delay, timeout and the
+    browser/headless/HTTP-first/cache switches; never secrets, paths or results.
   - `activity.py` (02.1, PDF-Splitter, no Tk): structured `ActivityEvent`s, a
     bounded locked channel, the Summary/Detailed model, the per-session
     `SessionLog` (written when an event is emitted; DECISIONS.md #006) and the
@@ -127,6 +128,9 @@ v0.3.0) `files/runtime-data/` for GUI preferences (`settings.json`, Checkpoint
   - `run_progress.py` (02.2, no Tk): `RunTracker` (phase, `done / total · %`,
     counters, final state) and the monotonic-clock `EtaEstimator`, fed by
     `progress_cb` and the optional `phase_cb` (DECISIONS.md #007).
+  - `selection.py` (02.3, no Tk): the Website -> Novel view of the catalog. A website
+    is a host, not an adapter (DECISIONS.md #008); `settle` gives the nearest runnable
+    (website, novel) pair.
 - `app.py` — the tkinter GUI entry point.
   - **Layout (since Checkpoint 01.1):** three bordered sections on the left
     (1. Web Novel Selection, 2. Output Options, 3. Run), the Activity panel on the
@@ -155,8 +159,10 @@ validated `.net`/`.com` sources, and TXT/PDF output. See `handoff.md` and
 and so is step 02.1 (Activity Summary/Detailed logging and the thread-safe event
 bridge) and step 02.2 (Run progress, ETA, counters and run-state accuracy,
 with one optional observability-only `phase_cb` in the pipeline), which awaits
-owner review before 02.3. The rest of this section
-describes 0.2.0/0.2.1 as built.
+owner review, and step 02.3 (website-first selection, saved preferences,
+the disabled Resume Existing Run control and the counter-clipping fix), which
+awaits owner review and the UI acceptance gate before Checkpoint 03. The rest of
+this section describes 0.2.0/0.2.1 as built.
 
 **0.2.0 (Unreleased — implemented, pending the user's manual live test).**
 **Fast-primary + single-lane hard-chapter rescue.** 0.1.3 ran one persistent VISIBLE

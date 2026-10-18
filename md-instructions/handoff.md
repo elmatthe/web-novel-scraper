@@ -1,6 +1,6 @@
 # webnovel-scraper - Handoff
 
-## Current Snapshot — v0.3.0 Checkpoint 02.2 complete (progress, ETA and run-state accuracy)
+## Current Snapshot — v0.3.0 Checkpoint 02.3 complete (website-first selection, preferences, Resume placeholder, counter fix)
 **2026-10-18 · HOME-PC (Windows 11) · Claude Code (Opus 5.5) · branch
 `feature/v0.3.0-modernization`**
 
@@ -10,7 +10,7 @@
 - **Base:** `577b5db` = `main` (`e7dc407`) plus the FWN offset/duplicate-output
   fix. Checkpoint 00 = `1ab1747`; 01.0 (flat `scripts/`) = `f169565`; 01.1
   (Light/Dark UI foundation, three-section shell) = `e93c21a`; 02.1 =
-  `d7116db`; 02.2 is the commit after it. `fix/freewebnovel-offset-and-output-collisions` stays local.
+  `d7116db`; 02.2 = `3269aa7`; 02.3 is the commit after it. `fix/freewebnovel-offset-and-output-collisions` stays local.
 - **Release state:** v0.2.0 is the latest release and tag (2026-06-30). 0.2.1 is
   merged to `main` via PR #4 but untagged. v0.3.0 supersedes it (plan §8 C3).
 - **01.1 recap:**
@@ -195,8 +195,7 @@
       count is exact);
     - the legacy chunked/single path announces "building" only just before it
       writes its PDFs, after its second-pass sweep;
-    - a final line with four counters is clipped at the minimum width (Summary
-      lists them all).
+    - a final line with four counters was clipped at the minimum width (fixed in 02.3).
   - **Tests:** 117 added (`test_ui_run_progress`, `test_progress_observer`,
     `test_ui_run_section`, and additions to `test_ui_run_activity`). The 02.1 fakes
     gained `phase_cb=None`, and the old status/count assertions were updated for
@@ -207,7 +206,71 @@
   - **Pending (owner):** the Run-section visual check in Light/Dark at the minimum
     size and 125%/150% scaling, and one live run to see the phases and ETA on real
     timing.
-  - **Next:** 02.3, the remaining Checkpoint 02 controls, only after review.
+  - **Next:** 02.3, the remaining Checkpoint 02 controls, only after review. Done, below.
+
+- **Checkpoint 02.3 (UI/controller only).** Website-first selection, the Resume
+  placeholder, ordinary preferences and the counter-clipping fix. No scraper, adapter,
+  catalog, PDF, TXT, cache, manifest, output-folder, dependency or default change;
+  `DEFAULT_HEADLESS` is still `False`, output folders are still `<parent>/<slug>-N`.
+  - **Website-first selection (ADR 008):** new `ui/selection.py` (no Tk).
+    - Section 1 is Website, Novel, Start chapter, End chapter. A website is its **host**
+      (`base_url`, else `url`, lower-case, no `www.`), never the adapter, so a future
+      `.net`/`.com` pair can share an adapter and stay two choices. **No catalog entry was
+      added**; Checkpoint 04 validates those.
+    - `websites()` lists catalog order (a duplicate display name gains its host);
+      `novels_for()` holds only enabled rows; `resolve()` returns the catalog's own row
+      or `None`; `settle()` gives the nearest runnable pair (unknown/disabled website
+      -> first runnable; novel kept if offered, else the website's first).
+    - `app.py`: `_load_catalog`, `_select`, `_on_website_change`, `_on_novel_change`,
+      `_on_selection_changed` (website text, hint, browser options, Start, output
+      preview). `_current_spec()` is `selection.resolve(...)`; Start still passes
+      `spec.novel_slug`/`spec.adapter_key`. The old `_site_key` and `_novel_slugs` are gone
+      (`_website_var`, `_novels`).
+    - "Coming soon" websites are disabled entries. **Windows draws a disabled menu entry
+      embossed, brighter than a real choice in Dark mode**, so there (Dark only) they are
+      dim, inert normal entries (`_style_unavailable_entries`); elsewhere they stay disabled.
+  - **Resume Existing Run:** `_resume_btn` plus `RESUME_NOTE`, in Section 3 below the
+    counters. Disabled, no command, not in `_locked_inputs`. Checkpoint 03 builds it.
+  - **Preferences (settings schema 2):** appearance, website, novel, `output_mode`,
+    `chunk_size` (1-10000), `delay` (0-600), `timeout` (1-600), `browser_mode`, `headless`,
+    `http_first`, `use_cache`. Not stored: range, folder name, output parent, progress,
+    results, secrets.
+    - Validation is per field (one bad field -> its default, status `repaired`); a schema-1
+      file loads unchanged and is rewritten as schema 2 by the next save (no backup copy);
+      version > 2 -> defaults; a bad file keeps a timestamped copy on the next save.
+    - Saved by `_save_preferences()` only at: website/novel/grouping picked, Advanced
+      Settings closed, Start (after validation), window destroy, and a theme change (which
+      saves just the theme). Typing saves nothing; unchanged values write nothing. A number
+      that is not valid keeps the saved value. A failed save is one status-bar message.
+    - Until the user picks a website or novel (`_selection_chosen`), the saved choice is left
+      alone, so opening and closing rewrites nothing.
+    - Defaults are mirrored in `settings.py` and `app.DEFAULT_*`; a test pins them equal.
+  - **Counter clipping fixed:** the detail label wraps (`_wrap_run_detail`): beside the ETA
+    while it shows, the whole row after the end. `_fit_window` reserves the longest form
+    (`WORST_CASE_DETAIL`, shared `run_progress.format_final_counts`) in the minimum and holds
+    the row's height, so the Resume row never moves.
+  - **Window:** minimum 635x632, default 859x632 at 100% (02.2: 635x590); 749x754 at 125%
+    and 902x875 at 150%. Controls column about 296 px; Activity still takes all growth.
+  - **Tests:** 125 added (`test_ui_selection`, `test_ui_selection_window`,
+    `test_ui_preferences_window`, `test_ui_settings_preferences`, one in
+    `test_ui_run_progress`). Updated only where superseded: the shell's selection tests
+    (website-first, `_load_catalog` for the no-runnable case, `_website_var`), the settings
+    round-trip (the file holds every preference), and the 02.2 long-text test (counters
+    wrap). 15 mutations were caught (two initially survived; a test was added and one
+    variant strengthened).
+  - **Gate:** `scripts/verify.py` PASS, 679 passed, 0 skipped (554 + 125). 420 UI tests
+    pass on Python 3.12.10. Startup smoke test passed (window found, closed cleanly,
+    session log started/closed, no settings file written by an untouched session).
+  - **Pending (owner):** the UI acceptance gate (Light/Dark, minimum, maximized, 125%/150%
+    on real hardware), one live run, macOS Aqua, the `.bat` double-click.
+  - **Not done / limits:** no live current-chapter name or live failed/recovered counters;
+    `RunReport` counts duplicate displayed numbers once; the legacy single/chunked path
+    announces "building" late; Resume Existing Run is a placeholder; the output root is
+    unchanged; macOS menu look unverified.
+  - **Next:** owner review of 02.3 and the UI acceptance gate. Then Checkpoint 03
+    (manifest-first cache and resume; output root `Downloads/Web-Novel-Scraper-Outputs/
+    <novel>-N`). Do not start it before approval. Delete the reference folder only after
+    the final UI approval.
 
 ### Uncommitted local state (deliberately NOT committed)
 - `md-instructions/0.2.1_release_plan.md`, `0.2.1_bug-hunt.md` and
@@ -232,6 +295,11 @@
   Briefing/handoff and handoff length are docs debt for 07 (C14).
 
 ### Log (newest first)
+- 2026-10-18 — Checkpoint 02.3: website-first selection (a website is a host; ADR 008),
+  disabled Resume Existing Run placeholder, schema-2 preferences, counters wrap instead of
+  clipping, legible "coming soon" entries in the Dark Windows menu. 125 tests added.
+  Verify PASS (679, 0 skipped). No scraper, adapter, catalog, PDF, dependency or default
+  changes.
 - 2026-10-18 — Checkpoint 02.2: Run section shows the real phase, `done / total · %`,
   counters and an ETA (`—` when unknown); final state from `RunReport`; one optional
   `phase_cb` observer in the pipeline (ADR 007, instrumentation only). 117 tests

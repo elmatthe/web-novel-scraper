@@ -5,6 +5,63 @@ See AI-WORKSPACE.md for how this fits alongside Briefing, Changelog, and Handoff
 
 ---
 
+## 008 — Website-first selection: a website is a host, not an adapter — 2026-10-18 — Claude (Sonnet 5.5)
+
+**Status:** Accepted (v0.3.0 Checkpoint 02.3)
+
+**Context:** Section 1 now asks for the Website first and then a Novel that website can
+run. The catalog is a flat list of rows (a novel on a site) keyed by `(novel_slug,
+adapter_key)`. Later checkpoints must be able to offer separate `.net` and `.com` entries
+for the same novel, and those need not use different adapters. The checkpoint forbids new
+catalog entries and any change to the scraping engine.
+- `adapter_key` names an implementation, not a place. Keying the Website menu by it would
+  merge two websites that share an adapter, or split one website that has two.
+- A saved preference must survive catalog edits without ever selecting something that
+  cannot run.
+
+**Decision:**
+1. A website is identified by the **host** of a row's `base_url` (else `url`), lower-case,
+   without a leading `www.` (`ui/selection.py`, pure, no Tk). Rows with the same host are
+   one website whatever their adapters; rows with different hosts are different websites
+   even if they share an adapter. Two websites that share a display name are labelled with
+   their host.
+2. The Website menu lists every website in catalog order. A website with no enabled row is
+   shown "(coming soon)" and cannot be chosen. The Novel list holds only the novels the
+   chosen website can run (enabled rows), so a disabled combination can never reach Start.
+3. `selection.settle(website, novel)` returns the nearest runnable pair: an unknown or
+   disabled website gives way to the first runnable one; the novel is kept if that website
+   offers it, else its first novel. It serves a website change, a saved preference and a
+   catalog edit alike.
+4. Start still passes the resolved catalog row's `novel_slug` and `adapter_key` in the
+   `ScrapeJob`. The pipeline and the catalog are unchanged.
+5. Preferences store the website host and novel slug as plain identifiers (settings schema
+   2). Until the user picks a website or novel in a session, the saved choice is left as it
+   is, so opening and closing the window rewrites nothing and a website that is temporarily
+   unavailable is remembered.
+6. On Windows in Dark mode the "coming soon" menu entries are drawn dim and inert rather
+   than as `state=disabled`, because Windows embosses disabled menu entries and they then
+   read brighter than the real choices. Everywhere else they are ordinary disabled entries.
+
+**Alternatives considered:**
+- (a) Key websites by `adapter_key`. Rejected: it merges `.net` and `.com` entries that
+  share an adapter.
+- (b) Add a `site_id` field to `SiteSpec`. Rejected for now: it changes the model and
+  catalog for no present benefit; the host already identifies the website. Revisit in
+  Checkpoint 04 if hosts prove ambiguous.
+- (c) Show disabled novels in the Novel list. Rejected: a Combobox cannot grey single
+  entries, and an unrunnable choice is better absent.
+- (d) A custom-drawn dropdown for the Website list. Rejected as a UI redesign.
+
+**Consequences:**
+- Adding a `.net` or `.com` row later needs only a catalog row with its own host; the
+  Website menu, Novel list and saved preference follow with no UI change.
+- Two catalog rows with the same host and novel would be one choice (the first enabled
+  row wins). The catalog does not have such a pair.
+- Stored identifiers are validated for shape only; the window checks them against the
+  catalog at start-up.
+
+---
+
 ## 007 — Run progress: a tracker over existing callbacks plus one observability-only pipeline observer — 2026-10-18 — Claude (Sonnet 5.5)
 
 **Status:** Accepted (v0.3.0 Checkpoint 02.2)

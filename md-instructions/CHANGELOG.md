@@ -5,6 +5,60 @@ versioning.
 
 ## [Unreleased] — v0.3.0 (in progress on `feature/v0.3.0-modernization`)
 
+### Added / Changed — Website-first selection, preferences, Resume placeholder and counter fix (Checkpoint 02.3)
+- **Section 1 is now Website, Novel, Start chapter, End chapter**
+  (`scripts/app.py`, new `scripts/webnovel_scraper/ui/selection.py`, no Tk).
+  - Pick the website first, then a novel that website can run. Both come from the
+    unchanged catalog. Websites with no enabled source stay listed as "coming soon"
+    and cannot be chosen; the Novel list holds only runnable novels, so a disabled
+    combination can never reach Start.
+  - Changing the website keeps the novel if the new website offers it, otherwise it
+    takes that website's first novel. Either change refreshes the website text,
+    browser options (inert for the plain-HTTP site), Start, the hint and the output
+    preview. Start passes the same catalog row's novel and adapter as before.
+  - A website is identified by its **host**, not its adapter (DECISIONS.md #008), so
+    a later `.net` and `.com` entry for one novel stays two choices even if they share
+    an adapter. No catalog entry was added (those are validated in Checkpoint 04).
+  - The selection survives Light/Dark switching, Advanced Settings and a run.
+- **Resume Existing Run** is shown in Section 3, disabled, with "Available after
+  resume support is implemented." It has no command, is never enabled by a run, a
+  selection change or a theme change, and cannot start a scrape or reuse a folder.
+  The real feature belongs to Checkpoint 03.
+- **Ordinary preferences are saved** (`ui/settings.py`, schema 2): appearance,
+  website and novel, grouping, chunk size, delay, timeout, and the browser,
+  headless, HTTP-first and cache switches.
+  - Saved at discrete moments only: a website, novel or grouping choice, closing
+    Advanced Settings, Start, and closing the window; never per keystroke. A theme
+    change saves the theme and resets nothing else.
+  - A schema-1 (appearance-only) file opens unchanged and becomes schema 2 on the
+    next save. A bad field is replaced alone by its default; a bad or newer file
+    falls back to defaults and the original is kept; a failed save is named once in
+    the status bar and the window keeps working.
+  - A saved website or novel that is gone, disabled or unknown falls back to a
+    runnable pair; until the user chooses one, the saved choice is left as it is.
+  - Fresh-install defaults are unchanged (Individual chapters, chunk 10, delay 3.0,
+    timeout 30, browser on, headless **off**, HTTP-first off, cache on, PDF on, TXT off).
+  - Never saved: chapter range, folder name, output location, progress or results,
+    credentials, cookies, session data or novel text. Output folders are still
+    `Downloads/<novel>-N` (that changes in Checkpoint 03).
+- **Fixed: the final counter line clipped at the minimum width.** The counters now
+  wrap onto further lines (the whole row once the run has ended; beside the ETA while
+  it shows). The longest form is reserved in the measured minimum and the row's height
+  is held, so nothing below it moves. All five counters were checked readable at the
+  minimum, default and maximized sizes and at simulated 125% and 150% scaling.
+- **Fixed: "coming soon" websites in the Dark menu.** Windows draws a disabled menu
+  entry embossed, which read brighter than the real choices. In Dark on Windows they
+  are now drawn dim and do nothing when chosen; elsewhere they stay ordinary disabled
+  entries.
+- **Layout:** the minimum window is 635x632 at 100% (was 635x590): the Resume row
+  and the reserved counter lines cost height only; the width is unchanged and Activity
+  still takes all growth.
+- **Tests:** 125 added; the baseline 554 is intact. Four superseded expectations were
+  updated (website-first order and values, the file now holds every preference, the
+  counters wrap). Gate: 679 passed, 0 skipped.
+- **Not in this change:** any scraper, adapter, catalog, PDF, TXT, cache, manifest,
+  output-folder, headless-default or dependency change, and the real Resume Existing Run.
+
 ### Added / Changed — Run progress, ETA, counters and accurate run state (Checkpoint 02.2)
 - **Section 3 (Run) now tells the truth about the run** (`scripts/app.py`, new
   `scripts/webnovel_scraper/ui/run_progress.py`).

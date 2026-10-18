@@ -7,9 +7,16 @@ raises, atomic writes (temp file in the same folder, then ``os.replace``), a pat
 for tests, a schema version, per-field validation, and a timestamped copy of an
 unusable original before it is overwritten.
 
-Trimmed for the scraper: only the appearance is persisted at Checkpoint 01. PDF-Splitter's
-processing, output, content-removal and run groups do not apply here. Later checkpoints
-may add stable ordinary preferences; sensitive browser/session data is never stored.
+Trimmed for the scraper. Checkpoint 01 persisted only the appearance (schema 1); Checkpoint
+02.3 adds the stable, ordinary choices (schema 2): website and novel, output grouping and
+chunk size, delay and timeout, and the browser, headless, HTTP-first and cache switches. A
+schema-1 file loads unchanged (its missing fields take the fresh-install defaults) and is
+rewritten as schema 2 by the next save. Never stored: credentials, cookies, session data,
+novel text, chapter ranges, output paths, progress or run results.
+
+The website and novel are stored as plain identifiers; this module does not know the catalog.
+The window checks them against the catalog and falls back to a supported pair (see
+:mod:`webnovel_scraper.ui.selection`), so a removed or disabled source never breaks start-up.
 
 Settings live in ``files/runtime-data/settings.json`` (ignored by Git, inside the
 repository); the per-session technical logs live beside them in ``files/runtime-data/logs/``
@@ -30,6 +37,8 @@ from pathlib import Path
 __all__ = [
     "REPO_ROOT", "RUNTIME_DIR", "SETTINGS_PATH", "LOGS_DIR", "SCHEMA_VERSION",
     "LIGHT", "DARK", "APPEARANCES", "DEFAULT_APPEARANCE",
+    "OUTPUT_MODES", "DEFAULT_OUTPUT_MODE", "DEFAULT_CHUNK_SIZE", "CHUNK_SIZE_RANGE",
+    "DEFAULT_DELAY", "DELAY_RANGE", "DEFAULT_TIMEOUT", "TIMEOUT_RANGE",
     "Settings", "LoadResult", "SaveResult", "SettingsStore", "validate_settings",
 ]
 
@@ -39,12 +48,25 @@ RUNTIME_DIR = REPO_ROOT / "files" / "runtime-data"
 SETTINGS_PATH = RUNTIME_DIR / "settings.json"
 LOGS_DIR = RUNTIME_DIR / "logs"
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 LIGHT = "light"
 DARK = "dark"
 APPEARANCES = (LIGHT, DARK)
 DEFAULT_APPEARANCE = LIGHT
+
+# Fresh-install values for the ordinary preferences. They mirror the window's own defaults
+# (``app.DEFAULT_*``; a test pins that they agree). DEFAULT_HEADLESS stays off until the
+# headless-first work of Checkpoint 04.
+OUTPUT_MODES = ("separate", "chunked", "single")   # the OutputMode values, as strings
+DEFAULT_OUTPUT_MODE = "separate"                   # Individual chapters
+DEFAULT_CHUNK_SIZE = 10
+CHUNK_SIZE_RANGE = (1, 10_000)
+DEFAULT_DELAY = 3.0
+DELAY_RANGE = (0.0, 600.0)
+DEFAULT_TIMEOUT = 30
+TIMEOUT_RANGE = (1, 600)
+_ID_LIMIT = 80   # longest website / novel identifier accepted
 
 
 @dataclass(frozen=True)
@@ -52,9 +74,32 @@ class Settings:
     """Every persisted preference. The dataclass defaults are the fresh-install values."""
 
     appearance: str = DEFAULT_APPEARANCE
+    website: str = ""            # website identifier; "" = first supported website
+    novel: str = ""              # novel slug; "" = first novel that website offers
+    output_mode: str = DEFAULT_OUTPUT_MODE
+    chunk_size: int = DEFAULT_CHUNK_SIZE
+    delay: float = DEFAULT_DELAY
+    timeout: int = DEFAULT_TIMEOUT
+    browser_mode: bool = True
+    headless: bool = False
+    http_first: bool = False
+    use_cache: bool = True
 
     def to_json(self) -> dict:
-        return {"schema_version": SCHEMA_VERSION, "appearance": self.appearance}
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "appearance": self.appearance,
+            "website": self.website,
+            "novel": self.novel,
+            "output_mode": self.output_mode,
+            "chunk_size": self.chunk_size,
+            "delay": self.delay,
+            "timeout": self.timeout,
+            "browser_mode": self.browser_mode,
+            "headless": self.headless,
+            "http_first": self.http_first,
+            "use_cache": self.use_cache,
+        }
 
     def checked(self) -> "Settings":
         """Return ``self`` only if it survives full validation unchanged."""
@@ -95,14 +140,63 @@ def validate_settings(raw: object) -> LoadResult:
             Settings(), "unusable",
             (f"settings file is from a newer version (schema {version}); using defaults",))
     diagnostics: list[str] = []
+    defaults = Settings()
 
-    appearance = raw.get("appearance", DEFAULT_APPEARANCE)
-    if appearance not in APPEARANCES:
-        diagnostics.append(f"ignored invalid appearance {appearance!r}; using {DEFAULT_APPEARANCE}")
-        appearance = DEFAULT_APPEARANCE
+    def field(name: str, check) -> object:
+        """The stored value if *check* accepts it, else the default (with a diagnostic).
+        A missing key is not a problem: older files simply lack newer fields."""
+        default = getattr(defaults, name)
+        if name not in raw:
+            return default
+        value = raw[name]
+        if check(value):
+            return value
+        diagnostics.append(f"ignored invalid {name} {_brief(value)}; using {default!r}")
+        return default
 
-    settings = Settings(appearance=appearance)
+    settings = Settings(
+        appearance=field("appearance", lambda v: isinstance(v, str) and v in APPEARANCES),
+        website=field("website", _is_identifier),
+        novel=field("novel", _is_identifier),
+        output_mode=field("output_mode", lambda v: isinstance(v, str) and v in OUTPUT_MODES),
+        chunk_size=field("chunk_size", lambda v: _is_int_in(v, CHUNK_SIZE_RANGE)),
+        delay=float(field("delay", _is_delay)),
+        timeout=field("timeout", lambda v: _is_int_in(v, TIMEOUT_RANGE)),
+        browser_mode=field("browser_mode", lambda v: isinstance(v, bool)),
+        headless=field("headless", lambda v: isinstance(v, bool)),
+        http_first=field("http_first", lambda v: isinstance(v, bool)),
+        use_cache=field("use_cache", lambda v: isinstance(v, bool)),
+    )
     return LoadResult(settings, "repaired" if diagnostics else "loaded", tuple(diagnostics))
+
+
+def _brief(value: object) -> str:
+    text = repr(value)
+    return text if len(text) <= 40 else text[:37] + "..."
+
+
+def _is_identifier(value: object) -> bool:
+    """A website or novel identifier: empty (unset) or a short lowercase token. Anything else
+    (paths, URLs, spaces, control characters) is not something this app ever stores."""
+    if not isinstance(value, str):
+        return False
+    return value == "" or (
+        len(value) <= _ID_LIMIT
+        and value[0].isalnum() and value == value.lower()
+        and all(ch.isalnum() or ch in "-._" for ch in value)
+        and value.isascii()
+    )
+
+
+def _is_int_in(value: object, bounds: tuple[int, int]) -> bool:
+    return (isinstance(value, int) and not isinstance(value, bool)
+            and bounds[0] <= value <= bounds[1])
+
+
+def _is_delay(value: object) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    return value == value and DELAY_RANGE[0] <= value <= DELAY_RANGE[1]
 
 
 class SettingsStore:

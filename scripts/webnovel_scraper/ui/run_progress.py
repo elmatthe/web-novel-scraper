@@ -32,7 +32,7 @@ __all__ = [
     "IDLE", "PREPARING", "SCRAPING", "BUILDING", "STOPPING", "COMPLETE", "CANCELLED",
     "FAILED", "REFUSED", "ACTIVE_STATES", "TERMINAL_STATES", "OUTCOME_STATES",
     "OUTCOME_LABELS", "FinalCounts", "RunView", "EtaEstimator", "RunTracker",
-    "format_eta", "format_progress", "percent",
+    "format_eta", "format_progress", "format_final_counts", "percent",
 ]
 
 IDLE = "idle"
@@ -112,6 +112,21 @@ def format_progress(done: int | None, total: int | None) -> str:
 
 def _plural(count: int, word: str) -> str:
     return f"{count} {word}{'' if count == 1 else 's'}"
+
+
+def format_final_counts(counts: "FinalCounts") -> str:
+    """The result counters once a run has ended; zero counters other than PDFs are left out.
+    The window wraps this line rather than clipping it, and reserves its longest form."""
+    parts = [_plural(counts.pdfs, "PDF")]
+    if counts.failed:
+        parts.append(f"{counts.failed} failed")
+    if counts.recovered:
+        parts.append(f"{counts.recovered} recovered")
+    if counts.already_present:
+        parts.append(f"{counts.already_present} already present")
+    if counts.not_listed:
+        parts.append(f"{counts.not_listed} not on site list")
+    return _SEPARATOR.join(parts)
 
 
 # ------------------------------------------------------------------------------- the model
@@ -349,16 +364,4 @@ class RunTracker:
         return ""
 
     def _final_detail(self) -> str:
-        counts = self._counts
-        if counts is None:
-            return ""
-        parts = [_plural(counts.pdfs, "PDF")]
-        if counts.failed:
-            parts.append(f"{counts.failed} failed")
-        if counts.recovered:
-            parts.append(f"{counts.recovered} recovered")
-        if counts.already_present:
-            parts.append(f"{counts.already_present} already present")
-        if counts.not_listed:
-            parts.append(f"{counts.not_listed} not on site list")
-        return _SEPARATOR.join(parts)
+        return "" if self._counts is None else format_final_counts(self._counts)

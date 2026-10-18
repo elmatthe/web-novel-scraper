@@ -1,6 +1,6 @@
 # Web Novel Scraper — v0.3.0 Implementation Plan
 
-**Status:** Approved product requirements. Checkpoint 00 (planning/baseline) complete 2026-10-17 on `feature/v0.3.0-modernization`; Checkpoint 01 step 01.0 (flat `scripts/` layout) complete 2026-10-17; step 01.1 (Light/Dark UI foundation and three-section window shell) complete 2026-10-18; step 02.1 (Activity Summary/Detailed logging and thread-safe event bridge) complete 2026-10-18 (`d7116db`); step 02.2 (progress, ETA, counters and run-state accuracy) complete 2026-10-18 and awaits owner review before 02.3. Technical clarifications from Checkpoint 00 are in §8 and do not change owner decisions.  
+**Status:** Approved product requirements. Checkpoint 00 (planning/baseline) complete 2026-10-17 on `feature/v0.3.0-modernization`; Checkpoint 01 step 01.0 (flat `scripts/` layout) complete 2026-10-17; step 01.1 (Light/Dark UI foundation and three-section window shell) complete 2026-10-18; step 02.1 (Activity Summary/Detailed logging and thread-safe event bridge) complete 2026-10-18 (`d7116db`); step 02.2 (progress, ETA, counters and run-state accuracy) complete 2026-10-18 (`3269aa7`); step 02.3 (website-first selection, preferences, Resume placeholder and counter fix) complete 2026-10-18 and awaits owner review and the UI acceptance gate before Checkpoint 03. Technical clarifications from Checkpoint 00 are in §8 and do not change owner decisions.  
 **Created:** 2026-10-14  
 **Planning / review:** ChatGPT; **execution:** Claude Code in the local repository.  
 **Target repository:** `https://github.com/elmatthe/web-novel-scraper`  
@@ -128,6 +128,16 @@ Supersedes the read-only GitHub snapshot above wherever they differ.
   - **Gate:** 554 passed, 0 skipped; 305 UI/pipeline tests pass on 3.12.10; 12/12 mutations caught; startup smoke test passed.
   - **Deferred:** a live current-chapter name and live failed/recovered counters; Resume Existing Run; website-first selection.
   - **Pending:** the Run-section visual check (Light/Dark, minimum size, 125%/150%) and one live run (owner).
+
+- **02.3 Result (2026-10-18): COMPLETE, awaiting owner review (UI acceptance gate).** UI/controller only: no scraper, adapter, catalog, PDF, TXT, cache, manifest, output-folder, headless-default or dependency change. A new decision, DECISIONS.md #008, records that a website is a host, not an adapter.
+  - **Section 1:** Website, Novel, Start chapter, End chapter. Novel choices follow the website; "coming soon" websites are listed but cannot be chosen; the novel is kept across a website change when offered. Start passes the same catalog row's novel and adapter. New `ui/selection.py`.
+  - **Resume Existing Run:** shown disabled with an explanatory note, wired to nothing (Checkpoint 03 builds it).
+  - **Preferences (settings schema 2):** appearance, website, novel, grouping, chunk size, delay, timeout, browser, headless, HTTP-first, cache; saved at discrete moments; schema-1 files upgrade on the next save; invalid or unavailable values fall back safely; defaults unchanged (headless off).
+  - **Fixes:** the final counters wrap instead of clipping; "coming soon" websites are legible in the Dark menu on Windows.
+  - **Window:** minimum 635x632 at 100% (was 635x590), width unchanged.
+  - **Gate:** 679 passed, 0 skipped (554 + 125); 420 UI tests pass on 3.12.10; 15/15 mutations caught; startup smoke test passed.
+  - **Pending (owner):** the UI acceptance gate (Light/Dark, minimum/maximized, 125%/150%), one live run, macOS Aqua and the `.bat` double-click.
+  - **Next:** Checkpoint 03 (manifest-first cache and resume), only after owner review.
 
 ### 03 — Manifest-first cache and resume architecture
 - Implement per-site tracked baseline manifests in `scripts/` and untracked mutable runtime overlays/cache, provenance, schema and migration, preflight coverage/extend/refresh, chapter identity/offset guards, and safe output allocation/resume journal. Existing site adapters and output behavior remain functional.

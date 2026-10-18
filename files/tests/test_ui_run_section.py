@@ -509,9 +509,17 @@ def test_long_run_texts_never_widen_the_window_and_fit_at_the_minimum() -> None:
         base = (win.winfo_reqwidth(), win.winfo_reqheight())
         long_text = "Finished with problems — an unusually long status " * 4
         win._run_status_var.set(long_text)
-        win._detail_var.set("12345 PDFs · 6789 failed · 1011 recovered · 1213 already present " * 2)
+        # The counters wrap onto further lines (02.3) instead of clipping, within the
+        # height the minimum already reserves for their longest form.
+        win._detail_var.set(app.WORST_CASE_DETAIL)
+        win._eta_var.set("")
+        win._wrap_run_detail(with_eta=False)
         win._counts_var.set("99999 / 99999 · 100%")
+        win.update()
+        assert (win.winfo_reqwidth(), win.winfo_reqheight()) == base
         win._eta_var.set("ETA: 123 h 59 min")
+        win._detail_var.set("120 already present")
+        win._wrap_run_detail(with_eta=True)
         win.update()
         assert (win.winfo_reqwidth(), win.winfo_reqheight()) == base
         right = win.winfo_rootx() + win.winfo_width()

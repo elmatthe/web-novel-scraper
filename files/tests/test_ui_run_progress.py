@@ -495,3 +495,15 @@ def test_a_late_higher_count_after_a_stop_cannot_change_the_final_count() -> Non
     tracker.finish("stopped", processed=(20, 40), counts=FinalCounts(pdfs=20))
     tracker.progress(30, 40, at=2.0)            # a routine update the window drew too late
     assert tracker.view().counts == "20 / 40 · 50%" and tracker.view().status == "Stopped"
+
+
+def test_format_final_counts_lists_every_nonzero_counter_in_order() -> None:
+    """The one formatter the tracker and the window's worst-case reservation share."""
+    from webnovel_scraper.ui.run_progress import FinalCounts, format_final_counts
+
+    assert format_final_counts(FinalCounts(pdfs=1)) == "1 PDF"
+    assert format_final_counts(FinalCounts(pdfs=0)) == "0 PDFs"
+    full = format_final_counts(FinalCounts(
+        pdfs=2900, already_present=120, failed=3, recovered=2, not_listed=1))
+    assert full == ("2900 PDFs · 3 failed · 2 recovered · 120 already present"
+                    " · 1 not on site list")

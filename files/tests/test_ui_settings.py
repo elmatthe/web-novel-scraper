@@ -114,10 +114,10 @@ def test_appearance_round_trips_atomically(tmp_path) -> None:
     store = SettingsStore(path)
     store.load()
     assert store.update(appearance=DARK).ok
-    assert json.loads(path.read_text(encoding="utf-8")) == {
-        "schema_version": SCHEMA_VERSION,
-        "appearance": "dark",
-    }
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["schema_version"] == SCHEMA_VERSION
+    assert saved["appearance"] == "dark"
+    assert saved == Settings(appearance=DARK).to_json()
     # No temp file is left beside it.
     assert sorted(p.name for p in path.parent.iterdir()) == ["settings.json"]
 
