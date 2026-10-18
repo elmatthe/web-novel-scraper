@@ -5,6 +5,44 @@ versioning.
 
 ## [Unreleased] — v0.3.0 (in progress on `feature/v0.3.0-modernization`)
 
+### Added — Chapter manifest store and legacy index import (Checkpoint 03.1, no behaviour change)
+- **Nothing in the app changes yet.** The new store is tested and unwired: the GUI, pipeline
+  (including `pipeline._load_index`), catalog, adapters, `RequestManager`, PDF/TXT output, output
+  folders and Resume button are untouched, and no dependency was added.
+- **`webnovel_scraper/chapter_manifest.py`:** the manifest schema of plan §9.2 (`schema_version`
+  1, source identity, provenance, coverage spans, chapters, source-confirmed absences,
+  `content_sha256`) with strict validation on build and on load: exact source match, host-scoped
+  page URLs, canonical decimal-text labels (`627.2` and `627.10` stay distinct), unique pages and
+  slugs, stable order, duplicate displayed numbers kept, and a 20 MB cap. Coverage cannot claim
+  more than the entries show: every whole number in a span must be a chapter or a
+  source-confirmed absence, and an unexamined gap is never treated as absent.
+- **`webnovel_scraper/chapter_store.py`:** loads a tracked baseline
+  (`scripts/webnovel_scraper/chapter_lists/<host>/<novel>.json`, read-only at run time) and a
+  mutable runtime overlay (`files/runtime-data/chapter-lists/<host>/<novel>.json`, Git-ignored),
+  and merges them by source page URL. Contradictions (a page with two labels, titles or slugs,
+  two pages with one slug, absence versus a listed chapter) are reported, never resolved by file
+  age, and the affected labels leave coverage until rediscovered. `freewebnovel.com` and
+  `freewebnovel.net` never share a file.
+- **Safe writes and quarantine:** overlays are validated, then published atomically (the old file
+  survives any failure). A corrupt overlay is renamed to `<name>.corrupt-<utc>[-N]` (never
+  deleted or overwritten), and loading falls back to the baseline. A corrupt tracked baseline is
+  only reported and is never renamed or rewritten. A rename failure leaves the file in place and
+  blocks overwriting it.
+- **Legacy `chapter_index.json` import (explicit call only):** read-only, schema 2 only, with a
+  matching identity block, `complete: true` and every row valid. Bare lists, v1, missing identity,
+  incomplete or cross-site files are rejected with a reason. Only contiguous whole-number runs
+  become coverage, the file's SHA-256 is recorded, and the import is idempotent and never
+  overwrites newer overlay coverage. The old file is never moved, rewritten or deleted.
+- **Docs:** plan §9.10 records the owner decisions (Folder name field retired in 03.3;
+  pre-0.3.0 folders never automatically resumable), the two contract clarifications (baselines are
+  never quarantined; keep the approved Downloads output root) and the API boundaries for 03.2.
+  ADR 009 has an addendum.
+- **Tests:** 247 added (`test_chapter_manifest.py`, `test_chapter_store.py`,
+  `test_chapter_legacy_import.py`), offline and deterministic, including atomic-publication
+  failure and recovery, quarantine collisions and I/O failures, and the legacy file's bytes and
+  modification time unchanged. Mutation checks on the validators, the quarantine rules and the
+  import gates found no surviving mutant. The suite also passes on Python 3.12.10.
+
 ### Added — Source identity, safe run allocation and manifest/journal contracts (Checkpoint 03.0, no behaviour change)
 - **Nothing in the app changes yet.** Three new modules are tested and unwired: the GUI, pipeline,
   catalog, adapters, `RequestManager`, PDF output and Resume button are untouched, and runs are

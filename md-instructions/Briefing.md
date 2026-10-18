@@ -161,7 +161,12 @@ bridge) and step 02.2 (Run progress, ETA, counters and run-state accuracy,
 with one optional observability-only `phase_cb` in the pipeline), which awaits
 owner review, and step 02.3 (website-first selection, saved preferences,
 the disabled Resume Existing Run control and the counter-clipping fix), which
-awaits owner review and the UI acceptance gate before Checkpoint 03. The rest of
+awaits owner review and the UI acceptance gate before Checkpoint 03. Checkpoint 03
+(manifest-first cache and resume) is under way: 03.0 added source identity, a safe
+run-folder allocator and the data contracts, and 03.1 added the chapter manifest store
+(`chapter_manifest.py`, `chapter_store.py`: baseline + runtime overlay, merge,
+quarantine, read-only legacy `chapter_index.json` import). Both are tested and not yet
+wired into the pipeline or GUI (03.2 onward). The rest of
 this section describes 0.2.0/0.2.1 as built.
 
 **0.2.0 (Unreleased — implemented, pending the user's manual live test).**

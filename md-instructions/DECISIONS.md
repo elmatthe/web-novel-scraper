@@ -43,6 +43,17 @@ display chapter 3664, and `627.1` and `627.10` cannot be told apart as floats.
 changes for users until 03.1 to 03.3 integrate it. The GUI's Folder name field is retired when
 03.3 adopts `<slug>-N`.
 
+**Addendum (2026-10-18, after the 03.0 review, recorded in 03.1):**
+- *Owner decisions.* (1) The Folder name field is retired in 03.3. (2) Pre-v0.3.0 output folders
+  are not automatically resumable; they are never moved, overwritten or deleted.
+- *Clarification 1.* Tracked baseline manifests under `scripts/` are never renamed, quarantined
+  or rewritten at run time. Quarantine (`<name>.corrupt-<utc>[-N]`) applies only to mutable
+  runtime overlays; an invalid baseline is rejected with a diagnostic and left untouched.
+- *Clarification 2.* 03.3 keeps the approved output-root contract exactly
+  (`default_output_root()`: `~/Downloads/Web-Novel-Scraper-Outputs`, the home folder only when
+  there is no Downloads folder) and never substitutes the home directory silently.
+- Detail and the 03.1 API boundaries: plan §9.10.
+
 ---
 
 ## 008 — Website-first selection: a website is a host, not an adapter — 2026-10-18 — Claude (Sonnet 5.5)

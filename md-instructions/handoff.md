@@ -1,7 +1,7 @@
 # webnovel-scraper - Handoff
 
-## Current Snapshot — v0.3.0 Checkpoint 03.0 complete (source identity, safe run allocation, manifest/journal contracts)
-**2026-10-18 · HOME-PC (Windows 11) · Claude Code (Opus 5.5) · branch
+## Current Snapshot — v0.3.0 Checkpoint 03.1 complete (chapter manifest store, legacy index import)
+**2026-10-18 · HOME-PC (Windows 11) · Claude Code (Sonnet 5.5) · branch
 `feature/v0.3.0-modernization`**
 
 - **Active plan:** `md-instructions/Web-Novel-Scraper-v0.3.0-Implementation-Plan.md`
@@ -10,9 +10,30 @@
 - **Base:** `577b5db` = `main` (`e7dc407`) plus the FWN offset/duplicate-output
   fix. Checkpoint 00 = `1ab1747`; 01.0 (flat `scripts/`) = `f169565`; 01.1
   (Light/Dark UI foundation, three-section shell) = `e93c21a`; 02.1 =
-  `d7116db`; 02.2 = `3269aa7`; 02.3 = `1da9eac`; 03.0 is the commit after it. `fix/freewebnovel-offset-and-output-collisions` stays local.
+  `d7116db`; 02.2 = `3269aa7`; 02.3 = `1da9eac`; 03.0 = `20db263`; 03.1 is the commit after it. `fix/freewebnovel-offset-and-output-collisions` stays local.
 - **Release state:** v0.2.0 is the latest release and tag (2026-06-30). 0.2.1 is
   merged to `main` via PR #4 but untagged. v0.3.0 supersedes it (plan §8 C3).
+- **03.1 recap (chapter manifest store and legacy import; nothing is wired in).** No
+  pipeline (`pipeline._load_index` included), GUI, catalog, adapter, `RequestManager`, PDF,
+  output-folder or dependency change; the Resume button is still disabled.
+  - `chapter_manifest.py` (pure): the §9.2 schema, strict validation on build and load, coverage
+    as set membership (a span may not hold a whole number nothing accounts for), 20 MB cap,
+    `content_sha256`.
+  - `chapter_store.py`: `ChapterManifestStore` loads the tracked baseline (read-only at run
+    time) and the Git-ignored runtime overlay, `merge_manifests` projects them by page URL and
+    reports contradictions without picking a winner, `save_runtime` publishes atomically,
+    invalid overlays are quarantined as `<name>.corrupt-<utc>[-N]`, invalid baselines are only
+    reported, and `import_legacy_index` is an explicit read-only v2 import.
+  - **Owner decisions recorded (2026-10-18):** Folder name field retired in 03.3; pre-0.3.0
+    folders never automatically resumable. **Clarifications:** baselines are never
+    renamed/quarantined/rewritten; 03.3 keeps the approved Downloads output-root contract.
+    Details and the API boundary for 03.2: plan §9.10; ADR 009 addendum.
+  - **Gate:** `scripts/verify.py` PASS, 1127 passed, 0 skipped (880 + 247). The new tests also
+    pass on Python 3.12.10.
+  - **Limits:** no cross-process locking on the overlay; no real baseline manifests shipped yet;
+    `_load_index` still trusts an identity-less v2 dict until 03.2.
+  - **Next:** owner review of 03.1, then 03.2 (coverage preflight, discovery/extend/refresh,
+    false-success prevention, HTML cache layout; plan §9.3, §9.6). Do not start it before approval.
 - **03.0 recap (contracts and safe filesystem mechanisms only; nothing is wired in).**
   No catalog, adapter, pipeline, GUI, `RequestManager`, PDF, cache, output-folder or
   dependency change. The Resume button is still disabled; `pipeline.resolve_output_dir`
@@ -29,9 +50,9 @@
     interruption contracts, the compatibility risks found, and the order 03.1 to 03.4.
   - Tests: 201 added (`test_source_identity.py`, `test_run_storage.py`); mutation checks
     caught every non-equivalent mutant.
-  - **Owner questions, none blocking:** retire the GUI **Folder name** field when 03.3
-    adopts `<slug>-N` (decision 4), and whether pre-0.3.0 `<slug>-N` folders should ever be
-    resumable (recommended: no).
+  - **Owner questions from 03.0, now answered (2026-10-18):** the GUI **Folder name** field is
+    retired when 03.3 adopts `<slug>-N`, and pre-0.3.0 `<slug>-N` folders are never
+    automatically resumable.
 - **01.1 recap:**
   - `ui/appearance.py` and `ui/settings.py` were adapted from PDF-Splitter.
   - Three bordered sections on the left (1. Web Novel Selection, 2. Output Options,
@@ -286,8 +307,7 @@
     `RunReport` counts duplicate displayed numbers once; the legacy single/chunked path
     announces "building" late; Resume Existing Run is a placeholder; the output root is
     unchanged; macOS menu look unverified.
-  - **Next:** owner review of 03.0. Then 03.1 (manifest store, schema and legacy v2
-    migration; plan §9.2, §9.4). Do not start it before approval. The remaining launcher,
+  - **Next (superseded; 03.1 is done):** owner review of 03.1, then 03.2. The remaining launcher,
     native-scaling and macOS checks from Checkpoints 01–02 are still open. Delete the
     reference folder only after the final UI approval.
 
@@ -314,6 +334,10 @@
   Briefing/handoff and handoff length are docs debt for 07 (C14).
 
 ### Log (newest first)
+- 2026-10-18 — Checkpoint 03.1: chapter manifest schema and store (baseline + runtime overlay,
+  merge with conflict reporting, atomic writes, overlay quarantine) and a read-only legacy v2
+  `chapter_index.json` import (plan §9.2, §9.4, §9.10; ADR 009 addendum). 247 tests added.
+  Verify PASS (1127, 0 skipped). Nothing wired into the GUI or pipeline.
 - 2026-10-18 — Checkpoint 03.0: source identity, safe run-folder allocator, atomic JSON
   helper and the finalized manifest/journal/cache contracts (plan §9, ADR 009). 201 tests
   added; nothing wired into the GUI or pipeline.
