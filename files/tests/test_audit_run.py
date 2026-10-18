@@ -78,3 +78,60 @@ def test_gaps_in_the_selection_are_listed(tmp_path):
 ])
 def test_only_the_heading_at_the_start_of_each_chapter_counts(text, expected):
     assert audit_run._headings_in_txt(text) == expected
+
+
+# ── files the run did not publish (Codex I1) ─────────────────────────────────
+def _separate_run(tmp_path, **kw):
+    return make_run(tmp_path, Site(range(1, 7), **kw), mode=OutputMode.SEPARATE)
+
+
+def test_a_clean_run_has_no_unrecorded_files(tmp_path):
+    folder = _separate_run(tmp_path)
+    report = audit_run.audit(folder)
+    assert report["unrecorded_files"] == [] and report["problems"] == []
+
+
+def test_a_file_copied_in_by_hand_is_reported_with_its_checksum_and_the_run_does_not_pass(tmp_path, capsys):
+    folder = _separate_run(tmp_path, fail={4})
+    copied = folder / "PDF" / "Chapter 4_ Title 4.pdf"          # a hand-made PDF for the failed chapter
+    copied.write_bytes(b"%PDF-1.4 copied by hand")
+    before = {p.name: p.read_bytes() for p in folder.iterdir() if p.is_file()}
+    report = audit_run.audit(folder)
+    [row] = report["unrecorded_files"]
+    assert row["path"] == "PDF/Chapter 4_ Title 4.pdf" and row["kind"] == "unrecorded"
+    assert row["size"] == copied.stat().st_size and len(row["sha256"]) == 64
+    assert row["chapter"] == "4" and row["recorded_file_for_that_chapter"] is None
+    assert any("1 file(s) in the run folder are not in the run's record" in p for p in report["problems"])
+    assert audit_run.main([str(folder)]) == 1
+    assert "Extra     1 file(s) the journal does not record" in capsys.readouterr().out
+    assert copied.read_bytes() == b"%PDF-1.4 copied by hand"
+    assert {p.name: p.read_bytes() for p in folder.iterdir() if p.is_file()} == before   # audit changes nothing
+
+
+def test_a_duplicate_of_a_recorded_chapter_under_another_name_is_identified_as_one(tmp_path):
+    folder = _separate_run(tmp_path)
+    (folder / "PDF" / "Chapter 2.1-3_ Title 3.pdf").write_bytes(b"x")     # same chapter 3, composite name
+    report = audit_run.audit(folder)
+    [row] = report["unrecorded_files"]
+    assert row["chapter"] == "3" and row["recorded_file_for_that_chapter"] == "PDF/Chapter 3_ Title 3.pdf"
+    assert "1 for a chapter the journal already records a file for" in report["problems"][0]
+
+
+def test_leftover_temporary_files_other_folders_and_stray_run_files_are_reported(tmp_path):
+    folder = _separate_run(tmp_path)
+    (folder / "TXT" / "Chapter 5_ Title 5.txt.part").write_bytes(b"half")
+    (folder / "TXT" / "sub").mkdir()
+    (folder / "TXT" / "sub" / "notes.txt").write_text("mine", encoding="utf-8")
+    (folder / "notes.md").write_text("mine", encoding="utf-8")
+    report = audit_run.audit(folder, pdf_text=True)
+    kinds = {r["path"]: r["kind"] for r in report["unrecorded_files"]}
+    assert kinds == {"TXT/Chapter 5_ Title 5.txt.part": "temporary", "TXT/sub/notes.txt": "unrecorded",
+                     "notes.md": "unrecorded"}
+    assert report["problems"]
+
+
+def test_the_run_files_themselves_are_never_reported(tmp_path):
+    folder = _separate_run(tmp_path)
+    names = {p.name for p in folder.iterdir()}
+    assert {"run-journal.jsonl", "run-selection.json", "run-audit.json", "run-reservation.json"} <= names
+    assert audit_run.audit(folder)["unrecorded_files"] == []

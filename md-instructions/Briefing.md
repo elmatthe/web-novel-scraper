@@ -178,7 +178,7 @@ What v0.3.0 is, in short:
   environment, packages and browser engines for real (`scripts/setup_check.py`), repairs only what is
   missing, installs Python 3.12 per-user after asking (WinGet, else the verified python.org installer
   via `scripts/install_python.ps1`), and refuses too-deep or read-only folders (ADR 017).
-- **Verification:** 1495 offline tests pass on Python 3.12.10 and 3.13.12; the launcher was run end to
+- **Verification:** 1505 offline tests pass on Python 3.12.10 and 3.13.12; the launcher was run end to
   end from a scratch copy in ten scenarios; limited live smoke runs passed for all nine pairings.
   Full-novel runs are the owner's acceptance step and have **not** been run.
 
@@ -594,6 +594,11 @@ Detail per checkpoint: `CHANGELOG.md`. Current state and next action: `handoff.m
     design choice.
 
 ## Known Issues
+- **Independent review of `838ca04` was NO-GO** (`files/test-logs/v0.3.0_codex-review.md`). C1 is fixed
+  (plan §9.20). Open release blockers: I1 (the owner's original Lord of Mysteries 2 run is incomplete;
+  recovery planned, needs approval), I2 (linked `PDF`/`TXT` folders, Resume cleanup of `.tmp`/`.part`),
+  I3 (.net pagination URLs), I4 (source-list gap lost on Resume), I5 (PDF supplementary-plane
+  characters), I6 (WebNovel page identity), M1 (documents contradict each other on whole-novel runs).
 - **Full-novel runs are not yet proven (release blocker).** The program is built for them (journal,
   resume, bounded memory, a 300-chapter fault-injection test, a 1,432-chapter synthetic PDF in about
   85 s), but no whole-novel run has completed against the live sites. An automated attempt was blocked

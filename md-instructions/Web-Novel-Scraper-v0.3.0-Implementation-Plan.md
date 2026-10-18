@@ -620,6 +620,37 @@ The owner's whole-novel run of Lord of Mysteries 2 (.com) failed chapters 1130�
 
 Verification: 1495 tests pass; `scripts/verify.py` PASS; the new tests fail when the fix is removed.
 
+### 9.20 Corrective checkpoint 1 after the Codex review of `838ca04` (2026-10-18)
+
+Codex's verdict was NO-GO: 1 Critical (C1), 6 Important (I1-I6), 1 Minor (M1). This checkpoint covers C1
+and I1; the rest are recorded as unresolved blockers (handoff).
+
+1. **C1.** In `_extract_chapter` the pair was adopted `if second == meta.index`, otherwise the first
+   number from `_extract_title` was compared with `meta.index`: a confirmed 1131 page requested as 1130
+   compared 1130 with 1130 and was accepted as chapter 1130 (and a fractional first number such as
+   1129.1 likewise). Fix: the confirmed pair always sets the page's identity (`number` = second number),
+   then the existing guard compares it with the expected chapter. Tests written first and seen to fail:
+   the pair requested under its whole and under its fractional first number, through the cache path
+   (`fetch_chapter` with a page "from the cache": set aside, fetched once more, set aside again, refused)
+   and through a whole run (the refused chapter is a failure and nothing is published for it; the
+   chapter the page is stays published once, as itself). Checked on the owner's real cached chapter-1131
+   HTML (read only): 1130 refused, 1131 accepted, 1132 refused.
+2. **I1.** The original run folder was checked read-only (journal, selection and audit hashes unchanged
+   before and after: `3a599e37…`, `fffad632…`, `ee995fdc…`). Facts, matching Codex's: one session, ended
+   `complete_with_problems`, nine failures (1130-1138); 2,344 publications (1,172 PDF + 1,172 TXT) all
+   verified; 1,181 PDFs (nine unrecorded hand copies named `Chapter 1130_ Initiative.pdf` …), 1,172 TXTs.
+   **Rehearsal on a scratch copy** (32 MB; a copy of the LOM2 page cache; sockets disabled so nothing
+   outside the cache could be fetched): the supported Resume skipped 1,172 verified chapters, took the nine
+   missing pages from the cache (the correction run had cached them) and wrote 18 files with the current
+   names (`Chapter 1129.1-1130_ Initiative.pdf` …). The journal ended `complete`; the audit then shows
+   2,362 of 2,362 files ok and 1,181 chapters saved, and flags **nine extra PDFs** (the hand copies;
+   1,190 PDFs for 1,181 chapters), each paired with its recorded duplicate. Resume therefore completes
+   the run but never removes or adopts the copies; that stays the owner's decision.
+3. **Audit extension** with tests: see the changelog. The previous audit enumerated only journal records
+   and so could not see extra files.
+
+Verification: 1505 tests pass; `scripts/verify.py` PASS.
+
 ## 10. Owner overrides and autonomous completion mandate (2026-10-18)
 
 The owner approved 03.2a and authorised autonomous completion of 03.2b through 07 for a **Windows-only

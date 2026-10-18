@@ -9,6 +9,24 @@ versioning.
 candidate. The macOS launcher and portable code are kept, but macOS acceptance is deferred to a
 later branch; nothing here claims macOS readiness.
 
+### Fixed — corrective checkpoint 1 after the independent review of `838ca04` (2026-10-18)
+- **C1 (critical): a two-number page is only ever the chapter its second number names.** A page headed
+  `Chapter 1130 - 1131 Individual Preparations` (story: `Chapter 1131 …`) was refused as chapter 1132
+  but accepted as chapter **1130**: its identity was settled only when the second number happened to
+  equal the expected chapter, otherwise the first number was used. The page's identity is now taken
+  from the confirmed pair first, then compared with the expected chapter, so it is refused under its
+  first number (whole or fractional) as under any other. Confirmed on the real cached chapter-1131 page:
+  expected 1130 refused, 1131 accepted as `Chapter 1130-1131: Individual Preparations`, 1132 refused.
+  The saved-page cache sets such a page aside, and a run publishes nothing for the refused chapter.
+- **The audit tool lists files the run did not publish** (`files/audit_run.py`): anything in `PDF/`,
+  `TXT/` or the run folder that the journal does not record (hand-copied files, leftover `.part`/`.tmp`,
+  a duplicate under another name), with size, SHA-256, the chapter its name says it is and the file the
+  journal records for that chapter. Such a folder no longer passes. It reads and hashes only.
+- **I1 (Lord of Mysteries 2 original run): analysed and rehearsed, not executed.** See the acceptance
+  document ("Recovering the original Lord of Mysteries 2 (.com) run"). Nothing in the owner's folder
+  was changed.
+- **Tests:** 1505 total.
+
 ### Fixed — composite chapter headings: Lord of Mysteries 2 (.com) chapters 1130–1138 (2026-10-18)
 - **Chapters 1130–1138 of Lord of Mysteries 2 on Free Web Novel (.com) were reported as failed.** For
   those pages the website's heading shows two numbers, e.g. `Chapter 1129.1 - 1130 Initiative` at

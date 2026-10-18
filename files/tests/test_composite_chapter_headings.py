@@ -86,6 +86,13 @@ def test_a_title_that_starts_with_a_number_is_still_just_a_title():
     ("Chapter 1130 - 1130 Initiative", "Chapter 1130 Initiative", 1131, "equal numbers, other chapter expected"),
     ("Chapter 1129.1 - 1130.5 Initiative", "Chapter 1130.5 Initiative", 1130, "second number is not a whole chapter"),
     ("Chapter 1129 Initiative", "Chapter 1129 Initiative", 1130, "plain page of another chapter"),
+    # A confirmed pair is chapter B and nothing else: asking for its first number must fail (Codex C1).
+    ("Chapter 1130 - 1131 Individual Preparations", "Chapter 1131 Individual Preparations", 1130,
+     "confirmed 1131 page requested as 1130 (whole first number)"),
+    ("Chapter 1129.1 - 1130 Initiative", "Chapter 1130 Initiative", 1129.1,
+     "confirmed 1130 page requested as 1129.1 (fractional first number)"),
+    ("Chapter 1129.1 - 1130 Initiative", "Chapter 1130 Initiative", 1129,
+     "confirmed 1130 page requested as 1129"),
 ])
 def test_genuine_mismatches_are_still_rejected(heading, story, expected, why):
     with pytest.raises(ChapterMismatchError):
@@ -172,3 +179,55 @@ def test_a_run_with_composite_chapters_audits_and_a_resume_completes_an_older_fa
                      "Chapter 3-4_ Title 4.txt", "Chapter 5_ Title 5.txt", "Chapter 6_ Title 6.txt"]
     replay = replay_journal(folder / JOURNAL_FILENAME)
     assert replay.last_end == "complete"
+
+
+# ── a confirmed pair under its first number: cache path and whole run (Codex C1) ──────────────
+PAIR_1131 = page("Chapter 1130 - 1131 Individual Preparations", "Chapter 1131 Individual Preparations")
+
+
+class CachedRM:
+    """Serves one page as if from the saved-page cache; records what the cache is told to set aside."""
+
+    class Info:
+        from_cache = True
+
+    last_fetch_info = Info()
+
+    def __init__(self, html):
+        self.html, self.set_aside, self.fetches = html, [], 0
+
+    def fetch(self, url, **_kw):
+        self.fetches += 1
+        return self.html
+
+    def invalidate_cache(self, url, reason):
+        self.set_aside.append(url)
+
+
+def test_a_cached_confirmed_page_under_the_wrong_address_is_set_aside_and_never_accepted():
+    rm = CachedRM(PAIR_1131)
+    meta = ChapterMeta(index=1130, url=f"{SPEC.url}/chapter-1130", slug=1130)
+    with pytest.raises(ChapterMismatchError):
+        FreeWebNovelAdapter(request_manager=rm).fetch_chapter(meta, SPEC)
+    assert rm.set_aside == [meta.url, meta.url]        # set aside, fetched once more, set aside again
+    assert rm.fetches == 2
+
+
+def test_a_run_never_publishes_a_confirmed_page_as_the_chapter_before_it(tmp_path):
+    class Stale(Site):
+        def fetch_chapter(self, meta, spec, **_kw):
+            if meta.index == 3:            # the list says 3, the site serves the pair that is chapter 4
+                return self.adapter._extract_chapter(
+                    page("Chapter 3 - 4 Title 4", "Chapter 4 Title 4"), meta)
+            return super().fetch_chapter(meta, spec)
+
+    store = ChapterManifestStore(tmp_path / "b", tmp_path / "r")
+    job = ScrapeJob(novel_slug=SPEC.novel_slug, adapter_key="freewebnovel", start=1, end=6, delay=0.0,
+                    output_mode=OutputMode.SEPARATE, chunk_size=6, use_cache=False,
+                    output_dir=tmp_path / "out", allocate_run=True, formats=("txt",))
+    report = pipeline.run_scrape(job, adapter=Stale(), log=lambda _m: None, sleep_fn=lambda _s: None,
+                                 manifest_store=store)
+    assert report.failed == [3]
+    names = sorted(p.name for p in (report.output_dir / "TXT").glob("*.txt"))
+    assert names == ["Chapter 1_ Title 1.txt", "Chapter 2_ Title 2.txt", "Chapter 3-4_ Title 4.txt",
+                     "Chapter 5_ Title 5.txt", "Chapter 6_ Title 6.txt"]   # nothing for 3; 4 once, as 4

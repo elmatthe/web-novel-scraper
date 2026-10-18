@@ -968,9 +968,11 @@ class FreeWebNovelAdapter(BaseAdapter):
         number, title = _extract_title(soup, meta.index)
         shown = None
         composite = _composite_heading(soup) if number is not None else None
-        if composite is not None and float(composite[1]) == float(meta.index):
-            # "Chapter 1129.1 - 1130 Initiative" on the page for chapter 1130: the chapter is 1130
-            # (the story says so too); the heading keeps the number pair the site shows.
+        if composite is not None:
+            # "Chapter 1129.1 - 1130 Initiative": the page IS chapter 1130 (the story says so too),
+            # whichever chapter was asked for. Its identity is settled here, before and apart from
+            # the expected number, so the guard below refuses it under 1129.1 or 1131 alike; the
+            # heading keeps the number pair the site shows.
             shown, number, title = f"{composite[0]}-{composite[1]}", composite[1], composite[2]
         if number is not None and float(number) != float(meta.index):
             # The offset guard (plan §9.6): a page showing another chapter is never published

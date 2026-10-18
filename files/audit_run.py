@@ -18,7 +18,11 @@ Checks:
   * every chapter: saved in every format, failed (with the recorded reason), or not saved;
   * TXT files: the chapter headings, in order, are exactly the chapters the journal says the file
     holds; replacement characters (U+FFFD) are counted;
-  * with ``--pdf-text``: every expected heading appears, in order, in the PDFs' text (slower).
+  * with ``--pdf-text``: every expected heading appears, in order, in the PDFs' text (slower);
+  * files the run did not publish: anything in ``PDF/``, ``TXT/`` or the run folder itself that the
+    journal does not record (a file copied in by hand, a leftover temporary file, a duplicate under
+    another name), with its size, SHA-256, the chapter its name says it is, and whether the journal
+    already records a file for that chapter. A run with such a file does not pass.
 
 Exit code 0 when everything checks out, 1 when anything does not (the report says what).
 """
@@ -27,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 from collections import Counter
@@ -37,9 +42,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 from webnovel_scraper.models import OutputMode  # noqa: E402
 from webnovel_scraper.run_journal import (  # noqa: E402
-    JOURNAL_FILENAME, file_sha256, load_selection, replay_journal,
+    JOURNAL_FILENAME, LOCK_FILENAME, SELECTION_FILENAME, file_sha256, load_selection, replay_journal,
 )
-from webnovel_scraper.run_output import plan_groups  # noqa: E402
+from webnovel_scraper.run_output import FORMAT_DIRS, plan_groups  # noqa: E402
+from webnovel_scraper.run_storage import RESERVATION_FILENAME  # noqa: E402
 from webnovel_scraper.txt_builder import CHAPTER_SEPARATOR  # noqa: E402
 
 _HEADING = re.compile(r"^Chapter (\S+?): ", re.MULTILINE)
@@ -73,6 +79,45 @@ def _pdf_lacks_heading(path: Path, expected: list[str]) -> str | None:
             return label
         position = found.end()
     return None
+
+
+_RUN_FILES = {JOURNAL_FILENAME, SELECTION_FILENAME, LOCK_FILENAME, RESERVATION_FILENAME, "run-audit.json"}
+_TEMPORARY = (".part", ".tmp")
+_FILE_CHAPTER = re.compile(r"^Chapter (\S+?)_ ")
+
+
+def _unrecorded_files(run_dir: Path, recorded: set[str], labels: list[str], held: dict) -> list[dict]:
+    """Every file under the run folder that the journal does not record (never follows links).
+    ``recorded`` holds the journal's relative paths, case-folded. Read-only: it lists and hashes."""
+    found: list[tuple[str, str | None]] = []            # (relative path, format of its folder)
+    folders = {name.casefold(): fmt for fmt, name in FORMAT_DIRS.items()}
+    for entry in sorted(run_dir.iterdir(), key=lambda e: e.name):
+        if entry.name.casefold() in folders and entry.is_dir() and not entry.is_symlink():
+            for base, dirs, names in os.walk(entry):
+                dirs[:] = [d for d in dirs if not (Path(base) / d).is_symlink()]
+                for name in sorted(names):
+                    found.append((Path(base, name).relative_to(run_dir).as_posix(), folders[entry.name.casefold()]))
+        elif entry.name not in _RUN_FILES:
+            found.append((entry.name, None))
+    out = []
+    for relative, fmt in found:
+        if relative.casefold() in recorded:
+            continue
+        path = run_dir / relative
+        if path.is_symlink() or not path.is_file():
+            out.append({"path": relative, "kind": "link or folder", "size": None, "sha256": None})
+            continue
+        size, digest = file_sha256(path)
+        row = {"path": relative, "kind": "temporary" if relative.endswith(_TEMPORARY) else "unrecorded",
+               "size": size, "sha256": digest}
+        named = _FILE_CHAPTER.match(path.name)
+        if named is not None and fmt is not None:
+            identity = _identity(named.group(1))
+            row["chapter"] = identity
+            if identity in labels:
+                row["recorded_file_for_that_chapter"] = held.get(fmt, {}).get(labels.index(identity))
+        out.append(row)
+    return out
 
 
 def audit(run_dir: Path, *, pdf_text: bool = False) -> dict:
@@ -133,6 +178,16 @@ def audit(run_dir: Path, *, pdf_text: bool = False) -> dict:
                             problems.append(f"{record['path']}: no heading for chapter {lacking} (in order)")
             files.append(entry)
 
+    # ── files the run did not publish ────────────────────────────────────
+    recorded = {record["path"].casefold() for record in replay.publishes.values()}
+    unrecorded = _unrecorded_files(run_dir, recorded, labels, held)
+    if unrecorded:
+        duplicates = sum(1 for row in unrecorded if row.get("recorded_file_for_that_chapter"))
+        problems.append(
+            f"{len(unrecorded)} file(s) in the run folder are not in the run's record "
+            f"({duplicates} for a chapter the journal already records a file for): "
+            + ", ".join(row["path"] for row in unrecorded[:5]) + (" ..." if len(unrecorded) > 5 else ""))
+
     # ── chapters ─────────────────────────────────────────────────────────
     failures = {f["position"]: f["reason"] for f in replay.failures}
     rows, counts = [], Counter()
@@ -170,6 +225,7 @@ def audit(run_dir: Path, *, pdf_text: bool = False) -> dict:
         "whole_numbers_missing_from_the_selection": missing_numbers,
         "chapter_counts": dict(counts),
         "files": files,
+        "unrecorded_files": unrecorded,
         "chapters": rows,
         "problems": problems,
     }
@@ -194,6 +250,9 @@ def _print(report: dict) -> None:
         print(f"Repeats   numbers on more than one page: {', '.join(report['numbers_on_more_than_one_page'])}")
     states = Counter(f["state"] for f in report["files"])
     print(f"Files     {len(report['files'])} planned: " + ", ".join(f"{n} {s}" for s, n in states.items()))
+    if report["unrecorded_files"]:
+        print(f"Extra     {len(report['unrecorded_files'])} file(s) the journal does not record "
+              "(listed in the report with checksums)")
     fffd = sum(f.get("replacement_characters", 0) for f in report["files"])
     if fffd:
         print(f"Unicode   {fffd} replacement character(s) in TXT files (text the site served damaged)")
