@@ -5,7 +5,8 @@ The real pages are not stored; every page here is a short synthetic page with th
 * Slug 1964 shows "Chpater 1953: Nineteen (Part 1)" and slug 1967 (a stale saved copy) shows the very same
   page. The misspelt word hid the number from the heading reader, which also switched the wrong-chapter
   guard off, so the page was published under the requested number with "Untitled".
-* Slugs 1653-1932 display two numbers more than the chapter list inferred: the site skips 1642-1643, and two
+* Newer local snapshots at slugs 1653-1932 display two numbers more than the chapter list inferred;
+  1642-1643 remain unresolved in that generation (not proven absent from the live source). Two
   fractional pages (1923.1, 1923.2) bring the slug-to-number gap back to where it was. The reconciler saw equal
   gaps at both ends and assumed the whole span was constant.
 """
@@ -172,7 +173,12 @@ def test_a_run_and_its_resume_never_publish_one_chapters_text_under_another(tmp_
             self.adapter, self.fetched = FreeWebNovelAdapter(request_manager=object()), []
 
         def build_chapter_index(self, spec, **_kw):
-            return [ChapterMeta(index=n, url=f"{SPEC.url}/chapter-{n + 10}", slug=n + 10) for n in range(1, 6)]
+            class DiscoveryPages:
+                def fetch(self, url, **_kwargs):
+                    number = int(url.rsplit("-", 1)[1]) - 10
+                    return page(f"Chapter {number}: Title {number}", body=("Synthetic discovery prose.",))
+
+            return self.adapter._reconcile_window(DiscoveryPages(), spec, 11, 15, {})
 
         def fetch_chapter(self, meta, spec, **_kw):
             self.fetched.append(meta.index)
@@ -246,7 +252,7 @@ def test_a_span_between_two_equal_gaps_is_not_assumed_constant():
         assert got[slug] == float(dip_label(slug)), f"slug {slug}"
     assert len(metas) == 598
     chapter_fetches = [u for u in rm.fetched if "/chapter-" in u]
-    assert len(chapter_fetches) < 250, len(chapter_fetches)       # still far from a page-by-page walk
+    assert len(chapter_fetches) == len(set(chapter_fetches)) == 600  # independent page evidence
 
 
 def test_the_stopped_run_mapping_would_have_been_wrong():
@@ -254,11 +260,12 @@ def test_the_stopped_run_mapping_would_have_been_wrong():
     assert int(dip_label(250)) != 250 - 2
 
 
-def test_a_plain_offset_novel_still_resolves_with_few_fetches():
+def test_a_plain_offset_novel_observes_every_page_without_duplicate_fetches():
     rm = MapRM(lambda s: None if s <= 2 else str(s - 2), 600)
     metas = FreeWebNovelAdapter(request_manager=rm).build_chapter_index(SPEC, start_hint=1, end_hint=5000)
     assert {m.slug: m.index for m in metas} == {s: s - 2 for s in range(3, 601)}
-    assert len([u for u in rm.fetched if "/chapter-" in u]) < 100
+    assert len([u for u in rm.fetched if "/chapter-" in u]) == 600
+    assert len(rm.fetched) == len(set(rm.fetched))
 
 
 def test_heading_for_never_turns_an_unknown_number_into_a_number():

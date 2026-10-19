@@ -104,6 +104,26 @@ class ChapterMeta:
         return not (self.title and self.title.strip())
 
 
+@dataclass(frozen=True)
+class DiscoveryEvidence:
+    """Ephemeral discovery facts; deliberately not a persisted verification certificate.
+
+    Only ``observed`` with current-page provenance certifies an identity. Candidates,
+    saved_unknown, conflict, unreadable, inaccessible, extra and unknown describe
+    different outcomes. ``source_absent`` requires independent source evidence;
+    a missing URL never proves a displayed chapter absent.
+    """
+
+    status: str
+    provenance: str
+    labels: tuple[str, ...] = ()
+    detail: str = ""
+
+    @property
+    def verified(self) -> bool:
+        return self.status == "observed" and self.provenance == "current-page"
+
+
 class ChapterIndex(list):
     """A discovered chapter list (``ChapterMeta`` rows) that also says whether the adapter could
     confirm it runs to the site's real last chapter. ``tail_confirmed=False`` means the list may be
@@ -115,10 +135,14 @@ class ChapterIndex(list):
     not a gap in the site's list. ``None`` means the whole list was read."""
 
     def __init__(self, items=(), *, tail_confirmed: bool = True,
-                 examined: tuple[tuple[int, int], ...] | None = None) -> None:
+                 examined: tuple[tuple[int, int], ...] | None = None,
+                 evidence: dict[str, DiscoveryEvidence] | None = None,
+                 discovery_complete: bool = False) -> None:
         super().__init__(items)
         self.tail_confirmed = tail_confirmed
         self.examined = examined
+        self.evidence = evidence or {}
+        self.discovery_complete = discovery_complete
 
 
 @dataclass

@@ -17,7 +17,12 @@ from __future__ import annotations
 
 import logging
 import re
+import tempfile
+import threading
+import weakref
+from dataclasses import dataclass
 from decimal import Decimal
+from pathlib import Path
 from typing import Callable, Optional
 from urllib.parse import urldefrag, urljoin, urlparse
 
@@ -36,6 +41,8 @@ from ..content import (
 from ..models import (
     ChapterContent,
     ChapterMeta,
+    ChapterIndex,
+    DiscoveryEvidence,
     ChapterMismatchError,
     EmptyExtractionError,
     SiteSpec,
@@ -123,19 +130,52 @@ _COMPLETENESS_MIN = 10
 # time (offset-resolution reconciliation and content-fetch become ONE network
 # hit per chapter, not two).
 _PREFETCHED_HTML_KEY = "_prefetched_html"
-_MISSING_PAGE_MARKER = ""
 
-# Padding (in slugs) added around a binary-search-resolved anchor before/after
-# the walk, absorbing a local run of insert pages (Supreme Magus has a run of
-# five between slugs 629 and 635) so the true boundary isn't missed by a
-# couple of slugs when a caller supplies start_hint/end_hint.
-_WALK_PADDING = 8
+# Every offset-source page is observed, in cancellable batches.
 _RECONCILIATION_FETCH_CEILING_PADDING = 64
-_RECONCILIATION_SEARCH_LOG_EVERY = 8
-# Longest run of slugs whose number is inferred from two probed pages with the same slug-to-number
-# gap (see ``_reconcile_window``): a change of gap shorter than this between two such pages is not seen
-# here, and the per-chapter identity check refuses the page instead.
-_VERIFY_STRIDE = 16
+_DISCOVERY_BATCH = 16
+_DISCOVERY_TEMP = Path(__file__).resolve().parents[3] / "files" / "run-temp" / "chapter-discovery"
+_EVIDENCE_KEY = "discovery_evidence"
+
+
+class _PageSpool:
+    """One temporary file, kept alive by selected page references until extraction.
+
+    Only one page is materialized at a time. Never a cross-run identity cache.
+    TemporaryFile closes and removes itself when the last reference is released.
+    """
+    def __init__(self):
+        _DISCOVERY_TEMP.mkdir(parents=True, exist_ok=True)
+        self.file = tempfile.TemporaryFile(dir=_DISCOVERY_TEMP)
+        weakref.finalize(self, self.file.close)
+        self.lock = threading.Lock()
+
+    def put(self, html):
+        data = html.encode("utf-8")
+        with self.lock:
+            self.file.seek(0, 2)
+            offset = self.file.tell()
+            self.file.write(data)
+        return _PageRef(self, offset, len(data))
+
+
+@dataclass(frozen=True)
+class _PageRef:
+    spool: _PageSpool
+    offset: int
+    length: int
+
+    def read(self):
+        with self.spool.lock:
+            self.spool.file.seek(self.offset)
+            return self.spool.file.read(self.length).decode("utf-8")
+
+
+@dataclass(frozen=True)
+class _PageRead:
+    number: int | Decimal | None
+    html: _PageRef | None
+    evidence: DiscoveryEvidence
 
 
 def _meta_label(meta: ChapterMeta) -> str:
@@ -437,39 +477,11 @@ class FreeWebNovelAdapter(BaseAdapter):
             Callable[[list[ChapterMeta], int, int], None]
         ] = None,
     ) -> list[ChapterMeta]:
-        """Discover the complete chapter list (TOC-first), addressed by the
-        site's DISPLAYED chapter number (fix-chapter-number-offset).
+        """Generate ordinary addresses or observe every page of an offset source.
 
-        **Approach B — generated URLs (the legacy bug fix).** The legacy
-        scraper looked chapter URLs up in the map parsed from the landing page,
-        but FreeWebNovel's index renders only a *slice* of the full list, so any
-        chapter in the unrendered gap was silently dropped (the 2261–2327 bug).
-        The index page is used ONLY to learn the highest SLUG (the "newest
-        chapters" widget reliably shows the latest chapter), and chapter URLs
-        are *generated* from a template over ``1..count`` slugs — gap-free by
-        construction.
-
-        ``spec.chapter_count`` overrides the discovered slug count when set
-        (and a disagreement is surfaced as a warning, never silently honoured).
-
-        **Identity-vs-offset (probe-gated, per-novel auto-detected):** most
-        FreeWebNovel novels number slugs and displayed chapters identically. The
-        SAME index-page fetch already made above usually reveals this for FREE —
-        its rendered anchors carry both the URL slug and "Chapter N: Title" link
-        text, so comparing them costs no extra network call. Only when the index
-        page's anchor text is uninformative does one extra probe fetch decide
-        identity vs. offset (rare — real FreeWebNovel TOC pages are informative).
-        An IDENTITY novel returns the exact same generated list as before (zero
-        extra fetches, byte-identical output). An OFFSET novel (confirmed:
-        Supreme Magus) walks forward reconciling each page's ACTUAL displayed
-        number — fractional ".x" side-chapters keep their fractional label,
-        unnumbered/negative extras (joke chapters, glossaries) are skipped and
-        logged. ``start_hint``/``end_hint`` (displayed-space, both optional) let
-        a caller bound that walk to the requested range via a binary search over
-        the monotone displayed(slug) relationship, padded to absorb a local
-        cluster of inserts; omitted, the walk covers the whole discovered slug
-        range (this repo's pipeline does not thread them yet — see Phase 3 note
-        in the fix drop).
+        Supreme Magus always requires page observations, even if a rendered index
+        slice has equal URL/display numbers. Hints filter selection downstream;
+        binary search and padding cannot prove a nonmonotone source complete.
         """
         rm = self._manager(spec)
         # ``fast_path`` (0.2.0 §3.11): the conductor builds the TOC under the bounded
@@ -486,6 +498,18 @@ class FreeWebNovelAdapter(BaseAdapter):
             html = rm.fetch(spec.url, use_browser=spec.use_browser, use_cache=False)
         soup = BeautifulSoup(html, "html.parser")
         discovered, pairs = self._scan_index_page(soup, spec)
+        requires_pages = spec.novel_slug == "supreme-magus" and urlparse(spec.url).hostname == "freewebnovel.com"
+        if requires_pages:
+            # Displayed-text and foreign-link fallbacks cannot bound this source.
+            own_slugs = []
+            for anchor in soup.find_all("a", href=True):
+                url = _normalize_url(anchor["href"], spec.base_url or spec.url)
+                match = _chapter_link_re(spec).search(url)
+                if match and urlparse(url).netloc == urlparse(spec.url).netloc:
+                    own_slugs.append(int(match.group(1)))
+            if not own_slugs:
+                raise RuntimeError("Supreme Magus discovery has no source-scoped URL bound; completeness is unproven.")
+            discovered = max(own_slugs)
 
         if spec.chapter_count is not None:
             count = spec.chapter_count
@@ -517,21 +541,13 @@ class FreeWebNovelAdapter(BaseAdapter):
                 for n in range(1, count + 1)
             ]
 
-        if pairs and all(slug == disp for slug, disp in pairs):
+        if not requires_pages and pairs and all(slug == disp for slug, disp in pairs):
             return _identity_list()
 
-        # Cache of slug -> (html, displayed_number) so a page fetched to decide
-        # identity/resolve the anchor is never fetched again by the walk below.
-        known: dict[int, tuple[Optional[str], Optional[int | Decimal]]] = {}
-        for meta in resume_metas or []:
-            if meta.slug is not None:
-                known[meta.slug] = (None, _parse_chapter_number(_meta_label(meta)))
-        fetch_budget = {
-            "count": 0,
-            "limit": count + _RECONCILIATION_FETCH_CEILING_PADDING,
-        }
+        known: dict[int, _PageRead] = {}
+        fetch_budget = {"count": 0, "limit": count + _RECONCILIATION_FETCH_CEILING_PADDING}
 
-        if not pairs:
+        if not pairs and not requires_pages:
             # Index page gave no free (slug, displayed) evidence at all — one
             # probe fetch decides identity vs. offset. This is the ONLY case
             # that costs an extra fetch beyond the index page itself.
@@ -541,14 +557,14 @@ class FreeWebNovelAdapter(BaseAdapter):
             probe_num = self._fetch_and_read(
                 rm, spec, probe_slug, known, fetch_budget=fetch_budget
             )
-            if probe_num == probe_slug:
+            if not requires_pages and probe_num == probe_slug:
                 return _identity_list()
             self._warn(
                 f"{spec.novel_slug!r}: URL slug and displayed chapter number "
                 f"disagree (slug {probe_slug} displays "
                 f"{probe_num!r}) — addressing by displayed number."
             )
-        else:
+        elif any(slug != displayed for slug, displayed in pairs):
             # ≥1 harvested pair disagreed — offset confirmed for free.
             mismatch = next((p for p in pairs if p[0] != p[1]), pairs[0])
             self._warn(
@@ -557,44 +573,19 @@ class FreeWebNovelAdapter(BaseAdapter):
                 f"{mismatch[1]!r}) — addressing by displayed number."
             )
 
-        # ── OFFSET path: resolve the walk window, then reconcile per page ────
-        if start_hint is None and end_hint is None:
-            walk_lo, walk_hi = 1, count
-        else:
-            anchor = self._resolve_slug_for_displayed(
-                rm,
-                spec,
-                start_hint if start_hint is not None else 1,
-                1,
-                count,
-                known,
-                fetch_budget=fetch_budget,
-            )
-            walk_lo = max(1, anchor - _WALK_PADDING)
-            if end_hint is None:
-                walk_hi = count
-            else:
-                end_anchor = self._resolve_slug_for_displayed(
-                    rm,
-                    spec,
-                    end_hint,
-                    anchor,
-                    count,
-                    known,
-                    fetch_budget=fetch_budget,
-                )
-                walk_hi = min(count, end_anchor + _WALK_PADDING)
-
-        return self._reconcile_window(
-            rm,
-            spec,
-            walk_lo,
-            walk_hi,
-            known,
-            fetch_budget=fetch_budget,
-            resume_metas=resume_metas,
-            index_progress_cb=index_progress_cb,
+        # No complete independent TOC: inspect every slug, including backward runs.
+        result = self._reconcile_window(
+            rm, spec, 1, count, known, fetch_budget=fetch_budget,
+            resume_metas=resume_metas, index_progress_cb=index_progress_cb,
         )
+        result.tail_confirmed = result.discovery_complete and not (
+            discovered is None or (spec.chapter_count is not None and discovered != count)
+        )
+        if requires_pages and discovered != count:
+            # A smaller catalog override could omit a backward sequence or a
+            # duplicate label in the unscanned suffix, even for a bounded request.
+            result.discovery_complete = False
+        return result
 
     def _scan_index_page(
         self, soup: BeautifulSoup, spec: SiteSpec
@@ -658,293 +649,153 @@ class FreeWebNovelAdapter(BaseAdapter):
         )
         return discovered
 
-    def _fetch_and_read(
-        self,
-        rm,
-        spec: SiteSpec,
-        slug: int,
-        known: dict[int, tuple[Optional[str], Optional[int | Decimal]]],
-        *,
-        fetch_budget: Optional[dict[str, int]] = None,
-    ) -> Optional[int | Decimal]:
-        """Fetch (or reuse a cached) page for ``slug`` and return its displayed
-        number, caching ``(html, number)`` in ``known`` so neither the binary
-        search, the walk, nor a later ``fetch_chapter`` call ever re-fetches it."""
-        if slug not in known:
-            if fetch_budget is not None:
-                fetch_budget["count"] += 1
-                if fetch_budget["count"] > fetch_budget["limit"]:
-                    raise RuntimeError(
-                        "FreeWebNovel chapter-index reconciliation exceeded its "
-                        f"fetch safety ceiling ({fetch_budget['limit']} chapter "
-                        "page fetches). Aborting instead of continuing an "
-                        "unexpectedly long TOC walk."
-                    )
-            from ..request_manager import NotFoundFetchError
+    @staticmethod
+    def _check_cancelled(rm):
+        from ..request_manager import ScrapeCancelled
+        if getattr(getattr(rm, "cancel_event", None), "is_set", lambda: False)():
+            raise ScrapeCancelled("cancelled during chapter-page discovery")
 
-            try:
-                html = rm.fetch(
-                    chapter_url_for(spec, slug), use_browser=spec.use_browser
-                )
-            except NotFoundFetchError:
-                known[slug] = (_MISSING_PAGE_MARKER, None)
-                self._warn(
-                    f"{spec.novel_slug!r}: slug {slug} is missing (HTTP 404/410); "
-                    "treating it as a chapter-number discontinuity."
-                )
+    def _fetch_and_read(self, rm, spec, slug, known, *, fetch_budget=None):
+        """Read independent current evidence once; saved tuples are not observations."""
+        self._check_cancelled(rm)
+        prior = known.get(slug)
+        if isinstance(prior, _PageRead):
+            return prior.number if prior.evidence.verified else None
+        if fetch_budget is not None:
+            if fetch_budget["count"] >= fetch_budget["limit"]:
+                raise RuntimeError("FreeWebNovel chapter-index reconciliation exceeded its fetch safety ceiling "
+                                   f"({fetch_budget['limit']} chapter page fetches).")
+            fetch_budget["count"] += 1
+        from ..request_manager import FetchError, NotFoundFetchError
+        from ..cloudflare_detection import is_cloudflare_challenge
+        url = chapter_url_for(spec, slug)
+        number, reference = None, None
+        try:
+            # No historical cache generation certifies current identity. No writes
+            # to persistent HTML caches occur through this uncached discovery call.
+            html = rm.fetch(url, use_browser=spec.use_browser, use_cache=False)
+        except NotFoundFetchError as exc:
+            evidence = DiscoveryEvidence("inaccessible", "current-response", detail=f"HTTP {exc.status}: URL missing; chapter absence unproven")
+            self._warn(f"{spec.novel_slug!r}: slug {slug} is missing (HTTP {exc.status}); chapter identity unresolved.")
+        except FetchError as exc:
+            evidence = DiscoveryEvidence("inaccessible", "current-response", detail=str(exc))
+        else:
+            soup = BeautifulSoup(html, "html.parser")
+            body = _extract_paragraphs(soup)
+            document_heading = " ".join(node.get_text(" ") for node in soup.select("title, h1"))
+            access_document = re.search(r"error\s*1015|rate.?limit|access denied", document_heading, re.I)
+            if is_cloudflare_challenge(html) or access_document or (not body and re.search(r"error\s*1015|rate.?limit|access denied", soup.get_text(" "), re.I)):
+                evidence = DiscoveryEvidence("inaccessible", "current-response", detail="access/rate-limit document")
             else:
-                page = BeautifulSoup(html, "html.parser")
                 try:
-                    num, _title, _shown = _observed_heading(page)
+                    number, _title, _shown = _observed_heading(soup)
                 except ChapterMismatchError as exc:
-                    self._warn(f"unresolved chapter identity at {chapter_url_for(spec, slug)}: {exc}")
-                    num = None
-                known[slug] = (html, num)
-        return known[slug][1]
+                    evidence = DiscoveryEvidence("conflict", "current-page", detail=str(exc))
+                else:
+                    if number is not None:
+                        label = ChapterLabel.parse(str(number)).text
+                        if not body:
+                            evidence = DiscoveryEvidence("unreadable", "current-page", (label,), "missing chapter body")
+                        else:
+                            evidence = DiscoveryEvidence("observed", "current-page", (label,))
+                    else:
+                        headings = " ".join(_candidate_title_texts(soup))
+                        extra = bool(re.search(r"-2\s+Joke Chapter|(?:Chapter\s+)?-1\s+Volume\s+2\s+Glossary", headings, re.I))
+                        evidence = DiscoveryEvidence("extra" if extra else "unknown", "current-page", detail="recognized opening extra" if extra else "no positive page identity")
+                if prior is not None:
+                    old_html, old_number = prior
+                    if old_number is not None and number is not None and str(old_number) != str(number):
+                        detail = f"prior {'HTML observation' if old_html else 'unverified candidate'} {old_number}; current page {number}"
+                        self._warn(f"{url}: {detail}")
+                        labels = (str(old_number), str(number)) if old_html else (str(number),)
+                        evidence = DiscoveryEvidence("conflict" if old_html else evidence.status,
+                                                     evidence.provenance, labels, detail)
+                if getattr(getattr(rm, "last_fetch_info", None), "from_cache", False):
+                    evidence = DiscoveryEvidence("saved_unknown", "historical-cache", evidence.labels,
+                                                 "fetch unexpectedly supplied cached HTML; " + evidence.detail)
+                if evidence.verified:
+                    spool = getattr(self, "_discovery_spool", None) or _PageSpool()
+                    reference = spool.put(html)
+        if not evidence.verified:
+            number = None
+            self._warn(f"{url}: {evidence.status}: {evidence.detail}")
+        known[slug] = _PageRead(number, reference, evidence)
+        return number
 
-    def _resolve_slug_for_displayed(
-        self,
-        rm,
-        spec: SiteSpec,
-        target: int | float,
-        lo: int,
-        hi: int,
-        known: dict[int, tuple[Optional[str], Optional[int | Decimal]]],
-        *,
-        fetch_budget: Optional[dict[str, int]] = None,
-    ) -> int:
-        """Binary search over the monotone (non-decreasing) displayed(slug)
-        relationship for the LOWEST slug whose displayed number is >= target —
-        the first page addressing that chapter. An unparseable page (extras
-        read as ``None``) is treated as "below target" so the search steps past
-        it rather than stalling. This only needs to be approximately right: the
-        caller pads the result and the per-page walk is the authoritative
-        reconciliation."""
-        best = hi
+    def _resolve_slug_for_displayed(self, rm, spec, target, lo, hi, known, *, fetch_budget=None):
+        """Return a navigation candidate, never a monotonicity/completeness proof."""
+        target_value = ChapterLabel.parse(str(target)).value
         while lo < hi:
             mid = (lo + hi) // 2
-            num = self._fetch_and_read(
-                rm, spec, mid, known, fetch_budget=fetch_budget
-            )
-            if num is not None and num >= target:
-                best = mid
+            number = self._fetch_and_read(rm, spec, mid, known, fetch_budget=fetch_budget)
+            if number is not None and Decimal(number) >= target_value:
                 hi = mid
             else:
                 lo = mid + 1
-        return best if best is not None else lo
+        return lo
 
     @staticmethod
-    def _displayed_offset(slug: int, num: Optional[int | Decimal]) -> Optional[int]:
-        """Return ``slug - displayed`` only for ordinary positive integer
-        chapter pages. Fractional side chapters and unnumbered extras are not
-        inferable constant-span endpoints, so the compressed reconciler walks
-        around them explicitly."""
-        if isinstance(num, int) and num >= 1:
-            return slug - num
-        return None
+    def _displayed_offset(slug, num):
+        return slug - num if isinstance(num, int) and num >= 1 else None
 
-    def _reconcile_window(
-        self,
-        rm,
-        spec: SiteSpec,
-        walk_lo: int,
-        walk_hi: int,
-        known: dict[int, tuple[Optional[str], Optional[int | Decimal]]],
-        *,
-        fetch_budget: Optional[dict[str, int]] = None,
-        resume_metas: Optional[list[ChapterMeta]] = None,
-        index_progress_cb: Optional[
-            Callable[[list[ChapterMeta], int, int], None]
-        ] = None,
-    ) -> list[ChapterMeta]:
-        """Resolve a slug window to displayed-space chapter metadata.
+    def _reconcile_window(self, rm, spec, walk_lo, walk_hi, known, *, fetch_budget=None,
+                          resume_metas=None, index_progress_cb=None):
+        """Observe every slug once. Inference never enters returned chapter rows.
 
-        Large offset novels are mostly constant-offset spans interrupted by a
-        small number of inserts/extras. Fetching every page during TOC build
-        makes a full-range run look hung for hours. This walk uses the documented
-        slug-to-number gap, fetches the pages that are not ordinary numbered chapters,
-        and infers only short spans between probed pages with the same gap."""
-        if walk_lo > walk_hi:
-            return []
-        metas_by_slug: dict[int, ChapterMeta] = {
-            meta.slug: meta
-            for meta in (resume_metas or [])
-            if meta.slug is not None and walk_lo <= meta.slug <= walk_hi
-        }
-        last_search_log_count = 0
+        Callbacks contain observed pages and explicit per-URL outcomes; partial
+        results never vouch for completeness. Seeds cannot suppress page reads.
+        """
+        rows, evidence = {}, {}
+        seeds = {m.slug: m for m in resume_metas or [] if m.slug is not None}
+        self._discovery_spool = _PageSpool()
+        last_emitted = None
 
-        def add_meta(meta: ChapterMeta) -> None:
-            if meta.slug is None:
-                raise RuntimeError("FreeWebNovel reconciliation produced a row without a slug.")
-            metas_by_slug[meta.slug] = meta
+        def snapshot(complete=False):
+            return ChapterIndex(sorted(rows.values(), key=lambda m: (ChapterLabel.from_meta(m).sort_key, m.slug)),
+                                tail_confirmed=False, evidence=dict(evidence), discovery_complete=complete)
 
-        def sorted_metas() -> list[ChapterMeta]:
-            return sorted(
-                metas_by_slug.values(),
-                key=lambda meta: (ChapterLabel.parse(_meta_label(meta)).sort_key, meta.slug or 0),
-            )
-
-        def add_inferred(lo: int, hi: int, offset: int) -> None:
-            for slug in range(lo, hi + 1):
-                index = slug - offset
-                if index < 1:
-                    continue
-                add_meta(
-                    ChapterMeta(
-                        index=index,
-                        url=chapter_url_for(spec, slug),
-                        slug=slug,
-                    )
-                )
-
-        def add_exact(slug: int) -> Optional[int]:
-            num = self._fetch_and_read(
-                rm, spec, slug, known, fetch_budget=fetch_budget
-            )
-            html = known[slug][0]
-            if num is None:
-                if html == _MISSING_PAGE_MARKER:
-                    return None
-                self._warn(
-                    f"{spec.novel_slug!r}: skipping slug {slug} (no parseable "
-                    "positive chapter number — joke/glossary extra)."
-                )
-                return None
-            add_meta(_parsed_meta(spec, slug, num, html))
-            return self._displayed_offset(slug, num)
-
-        def emit_progress(through_slug: int) -> None:
-            metas = sorted_metas()
-            fetches = fetch_budget["count"] if fetch_budget is not None else len(known)
-            self._log(
-                f"{spec.novel_slug!r}: reconciled through slug {through_slug} "
-                f"of {walk_hi} ({len(metas)} chapters resolved; {fetches} "
-                "chapter pages fetched)."
-            )
-            if index_progress_cb is not None:
-                index_progress_cb(metas, through_slug, walk_hi)
-
-        def maybe_log_search(search_lo: int, search_hi: int) -> None:
-            nonlocal last_search_log_count
-            fetches = fetch_budget["count"] if fetch_budget is not None else len(known)
-            if fetches - last_search_log_count < _RECONCILIATION_SEARCH_LOG_EVERY:
+        def emit(through):
+            nonlocal last_emitted
+            if through == last_emitted:
                 return
-            last_search_log_count = fetches
-            self._log(
-                f"{spec.novel_slug!r}: locating next chapter-number offset "
-                f"change in slugs {search_lo}-{search_hi} "
-                f"({fetches} chapter pages fetched so far)."
-            )
+            last_emitted = through
+            self._log(f"{spec.novel_slug!r}: reconciled through slug {through} of {walk_hi} "
+                      f"({len(rows)} observed chapters; no inferred identities).")
+            if index_progress_cb is not None:
+                index_progress_cb(snapshot(), through, walk_hi)
 
-        # Establish the first ordinary integer page. Opening joke/glossary or
-        # fractional pages are authoritative and therefore fetched explicitly.
-        cursor = walk_lo
-        current_offset: Optional[int] = None
-        while cursor <= walk_hi and current_offset is None:
-            current_offset = add_exact(cursor)
-            cursor += 1
-        if current_offset is None:
-            emit_progress(walk_hi)
-            return sorted_metas()
+        through = walk_lo - 1
+        try:
+            for slug in range(walk_lo, walk_hi + 1):
+                self._check_cancelled(rm)
+                number = self._fetch_and_read(rm, spec, slug, known, fetch_budget=fetch_budget)
+                read = known[slug]
+                url = chapter_url_for(spec, slug)
+                evidence[url] = read.evidence
+                if number is not None:
+                    meta = _parsed_meta(spec, slug, number, None)
+                    seed = seeds.get(slug)
+                    if seed is not None and _meta_label(seed) != _meta_label(meta):
+                        detail = f"saved unknown label {_meta_label(seed)} contradicts observed {_meta_label(meta)}"
+                        self._warn(f"{url}: {detail}")
+                        evidence[url] = DiscoveryEvidence("observed", "current-page", (_meta_label(meta),), detail)
+                    meta.extra[_EVIDENCE_KEY] = evidence[url]
+                    meta.extra[_PREFETCHED_HTML_KEY] = read.html
+                    rows[slug] = meta
+                through = slug
+                if (slug - walk_lo + 1) % _DISCOVERY_BATCH == 0:
+                    emit(through)
+            emit(through)
+            complete = bool(evidence) and all(e.verified or e.status == "extra" for e in evidence.values())
+            return snapshot(complete)
+        except BaseException:
+            emit(through)
+            raise
+        finally:
+            del self._discovery_spool
 
-        # Establish the final ordinary offset; a trailing insert is walked later.
-        right_integer_slug = walk_hi
-        final_offset: Optional[int] = None
-        while right_integer_slug >= cursor and final_offset is None:
-            num = self._fetch_and_read(
-                rm, spec, right_integer_slug, known, fetch_budget=fetch_budget
-            )
-            final_offset = self._displayed_offset(right_integer_slug, num)
-            if final_offset is None:
-                right_integer_slug -= 1
-        if final_offset is None:
-            for slug in range(cursor, walk_hi + 1):
-                add_exact(slug)
-            emit_progress(walk_hi)
-            return sorted_metas()
-
-        # The gap between slug and displayed number is NOT monotone: the site can skip numbers for a
-        # stretch and then come back to the earlier gap (Supreme Magus slugs 1653-1932 show two numbers
-        # more than the pages before and after them). Two equal gaps therefore prove nothing about the
-        # pages between; a span is inferred only when it is short enough to sit between two probed
-        # pages that agree. Longer spans are halved (fetching the middle page) until they are, so a
-        # change in the gap is found to the exact slug. Pages with no ordinary number (fractional
-        # inserts, extras, missing pages) are fetched one by one, never inferred.
-        add_exact(right_integer_slug)
-        emit_progress(cursor - 1)
-        pending = [(cursor - 1, right_integer_slug, current_offset, final_offset)]
-        while pending:
-            lo, hi, off_lo, off_hi = pending.pop()
-            if hi - lo <= 1:
-                continue
-            if off_lo is None:
-                pending.append((lo + 1, hi, add_exact(lo + 1), off_hi))
-            elif off_hi is None:
-                pending.append((lo, hi - 1, off_lo, add_exact(hi - 1)))
-            elif off_lo == off_hi and hi - lo <= _VERIFY_STRIDE:
-                add_inferred(lo + 1, hi - 1, off_lo)
-                emit_progress(hi)
-            else:
-                # Equal gaps: step along at the probe spacing. Different gaps: halve, to find where.
-                mid = lo + _VERIFY_STRIDE if off_lo == off_hi else (lo + hi) // 2
-                off_mid = add_exact(mid)
-                maybe_log_search(lo, hi)
-                pending.append((mid, hi, off_mid, off_hi))
-                pending.append((lo, mid, off_lo, off_mid))
-        for slug in range(right_integer_slug + 1, walk_hi + 1):
-            add_exact(slug)
-        emit_progress(walk_hi)
-
-        metas = sorted_metas()
-        self._log(
-            f"{spec.novel_slug!r}: chapter-index reconciliation read "
-            f"{fetch_budget['count'] if fetch_budget is not None else len(known)} chapter pages and "
-            f"inferred the rest only between pages at most {_VERIFY_STRIDE} slugs apart that agree."
-        )
-        return metas
-
-    def _walk_and_reconcile(
-        self,
-        rm,
-        spec: SiteSpec,
-        walk_lo: int,
-        walk_hi: int,
-        known: dict[int, tuple[Optional[str], Optional[int | Decimal]]],
-        *,
-        fetch_budget: Optional[dict[str, int]] = None,
-    ) -> list[ChapterMeta]:
-        """Walk slugs ``walk_lo..walk_hi`` in order, reading each page's ACTUAL
-        displayed chapter number. Fractional numbers are kept as their own
-        label; a page with no parseable positive number (joke chapter, negative
-        "Volume Glossary" extras) is skipped and logged, not emitted as a
-        degraded "Chapter N." — that silent mislabel is what this fix removes.
-        Fetched HTML is cached on the returned meta's ``extra`` so
-        ``fetch_chapter`` never re-fetches the same page."""
-        metas: list[ChapterMeta] = []
-        skipped = 0
-        for slug in range(walk_lo, walk_hi + 1):
-            num = self._fetch_and_read(
-                rm, spec, slug, known, fetch_budget=fetch_budget
-            )
-            html = known[slug][0]
-            if num is None:
-                skipped += 1
-                if html == _MISSING_PAGE_MARKER:
-                    continue
-                self._warn(
-                    f"{spec.novel_slug!r}: skipping slug {slug} (no parseable "
-                    "positive chapter number — joke/glossary extra)."
-                )
-                continue
-            metas.append(_parsed_meta(spec, slug, num, html))
-        metas.sort(key=lambda m: (ChapterLabel.parse(_meta_label(m)).sort_key, m.slug or 0))
-        if skipped:
-            self._log(
-                f"{spec.novel_slug!r}: resolved {len(metas)} chapter(s) by "
-                f"displayed number over slugs {walk_lo}-{walk_hi} "
-                f"({skipped} extra page(s) skipped)."
-            )
-        return metas
+    def _walk_and_reconcile(self, rm, spec, walk_lo, walk_hi, known, *, fetch_budget=None):
+        return self._reconcile_window(rm, spec, walk_lo, walk_hi, known, fetch_budget=fetch_budget)
 
     def fetch_chapter(
         self, meta: ChapterMeta, spec: SiteSpec, *, fast_path: bool = False
@@ -957,7 +808,8 @@ class FreeWebNovelAdapter(BaseAdapter):
             # checks as any page: one that is not this chapter is set aside and the page is fetched
             # again, exactly as for a saved page (``extract_validated``).
             try:
-                return self._extract_chapter(prefetched, meta)
+                html = prefetched.read() if isinstance(prefetched, _PageRef) else prefetched
+                return self._extract_chapter(html, meta)
             except EmptyExtractionError as exc:
                 invalidate = getattr(rm, "invalidate_cache", None)
                 if callable(invalidate):

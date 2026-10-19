@@ -829,37 +829,38 @@ def _sm_run(tmp_path, store, adapter, start, end, folder="out", **kw):
     return report, logs
 
 
-def test_real_adapter_offset_discovery_is_persisted_and_then_served_without_the_toc(tmp_path, store):
+def test_real_adapter_offset_observations_are_ephemeral_and_rechecked_next_run(tmp_path, store):
     spec, rm, adapter = _offset_novel()
     first, _ = _sm_run(tmp_path, store, adapter, 114, 118)
     assert first.effective_range == (114, 118) and first.toc_gaps == []
     assert len(first.written) == 6                           # 114-118 plus the 116.5 insert
     sm_source = SourceIdentity.from_site_spec(spec)
-    saved = store.load_effective(sm_source).effective
-    assert saved.covers(114, 118)
-    by_label = {c.label.text: c.slug for c in saved.chapters}
+    assert not store.runtime_path(sm_source).exists()
+    assert not store.load_effective(sm_source).effective.spans
+    assert len(rm.fetched) == 501  # one TOC, one observation per source page
+    selected = json.loads((first.output_dir / "run-selection.json").read_text(encoding="utf-8"))
+    by_label = {row["label"]: row["slug"] for row in selected["chapters"]}
     assert by_label["116"] == 119 and by_label["116.5"] == 120
 
     walked = len(rm.fetched)
     toc_before = rm.fetched.count(spec.url)
     second, _ = _sm_run(tmp_path, store, adapter, 115, 117, folder="second")
-    assert rm.fetched.count(spec.url) == toc_before           # no index page, no probes, no walk
-    assert [u for u in rm.fetched[walked:] if "/chapter-" not in u] == []
+    assert rm.fetched.count(spec.url) == toc_before + 1
+    assert len(rm.fetched) - walked == 501
     assert second.effective_range == (115, 117)
+    assert not store.runtime_path(sm_source).exists()
 
 
-def test_real_adapter_extension_reuses_what_is_known_and_only_walks_the_new_window(tmp_path, store):
+def test_real_adapter_extension_reobserves_pages_until_persisted_policy_exists(tmp_path, store):
     spec, rm, adapter = _offset_novel()
     _sm_run(tmp_path, store, adapter, 100, 104)
     sm_source = SourceIdentity.from_site_spec(spec)
-    first_pages = set(c.page_url for c in store.load_effective(sm_source).effective.chapters)
-
+    assert not store.runtime_path(sm_source).exists()
     before = len(rm.fetched)
-    _sm_run(tmp_path, store, adapter, 100, 140, folder="wider")
-    after = store.load_effective(sm_source).effective
-    assert after.covers(100, 140)
-    assert first_pages <= {c.page_url for c in after.chapters}   # nothing earlier was lost
-    assert len(rm.fetched) - before < 90                         # bounded, not a full-novel walk
+    report, _ = _sm_run(tmp_path, store, adapter, 100, 140, folder="wider")
+    assert len(report.written) == 42  # forty-one integers and fractional 116.5
+    assert len(rm.fetched) - before == 501
+    assert not store.load_effective(sm_source).effective.spans
 
 
 def test_real_adapter_duplicate_displayed_number_stays_two_pages_end_to_end(tmp_path, store):
@@ -875,8 +876,9 @@ def test_real_adapter_duplicate_displayed_number_stays_two_pages_end_to_end(tmp_
     spec, rm, adapter = _offset_novel(label)
     report, logs = _sm_run(tmp_path, store, adapter, 45, 50)
     sm_source = SourceIdentity.from_site_spec(spec)
-    saved = store.load_effective(sm_source).effective
-    assert [c.slug for c in saved.duplicate_labels()[ChapterLabel("47")]] == [50, 51]
+    assert not store.runtime_path(sm_source).exists()
+    metas = adapter.build_chapter_index(spec)
+    assert [m.slug for m in metas if m.index == 47] == [50, 51]
     names = sorted(p.name for p in report.written)
     assert len(names) == len(set(names)) == 7              # 45,46,47,47,48,49,50: nothing merged
     assert any("[slug 51]" in n for n in names)

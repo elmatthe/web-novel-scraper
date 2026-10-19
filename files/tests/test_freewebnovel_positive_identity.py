@@ -163,16 +163,24 @@ def test_com_build_index_carries_exact_labels_without_changing_numeric_indices()
     assert len({m.url for m in metas}) == 2
 
 
-def test_seeded_exact_label_survives_existing_probe_reuse():
+def test_seeded_exact_label_survives_only_after_independent_page_observation():
     meta = ChapterMeta(627.1, f"{SPEC.url}/chapter-1", slug=1, extra={"manifest_label": "627.10"})
 
     class Site:
-        def fetch(self, url, **kw):
-            assert url == SPEC.url  # Existing seed reuse; no discovery policy change here.
-            return f"<a href='{SPEC.url}/chapter-1'>Chapter 627.10</a>"
+        calls = []
 
-    result = fwn.FreeWebNovelAdapter(request_manager=Site()).build_chapter_index(SPEC, resume_metas=[meta])
+        def fetch(self, url, **kw):
+            self.calls.append(url)
+            if url == SPEC.url:
+                return f"<a href='{SPEC.url}/chapter-1'>Chapter 627.10</a>"
+            assert url == meta.url and kw["use_cache"] is False
+            return page("Chapter 627.10: Diagnostic")
+
+    site = Site()
+    result = fwn.FreeWebNovelAdapter(request_manager=site).build_chapter_index(SPEC, resume_metas=[meta])
     assert result[0].extra["manifest_label"] == "627.10"
+    assert site.calls == [SPEC.url, meta.url]
+    assert result[0].extra["discovery_evidence"].verified
 
 
 @pytest.mark.parametrize("observed,expected", [("627.1", "627.10"), ("627.10", "627.1")])

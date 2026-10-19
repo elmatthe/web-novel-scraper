@@ -313,7 +313,9 @@ class SlugSynthesizingRM:
         if slug in self.missing_slugs:
             raise NotFoundFetchError(f"HTTP 404 for {url}", status=404)
         label = self.label_fn(slug)
-        header = f"Chapter {label} Synthetic Title" if label else "-9 Unnumbered extra"
+        # Unknown negative headings are not certified extras. These synthetic
+        # opening pages use the source's positively recognized extra headings.
+        header = f"Chapter {label} Synthetic Title" if label else "-2 Joke Chapter"
         return (
             "<html><head><title>x</title></head><body>"
             f"<h1><span class='chapter'>{header}</span></h1>"
@@ -329,14 +331,9 @@ class SlugSynthesizingRM:
         pass
 
 
-def test_binary_search_and_bounded_walk_resolve_displayed_number_to_slug() -> None:
-    """Range semantics on a large offset novel: a requested displayed number
-    (116) resolves to its correct slug (119) — and the fractional insert right
-    beside it (slug 120 -> "116.5") is picked up by the padded walk — WITHOUT
-    walking the whole 500-slug novel. Index-page anchors carry no text (as in
-    the earlier extras test), so identity can't be confirmed for free and the
-    binary-search/walk path is exercised exactly as it would be for a real
-    request landing outside the index page's rendered slice."""
+def test_hinted_observation_scan_resolves_displayed_number_to_slug() -> None:
+    """Hints cannot bound a nonmonotone source. Read each page once, preserving
+    the requested label and adjacent fractional insert without padding assumptions."""
     index_url = SM_SPEC.url
     index_html = "<html><body>" + "".join(
         f"<a href='{index_url}/chapter-{n}'>x</a>" for n in (498, 499, 500)
@@ -350,20 +347,13 @@ def test_binary_search_and_bounded_walk_resolve_displayed_number_to_slug() -> No
     assert by_index[116] == 119
     assert by_index[116.5] == 120
 
-    # Boundedness: a full walk of this novel would fetch ~500 chapter pages;
-    # binary search + the padded window should need a small fraction of that.
-    assert len(rm.fetched) < 60, (
-        f"expected a bounded walk, fetched {len(rm.fetched)} URLs"
-    )
+    assert len(rm.fetched) == 501
+    assert len(set(rm.fetched)) == 501
+    assert all(m.extra["discovery_evidence"].verified for m in metas)
 
 
-def test_full_range_offset_index_uses_compressed_walk_not_every_slug() -> None:
-    """Supreme Magus live shape: a user asks for ``1-5000`` while the site has
-    fewer slugs and a growing slug-vs-displayed offset. The previous offset
-    path treated that as "walk slug 1 through latest" and fetched essentially
-    every chapter page before writing ``chapter_index.json`` or a single PDF.
-    The compressed reconciler infers constant-offset spans and only walks near
-    extras/discontinuities."""
+def test_full_range_offset_index_observes_every_slug_once() -> None:
+    """A complete page scan replaces the old inferred-as-verified optimization."""
     index_url = SM_SPEC.url
     index_html = "<html><body>" + "".join(
         f"<a href='{index_url}/chapter-{n}'>x</a>" for n in (498, 499, 500)
@@ -381,10 +371,8 @@ def test_full_range_offset_index_uses_compressed_walk_not_every_slug() -> None:
     assert len(metas) == 497  # 1..496 plus the fractional 116.5 insert
 
     chapter_fetches = [u for u in rm.fetched if "/chapter-" in u]
-    assert len(chapter_fetches) < 120, (
-        "full-range offset reconciliation should not fetch every slug before "
-        f"content starts; fetched {len(chapter_fetches)} chapter pages"
-    )
+    assert len(chapter_fetches) == len(set(chapter_fetches)) == 500
+    assert all(m.extra["discovery_evidence"].verified for m in metas)
 
 
 def test_real_size_full_range_offset_reconciliation_stays_observably_bounded() -> None:
@@ -393,7 +381,7 @@ def test_real_size_full_range_offset_reconciliation_stays_observably_bounded() -
     The novel starts with two unnumbered extras and accumulates eleven
     fractional inserts, one missing slug, and one duplicate displayed number
     across 4,417 slugs, growing from offset 2 to offset 15. A full ``1-5000``
-    request must not degrade into a near-linear browser walk.
+    request observes every source page once, including inaccessible pages.
     """
     count = 4417
     insert_slugs = {
@@ -464,26 +452,16 @@ def test_real_size_full_range_offset_reconciliation_stays_observably_bounded() -
     duplicate_index = int(full_size_label(3679))
     assert [m.slug for m in metas if m.index == duplicate_index] == [3678, 3679]
     chapter_fetches = [u for u in rm.fetched if "/chapter-" in u]
-    # One page in sixteen is read to prove a span between two equal gaps really is constant (the site can
-    # skip numbers for a stretch and return to the earlier gap), plus the inserts and their bisection.
-    assert 250 < len(chapter_fetches) < 450
+    assert len(chapter_fetches) == len(set(chapter_fetches)) == count
     assert any("slug 1472 is missing" in line for line in logs)
-    assert any("locating next chapter-number offset change" in line for line in logs)
+    assert not metas.discovery_complete
+    assert not metas.tail_confirmed
     assert any("reconciled through slug 4417 of 4417" in line for line in logs)
 
 
 # ── Phase 3: pipeline wiring — job.start/end reach the adapter as hints ──────
-def test_pipeline_run_near_high_chapter_stays_bounded_on_offset_novel(tmp_path) -> None:
-    """End-to-end through ``pipeline.run_scrape`` (the legacy/injected-adapter
-    path — used unconditionally whenever an adapter is injected, per
-    ``run_scrape``'s own scope-gate check): a user request for a single high
-    displayed chapter (116) on the same 500-slug synthetic offset novel resolves
-    to the correct slug (119), writes the correctly-named PDF, and — the point
-    of Phase 3's pipeline wiring — the underlying fetch count stays BOUNDED
-    (job.start/job.end actually reached ``build_chapter_index`` as
-    start_hint/end_hint; before this wiring, the adapter always walked
-    unbounded from slug 1, which for this 500-slug novel would need ~120+
-    fetches just to reach chapter 116)."""
+def test_pipeline_high_chapter_reuses_independently_observed_page(tmp_path) -> None:
+    """Selection hints reach discovery; extraction reuses its verified page spool."""
     index_url = SM_SPEC.url
     index_html = "<html><body>" + "".join(
         f"<a href='{index_url}/chapter-{n}'>x</a>" for n in (498, 499, 500)
@@ -509,12 +487,8 @@ def test_pipeline_run_near_high_chapter_stays_bounded_on_offset_novel(tmp_path) 
     assert report.written[0].name == "Chapter 116_ Synthetic Title.pdf"
     assert not report.failed
 
-    # Boundedness proof: index-build (bounded walk) + one content fetch (or
-    # zero, if fetch_chapter reused the walk's cached HTML) — nowhere near an
-    # unbounded from-slug-1 walk (~120 fetches) or the full 500-slug novel.
-    assert len(rm.fetched) < 60, (
-        f"expected job.start/end to bound the walk, fetched {len(rm.fetched)} URLs"
-    )
+    # One index + 500 observations; extraction adds no network request.
+    assert len(rm.fetched) == len(set(rm.fetched)) == 501
 
 
 def test_pipeline_end_hint_treats_unbounded_end_as_no_hint() -> None:
