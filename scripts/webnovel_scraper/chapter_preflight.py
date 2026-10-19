@@ -121,18 +121,7 @@ def index_tail_confirmed(metas: object) -> bool:
 def meta_label(meta: object) -> ChapterLabel:
     """The exact label of a meta: the manifest text carried in ``extra`` when it agrees with the
     numeric ``index``, otherwise the label of the index itself."""
-    index = getattr(meta, "index", None)
-    from_index = ChapterLabel.from_index(index)
-    extra = getattr(meta, "extra", None)
-    raw = extra.get(LABEL_KEY) if isinstance(extra, dict) else None
-    if isinstance(raw, str):
-        try:
-            carried = ChapterLabel(raw)
-        except SourceIdentityError:
-            return from_index
-        if carried.value == from_index.value:
-            return carried
-    return from_index
+    return ChapterLabel.from_meta(meta)
 
 
 def _clean(text: str, limit: int) -> Optional[str]:

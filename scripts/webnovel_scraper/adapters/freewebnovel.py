@@ -40,6 +40,7 @@ from ..models import (
     EmptyExtractionError,
     SiteSpec,
 )
+from ..source_identity import ChapterLabel
 from .base import BaseAdapter, extract_validated
 
 logger = logging.getLogger(__name__)
@@ -71,10 +72,18 @@ _COMPOSITE_RE = re.compile(
 )
 
 
-def _parse_chapter_number(raw: str) -> int | float:
-    """"627" → 627 (int); "627.2" → 627.2 (float). Fractional side-chapter
-    numbers stay floats so they sort between their integer neighbours."""
-    return float(raw) if "." in raw else int(raw)
+def _parse_chapter_number(raw: str) -> int | Decimal:
+    """Keep fractional text at first parse, including trailing zeros. Numeric legacy
+    indices are created only alongside the exact ``manifest_label`` metadata."""
+    return Decimal(raw) if "." in raw else int(raw)
+
+
+def _parsed_meta(spec: SiteSpec, slug: int, number: int | float | Decimal, html: Optional[str]) -> ChapterMeta:
+    label = ChapterLabel.parse(str(number))
+    extra = {"manifest_label": label.text}
+    if html is not None:
+        extra[_PREFETCHED_HTML_KEY] = html
+    return ChapterMeta(index=label.to_index(), url=chapter_url_for(spec, slug), slug=slug, extra=extra)
 
 # FreeWebNovel injects zero-width / format / non-breaking-space characters
 # between words (notably U+200C Zero-Width Non-Joiner in Reverend Insanity
@@ -131,8 +140,7 @@ _VERIFY_STRIDE = 16
 
 def _meta_label(meta: ChapterMeta) -> str:
     """The exact label of a chapter (the manifest's text when present: ``627.10`` survives)."""
-    carried = meta.extra.get("manifest_label") if isinstance(meta.extra, dict) else None
-    return carried if isinstance(carried, str) and carried else label_text(meta.index)
+    return ChapterLabel.from_meta(meta).text
 
 
 def _ws(text: str) -> str:
@@ -193,14 +201,10 @@ def _candidate_title_texts(soup: BeautifulSoup) -> list[str]:
     for tag in soup.find_all(["h1", "h2", "h3", "h4", "h5", "h6"], limit=30):
         add(tag.get_text(" ", strip=True))
 
-    for sel in _BODY_CONTAINER_SELECTORS:
-        for container in soup.select(sel):
-            for child in container.find_all(["p", "div"], limit=10):
-                txt = child.get_text(" ", strip=True)
-                if not txt or len(txt) > 300:
-                    continue
-                if "chapter" in txt.lower():
-                    add(txt)
+    # Only opening headings are identity evidence; a mention in ordinary prose is not.
+    for line in _extract_paragraphs(soup)[:_HEADING_LINES]:
+        if parse_heading(line)[0] is not None:
+            add(line)
 
     title_tag = soup.find("title")
     if title_tag:
@@ -215,6 +219,7 @@ def _candidate_title_texts(soup: BeautifulSoup) -> list[str]:
 
     # Sibling-merge fallback: an inline "Chapter N" / "Chapter N:" with no title
     # — synthesize a merged candidate from the following sibling text.
+    body_ids = {id(container) for selector in _BODY_CONTAINER_SELECTORS for container in soup.select(selector)}
     for tag in soup.find_all(
         ["strong", "span", "b", "p", "h1", "h2", "h3", "h4", "h5", "h6"]
     ):
@@ -228,6 +233,9 @@ def _candidate_title_texts(soup: BeautifulSoup) -> list[str]:
             continue  # already titled — not a split case
         sib_text = ""
         nxt = tag.find_next_sibling()
+        # A body container or the next story paragraph is never a split title.
+        if id(nxt) in body_ids or any(id(parent) in body_ids for parent in tag.parents):
+            continue
         if nxt is not None:
             sib_text = _strip_invisible(nxt.get_text(" ", strip=True))
         if not sib_text:
@@ -248,17 +256,16 @@ def _candidate_title_texts(soup: BeautifulSoup) -> list[str]:
 
 
 def _normalize_heading_line(
-    raw: str, fallback_num: Optional[int | float]
-) -> tuple[Optional[int | float], str]:
+    raw: str, fallback_num: Optional[int | Decimal]
+) -> tuple[Optional[int | Decimal], str]:
     """Return ``(chapter_number, title_only)``. ``title_only`` is the trimmed
     title text (site junk removed) or ``""`` for a bare-number heading. Returns
     ``(None, "")`` when the text is not a chapter heading at all. ``chapter_number``
-    is a float for a fractional side-chapter ("Chapter 627.2" → 627.2)."""
+    retains exact fractional digits. ``fallback_num`` is ignored for compatibility:
+    an expected number is never observed evidence."""
     raw = _ws(raw)
     m = CHAPTER_TITLE_RE.search(raw)
     if not m:
-        if not raw and fallback_num is not None:
-            return fallback_num, ""
         return None, ""
 
     number = _parse_chapter_number(m.group(1))
@@ -298,23 +305,48 @@ def _composite_heading(soup: BeautifulSoup) -> Optional[tuple[str, int, str]]:
 
 
 def _extract_title(
-    soup: BeautifulSoup, fallback_num: Optional[int | float]
+    soup: BeautifulSoup, fallback_num: Optional[int | Decimal]
 ) -> tuple[Optional[int | float], str]:
-    """Two-pass: prefer a candidate with BOTH a number and a non-empty title;
-    fall back to a title-less (bare-breadcrumb) candidate only if nothing
-    better exists. Robust to render variation between scrapes."""
-    title_less: Optional[tuple[Optional[int], str]] = None
+    """Legacy numeric title helper. Extraction/probing use ``_observed_heading``
+    instead so exact fractional evidence never passes through this float bridge.
+    ``fallback_num`` is ignored: unknown identity stays unknown."""
+    title_less: Optional[tuple[Optional[int | float], str]] = None
     for candidate in _candidate_title_texts(soup):
         num, title = _normalize_heading_line(candidate, fallback_num)
         if num is None:
             continue
         if title:
-            return num, title
+            return float(num) if isinstance(num, Decimal) else num, title
         if title_less is None:
-            title_less = (num, "")
+            title_less = (float(num) if isinstance(num, Decimal) else num, "")
     if title_less is not None:
         return title_less
-    return fallback_num, ""
+    return None, ""
+
+
+def _observed_heading(soup: BeautifulSoup) -> tuple[Optional[int | Decimal], str, Optional[str]]:
+    """Resolve page evidence without an expected number. Only a confirmed composite may
+    reconcile two different labels; every other numbered candidate must agree."""
+    composite = _composite_heading(soup)
+    evidence = []
+    for candidate in _candidate_title_texts(soup):
+        number, title = _normalize_heading_line(candidate, None)
+        if number is None:
+            continue
+        if composite is not None:
+            pair = _COMPOSITE_RE.search(candidate)
+            if pair and (label_text(pair.group(1)), int(pair.group(2))) == composite[:2]:
+                number, title = composite[1], composite[2]
+        evidence.append((number, title))
+    if not evidence:
+        return None, "", None
+    labels = {ChapterLabel.parse(str(number)).text for number, _ in evidence}
+    if len(labels) != 1:
+        raise ChapterMismatchError("conflicting chapter identity evidence: " + ", ".join(sorted(labels)))
+    number = evidence[0][0]
+    title = next((title for _, title in evidence if title), "")
+    shown = f"{composite[0]}-{composite[1]}" if composite else None
+    return number, title, shown
 
 
 # ── Body extraction (v0.3.0 05: structure, then the shared canonical cleanup) ─
@@ -490,10 +522,10 @@ class FreeWebNovelAdapter(BaseAdapter):
 
         # Cache of slug -> (html, displayed_number) so a page fetched to decide
         # identity/resolve the anchor is never fetched again by the walk below.
-        known: dict[int, tuple[Optional[str], Optional[int | float]]] = {}
+        known: dict[int, tuple[Optional[str], Optional[int | Decimal]]] = {}
         for meta in resume_metas or []:
             if meta.slug is not None:
-                known[meta.slug] = (None, meta.index)
+                known[meta.slug] = (None, _parse_chapter_number(_meta_label(meta)))
         fetch_budget = {
             "count": 0,
             "limit": count + _RECONCILIATION_FETCH_CEILING_PADDING,
@@ -566,7 +598,7 @@ class FreeWebNovelAdapter(BaseAdapter):
 
     def _scan_index_page(
         self, soup: BeautifulSoup, spec: SiteSpec
-    ) -> tuple[Optional[int], list[tuple[int, int | float]]]:
+    ) -> tuple[Optional[int], list[tuple[int, int | Decimal]]]:
         """One pass over the index page's anchors: the highest SLUG (for
         ``range()`` generation) plus every (slug, displayed) pair where an
         anchor's own href AND visible text both carry a chapter number — free
@@ -574,7 +606,7 @@ class FreeWebNovelAdapter(BaseAdapter):
         link_re = _chapter_link_re(spec)
         base = spec.base_url or spec.url
         numbers: list[int] = []
-        pairs: list[tuple[int, int | float]] = []
+        pairs: list[tuple[int, int | Decimal]] = []
 
         for a in soup.find_all("a", href=True):
             href = _normalize_url(a["href"], base)
@@ -631,10 +663,10 @@ class FreeWebNovelAdapter(BaseAdapter):
         rm,
         spec: SiteSpec,
         slug: int,
-        known: dict[int, tuple[Optional[str], Optional[int | float]]],
+        known: dict[int, tuple[Optional[str], Optional[int | Decimal]]],
         *,
         fetch_budget: Optional[dict[str, int]] = None,
-    ) -> Optional[int | float]:
+    ) -> Optional[int | Decimal]:
         """Fetch (or reuse a cached) page for ``slug`` and return its displayed
         number, caching ``(html, number)`` in ``known`` so neither the binary
         search, the walk, nor a later ``fetch_chapter`` call ever re-fetches it."""
@@ -662,8 +694,11 @@ class FreeWebNovelAdapter(BaseAdapter):
                 )
             else:
                 page = BeautifulSoup(html, "html.parser")
-                composite = _composite_heading(page)
-                num = composite[1] if composite else _extract_title(page, None)[0]
+                try:
+                    num, _title, _shown = _observed_heading(page)
+                except ChapterMismatchError as exc:
+                    self._warn(f"unresolved chapter identity at {chapter_url_for(spec, slug)}: {exc}")
+                    num = None
                 known[slug] = (html, num)
         return known[slug][1]
 
@@ -674,7 +709,7 @@ class FreeWebNovelAdapter(BaseAdapter):
         target: int | float,
         lo: int,
         hi: int,
-        known: dict[int, tuple[Optional[str], Optional[int | float]]],
+        known: dict[int, tuple[Optional[str], Optional[int | Decimal]]],
         *,
         fetch_budget: Optional[dict[str, int]] = None,
     ) -> int:
@@ -699,7 +734,7 @@ class FreeWebNovelAdapter(BaseAdapter):
         return best if best is not None else lo
 
     @staticmethod
-    def _displayed_offset(slug: int, num: Optional[int | float]) -> Optional[int]:
+    def _displayed_offset(slug: int, num: Optional[int | Decimal]) -> Optional[int]:
         """Return ``slug - displayed`` only for ordinary positive integer
         chapter pages. Fractional side chapters and unnumbered extras are not
         inferable constant-span endpoints, so the compressed reconciler walks
@@ -714,7 +749,7 @@ class FreeWebNovelAdapter(BaseAdapter):
         spec: SiteSpec,
         walk_lo: int,
         walk_hi: int,
-        known: dict[int, tuple[Optional[str], Optional[int | float]]],
+        known: dict[int, tuple[Optional[str], Optional[int | Decimal]]],
         *,
         fetch_budget: Optional[dict[str, int]] = None,
         resume_metas: Optional[list[ChapterMeta]] = None,
@@ -746,7 +781,7 @@ class FreeWebNovelAdapter(BaseAdapter):
         def sorted_metas() -> list[ChapterMeta]:
             return sorted(
                 metas_by_slug.values(),
-                key=lambda meta: (meta.index, meta.slug or 0),
+                key=lambda meta: (ChapterLabel.parse(_meta_label(meta)).sort_key, meta.slug or 0),
             )
 
         def add_inferred(lo: int, hi: int, offset: int) -> None:
@@ -775,15 +810,7 @@ class FreeWebNovelAdapter(BaseAdapter):
                     "positive chapter number — joke/glossary extra)."
                 )
                 return None
-            extra = {_PREFETCHED_HTML_KEY: html} if html is not None else {}
-            add_meta(
-                ChapterMeta(
-                    index=num,
-                    url=chapter_url_for(spec, slug),
-                    slug=slug,
-                    extra=extra,
-                )
-            )
+            add_meta(_parsed_meta(spec, slug, num, html))
             return self._displayed_offset(slug, num)
 
         def emit_progress(through_slug: int) -> None:
@@ -882,7 +909,7 @@ class FreeWebNovelAdapter(BaseAdapter):
         spec: SiteSpec,
         walk_lo: int,
         walk_hi: int,
-        known: dict[int, tuple[Optional[str], Optional[int | float]]],
+        known: dict[int, tuple[Optional[str], Optional[int | Decimal]]],
         *,
         fetch_budget: Optional[dict[str, int]] = None,
     ) -> list[ChapterMeta]:
@@ -909,16 +936,8 @@ class FreeWebNovelAdapter(BaseAdapter):
                     "positive chapter number — joke/glossary extra)."
                 )
                 continue
-            extra = {_PREFETCHED_HTML_KEY: html} if html is not None else {}
-            metas.append(
-                ChapterMeta(
-                    index=num,
-                    url=chapter_url_for(spec, slug),
-                    slug=slug,
-                    extra=extra,
-                )
-            )
-        metas.sort(key=lambda m: m.index)
+            metas.append(_parsed_meta(spec, slug, num, html))
+        metas.sort(key=lambda m: (ChapterLabel.parse(_meta_label(m)).sort_key, m.slug or 0))
         if skipped:
             self._log(
                 f"{spec.novel_slug!r}: resolved {len(metas)} chapter(s) by "
@@ -960,33 +979,20 @@ class FreeWebNovelAdapter(BaseAdapter):
 
     def _extract_chapter(self, html: str, meta: ChapterMeta) -> ChapterContent:
         soup = BeautifulSoup(html, "html.parser")
-        number, title = _extract_title(soup, meta.index)
-        shown = None
-        composite = _composite_heading(soup) if number is not None else None
-        if composite is not None:
-            # "Chapter 1129.1 - 1130 Initiative": the page IS chapter 1130 (the story says so too),
-            # whichever chapter was asked for. Its identity is settled here, before and apart from
-            # the expected number, so the guard below refuses it under 1129.1 or 1131 alike; the
-            # heading keeps the number pair the site shows.
-            shown, number, title = f"{composite[0]}-{composite[1]}", composite[1], composite[2]
+        number, title, shown = _observed_heading(soup)
         if number is None:
-            # No heading says which chapter this is (a misspelling nobody listed, say). The story's own
-            # opening lines may: a heading there for another chapter is that chapter's page.
-            for line in _extract_paragraphs(soup)[:_HEADING_LINES]:
-                story_number, _story_title = parse_heading(line)
-                if story_number is not None:
-                    number = _parse_chapter_number(story_number)
-                    break
-        if number is not None and float(number) != float(meta.index):
+            raise ChapterMismatchError(f"the page at {meta.url} has no observed chapter identity.")
+        label = _meta_label(meta)
+        observed = ChapterLabel.parse(str(number)).text
+        if observed != ChapterLabel.parse(label).text:
             # The offset guard (plan §9.6): a page showing another chapter is never published
             # as this one, however it reached us (cache, network or reconciliation).
             raise ChapterMismatchError(
                 f"the page at {meta.url} shows chapter {number}, but the chapter list expects "
-                f"chapter {meta.index} there (the site's numbering may have moved; refresh the "
+                f"chapter {label} there (the site's numbering may have moved; refresh the "
                 "chapter list and run again)."
             )
 
-        label = _meta_label(meta)
         title = clean_title(title, label) or clean_title(meta.title or "", label)
         paragraphs = clean_paragraphs(_extract_paragraphs(soup), label=label, title=title)
         if shown is not None:

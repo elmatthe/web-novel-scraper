@@ -118,6 +118,22 @@ class ChapterLabel:
         """The label of a legacy ``ChapterMeta.index`` (an integral float collapses to int)."""
         return cls.parse(index)
 
+    @classmethod
+    def from_meta(cls, meta: object) -> "ChapterLabel":
+        """Use carried exact text when numerically compatible with the legacy index.
+        This is a metadata bridge, not evidence that a page has this identity."""
+        numeric = cls.from_index(getattr(meta, "index", None))
+        extra = getattr(meta, "extra", None)
+        raw = extra.get("manifest_label") if isinstance(extra, dict) else None
+        if isinstance(raw, str):
+            try:
+                carried = cls.parse(raw)
+            except SourceIdentityError:
+                return numeric
+            if carried.value == numeric.value:
+                return carried
+        return numeric
+
     @property
     def value(self) -> Decimal:
         return Decimal(self.text)
@@ -375,7 +391,7 @@ class ChapterIdentity:
         """Identity of a legacy ``ChapterMeta`` (duck-typed) under ``source``."""
         return source.chapter_identity(
             getattr(meta, "url", None),
-            ChapterLabel.from_index(getattr(meta, "index", None)),
+            ChapterLabel.from_meta(meta),
             slug=getattr(meta, "slug", None),
             source_id=getattr(meta, "source_id", None),
             title=getattr(meta, "title", None),

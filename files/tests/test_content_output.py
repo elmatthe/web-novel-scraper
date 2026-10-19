@@ -196,7 +196,7 @@ def test_a_page_without_any_known_body_container_is_an_extraction_failure():
 
 
 def test_an_untitled_page_gets_the_explicit_fallback_and_a_warning():
-    adapter, chapter = _extract("<html><body><div id='article'><p>Only text.</p></div></body></html>", 9)
+    adapter, chapter = _extract("<html><body><h1>Chapter 9</h1><div id='article'><p>Only text.</p></div></body></html>", 9)
     assert chapter.heading == "Chapter 9: Untitled"
     assert any("Untitled" in w for w in adapter.warnings)
 
