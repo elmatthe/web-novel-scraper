@@ -235,62 +235,8 @@ class _Preflight:
                 and self.source.host == "freewebnovel.com")
 
     def _resolve_observed(self) -> Selection:
-        """Temporary bridge until Checkpoint 3 can persist evidence generations.
-
-        Refuse before refresh, import, quarantine or writer-lock operations. Fresh
-        observations are usable for this run only; no old schema gains a new
-        verification certificate and interruption leaves no misleading coverage.
-        """
-        if self.end is not None and self.start > self.end:
-            raise ChapterListRefused(
-                f"The start chapter ({self.start}) is after the end chapter ({self.end}); nothing was fetched."
-            )
-        paths = [self.store.baseline_path(self.source), self.store.runtime_path(self.source)]
-        if self.legacy_index is not None:
-            paths.append(self.legacy_index)
-        if any(p.exists() for p in paths):
-            raise ChapterListRefused(
-                "Supreme Magus saved chapter evidence cannot be certified under the current "
-                "manifest schema. Checkpoint 3 is required before saved-state reuse or refresh. "
-                "Existing files were left unchanged."
-            )
-        if self._cancelled():
-            raise ScrapeCancelled("cancelled before chapter-page discovery")
-        metas = self.discover(start_hint=self.start, end_hint=self.end, resume_metas=[],
-                              index_progress_cb=lambda partial, through, _total:
-                              self._checkpoint(partial, through, self.start, self.end))
-        if self._cancelled():
-            raise ScrapeCancelled("cancelled after chapter-page discovery")
-        evidence = getattr(metas, "evidence", {})
-        if (not getattr(metas, "discovery_complete", False) or not evidence
-                or any(not (e.verified or e.status == "extra") for e in evidence.values())):
-            raise ChapterListRefused(
-                "Supreme Magus discovery has unresolved, inaccessible or conflicting page evidence; "
-                "chapter completeness is unproven. No saved coverage was written."
-            )
-        identities = self._identities(metas, report=True)
-        if len(identities) != len(metas):
-            raise ChapterListRefused("Supreme Magus discovery contains unverified or contradictory entries.")
-        for identity in identities:
-            fact = evidence.get(identity.page_url)
-            if not fact or not fact.verified or fact.labels != (identity.label.text,):
-                raise ChapterListRefused("Supreme Magus page evidence does not certify its selected identity.")
-        spans = clipped_spans(identities, None, None)
-        effective = EffectiveManifest(self.source, tuple(identities), (), spans, False)
-        wholes = [n for n in (whole_number(c.label) for c in identities) if n is not None]
-        top = max(wholes, default=self.start)
-        high = top if self.end is None else min(top, self.end)
-        gaps = effective.uncovered_spans(self.start, high) if self.start <= high else []
-        if gaps:
-            raise ChapterListRefused(
-                "Supreme Magus chapter identities remain unresolved: "
-                + ", ".join(_span_text(a, b) for a, b in gaps)
-                + ". Missing observations do not prove source-confirmed absence."
-            )
-        self.tail_confirmed = index_tail_confirmed(metas)
-        self.log(f"  observed {len(identities)} chapter pages; using evidence in memory only "
-                 "until Checkpoint 3 (no saved chapter list written).")
-        return self._select(effective, (min(wholes), top) if wholes else None, discovered=True)
+        from .observed_preflight import resolve_observed
+        return resolve_observed(self)
 
     def _cancelled(self) -> bool:
         return bool(getattr(self.cancel_event, "is_set", lambda: False)())
@@ -432,8 +378,8 @@ class _Preflight:
         resolved, so the unresolved remainder is never claimed. Never raises: a failed checkpoint
         costs only resumability."""
         if self._requires_observations:
-            # Partial page evidence remains ephemeral until the persisted policy
-            # contract exists. Restart must observe pages again, never trust seeds.
+            # This generic metadata callback cannot publish policy evidence. Supreme
+            # Magus uses observed_preflight's validated observation snapshots instead.
             return
         try:
             identities = self._identities(partial, report=False)

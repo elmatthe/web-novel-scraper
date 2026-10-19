@@ -11,6 +11,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .chapter_manifest import ChapterManifest
+    from .chapter_verification import Verification
 
 
 class EmptyExtractionError(Exception):
@@ -106,7 +111,7 @@ class ChapterMeta:
 
 @dataclass(frozen=True)
 class DiscoveryEvidence:
-    """Ephemeral discovery facts; deliberately not a persisted verification certificate.
+    """Discovery facts; persistence additionally requires the versioned page-observation policy.
 
     Only ``observed`` with current-page provenance certifies an identity. Candidates,
     saved_unknown, conflict, unreadable, inaccessible, extra and unknown describe
@@ -137,12 +142,16 @@ class ChapterIndex(list):
     def __init__(self, items=(), *, tail_confirmed: bool = True,
                  examined: tuple[tuple[int, int], ...] | None = None,
                  evidence: dict[str, DiscoveryEvidence] | None = None,
-                 discovery_complete: bool = False) -> None:
+                 discovery_complete: bool = False, verification: Verification | None = None,
+                 verified_manifest: ChapterManifest | None = None, recheck_tail: bool = False) -> None:
         super().__init__(items)
         self.tail_confirmed = tail_confirmed
         self.examined = examined
         self.evidence = evidence or {}
         self.discovery_complete = discovery_complete
+        self.verification = verification
+        self.verified_manifest = verified_manifest
+        self.recheck_tail = recheck_tail
 
 
 @dataclass

@@ -30,6 +30,8 @@ from functools import cached_property
 from typing import Iterable, Optional
 from urllib.parse import urlsplit
 
+from .chapter_verification import Verification
+
 from .source_identity import (
     ChapterIdentity,
     ChapterLabel,
@@ -40,6 +42,7 @@ from .source_identity import (
 )
 
 SCHEMA_VERSION = 1
+VERIFIED_SCHEMA_VERSION = 2
 MANIFEST_KIND = "chapter-manifest"
 LAYER_BASELINE = "baseline"
 LAYER_RUNTIME = "runtime"
@@ -269,6 +272,7 @@ class ChapterManifest:
     spans: tuple
     chapters: tuple
     absent: tuple
+    verification: Optional[Verification] = None
 
     def __post_init__(self) -> None:
         if self.layer not in LAYERS:
@@ -289,6 +293,10 @@ class ChapterManifest:
         self._check_absent()
         self._check_accounting()
         self._check_toc_complete()
+        if self.verification is not None:
+            if not isinstance(self.verification, Verification):
+                raise ManifestError("Manifest verification must be a Verification value.")
+            self.verification.validate_manifest(self)
 
     # -- validation ---------------------------------------------------------
     def _check_spans(self) -> None:
@@ -406,6 +414,7 @@ class ChapterManifest:
         spans: Iterable[tuple[int, int]] = (),
         chapters: Iterable[ChapterIdentity] = (),
         absent: Iterable[AbsentChapter] = (),
+        verification: Optional[Verification] = None,
     ) -> "ChapterManifest":
         """Build a manifest from trusted code: chapters, absences and spans are put in
         canonical order (spans that touch are merged). Validation is the same as on load."""
@@ -417,6 +426,7 @@ class ChapterManifest:
             spans=coalesce_spans(tuple(s) for s in spans),
             chapters=tuple(sorted(chapters, key=chapter_sort_key)),
             absent=tuple(sorted(absent, key=_absent_sort_key)),
+            verification=verification,
         )
 
     @classmethod
@@ -438,13 +448,19 @@ class ChapterManifest:
     # -- serialization ------------------------------------------------------
     @cached_property
     def content_sha256(self) -> str:
-        """SHA-256 over the canonical chapters, absences and spans (not provenance)."""
+        """Schema 1 retains its original checksum. Schema 2 also binds policy, evidence,
+        provenance, source, layer and coverage flags into integrity."""
+        content = {
+            "chapters": [c.to_json() for c in self.chapters],
+            "absent": [a.to_json() for a in self.absent],
+            "spans": [[str(a), str(b)] for a, b in self.spans],
+        }
+        if self.verification is not None:
+            content.update(verification=self.verification.to_json(), source=self.source.to_json(),
+                           provenance=self.provenance.to_json(), layer=self.layer, toc_complete=self.toc_complete,
+                           schema_version=VERIFIED_SCHEMA_VERSION, kind=MANIFEST_KIND)
         canonical = json.dumps(
-            {
-                "chapters": [c.to_json() for c in self.chapters],
-                "absent": [a.to_json() for a in self.absent],
-                "spans": [[str(a), str(b)] for a, b in self.spans],
-            },
+            content,
             sort_keys=True,
             separators=(",", ":"),
             ensure_ascii=True,
@@ -452,8 +468,8 @@ class ChapterManifest:
         return hashlib.sha256(canonical.encode("ascii")).hexdigest()
 
     def to_json(self) -> dict:
-        return {
-            "schema_version": SCHEMA_VERSION,
+        payload = {
+            "schema_version": VERIFIED_SCHEMA_VERSION if self.verification is not None else SCHEMA_VERSION,
             "kind": MANIFEST_KIND,
             "layer": self.layer,
             "source": self.source.to_json(),
@@ -466,6 +482,9 @@ class ChapterManifest:
             "absent": [a.to_json() for a in self.absent],
             "content_sha256": self.content_sha256,
         }
+        if self.verification is not None:
+            payload["verification"] = self.verification.to_json()
+        return payload
 
     @classmethod
     def from_json(
@@ -475,17 +494,18 @@ class ChapterManifest:
         in ``expected_layer``."""
         if expected_layer not in LAYERS:
             raise ManifestError(f"Unknown manifest layer {expected_layer!r}.")
+        version = payload.get("schema_version") if isinstance(payload, dict) else None
         _exact_keys(
             payload,
             {"schema_version", "kind", "layer", "source", "provenance", "coverage",
-             "chapters", "absent", "content_sha256"},
+             "chapters", "absent", "content_sha256"} | ({"verification"} if version == VERIFIED_SCHEMA_VERSION else set()),
             "Manifest",
         )
         assert isinstance(payload, dict)
         version = payload["schema_version"]
-        if type(version) is not int or version != SCHEMA_VERSION:
+        if type(version) is not int or version not in (SCHEMA_VERSION, VERIFIED_SCHEMA_VERSION):
             raise ManifestError(
-                f"Unsupported manifest schema_version {version!r} (this app reads {SCHEMA_VERSION})."
+                f"Unsupported manifest schema_version {version!r} (this app reads {SCHEMA_VERSION} and {VERIFIED_SCHEMA_VERSION})."
             )
         if payload["kind"] != MANIFEST_KIND:
             raise ManifestError(f"Not a chapter manifest: kind is {payload['kind']!r}.")
@@ -518,6 +538,7 @@ class ChapterManifest:
             spans=spans,
             chapters=chapters,
             absent=tuple(AbsentChapter.from_json(item) for item in raw_absent),
+            verification=Verification.from_json(payload["verification"]) if version == VERIFIED_SCHEMA_VERSION else None,
         )
         stored = payload["content_sha256"]
         if not isinstance(stored, str) or not _SHA256_RE.fullmatch(stored):

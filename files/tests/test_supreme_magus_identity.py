@@ -176,9 +176,11 @@ def test_a_run_and_its_resume_never_publish_one_chapters_text_under_another(tmp_
             class DiscoveryPages:
                 def fetch(self, url, **_kwargs):
                     number = int(url.rsplit("-", 1)[1]) - 10
+                    if number <= 0:
+                        return "<h1>-2 Joke Chapter</h1>"
                     return page(f"Chapter {number}: Title {number}", body=("Synthetic discovery prose.",))
 
-            return self.adapter._reconcile_window(DiscoveryPages(), spec, 11, 15, {})
+            return self.adapter._reconcile_window(DiscoveryPages(), spec, 1, 15, {})
 
         def fetch_chapter(self, meta, spec, **_kw):
             self.fetched.append(meta.index)

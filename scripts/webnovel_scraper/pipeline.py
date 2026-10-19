@@ -1367,6 +1367,8 @@ def _open_resume(job: ScrapeJob, spec: SiteSpec, store: ChapterManifestStore, lo
     now contradicts the run's pages. Returns ``(run_dir, lock, replay, chapters)``."""
     run_dir = Path(job.output_dir)
     found = open_existing_run(run_dir.parent, run_dir, expected_novel_slug=spec.novel_slug)
+    from .observed_preflight import guard_observed_resume_store, validate_observed_resume
+    guard_observed_resume_store(SourceIdentity.from_site_spec(spec), store)
     lock = _lock_run(found.path)
     try:
         replay = replay_journal(found.path / "run-journal.jsonl")
@@ -1391,6 +1393,7 @@ def _open_resume(job: ScrapeJob, spec: SiteSpec, store: ChapterManifestStore, lo
             raise JournalError("This run used a different grouping (or chunk size).")
         chapters = load_selection(found.path, header)
         loaded = store.load_effective(current, quarantine=False)
+        validate_observed_resume(current, loaded, header, chapters, _manifest_digest(loaded.effective))
         known = {c.page_url: c for c in loaded.effective.chapters}
         for chapter in chapters:
             now = known.get(chapter.page_url)
@@ -1521,8 +1524,11 @@ def _prepare_run(
 
 
 def _manifest_digest(effective: object) -> Optional[str]:
-    """Which chapter list the run was selected from (provenance only, never checked on resume:
-    the run's own selection file is what a resume uses)."""
+    """Selection provenance; Supreme Magus additionally binds Resume to policy evidence."""
+    from .chapter_verification import requires_verification
+    source = getattr(effective, "source", None)
+    if source is not None and requires_verification(source):
+        return getattr(effective, "runtime_sha256", None) or getattr(effective, "baseline_sha256", None)
     try:
         rows = [c.to_json() for c in effective.chapters]
         spans = [list(span) for span in effective.spans]

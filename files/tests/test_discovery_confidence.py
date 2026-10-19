@@ -97,10 +97,14 @@ def test_preflight_refuses_old_saved_state_without_rewriting_it(tmp_path):
     store = ChapterManifestStore(tmp_path / "baseline", tmp_path / "runtime")
     identities = [SOURCE.chapter_identity(fwn.chapter_url_for(SPEC, s), ChapterLabel.parse(str(s)), slug=s)
                   for s in range(1, 5)]
-    store.record_discovery(SOURCE, identities, ((1, 4),))
+    from webnovel_scraper.chapter_manifest import ChapterManifest, Provenance
+    old = ChapterManifest.create(layer="runtime", source=SOURCE,
+        provenance=Provenance(None, None, "0.3.0", "walk"), chapters=identities, spans=((1, 4),))
     path = store.runtime_path(SOURCE)
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(old.to_json()))
     before = path.read_bytes()
-    with pytest.raises(ChapterListRefused, match="Checkpoint 3"):
+    with pytest.raises(ChapterListRefused, match="revalidation"):
         resolve_chapters(SPEC, start=1, end=4, store=store,
                          discover=lambda **_: pytest.fail("old state bypassed refusal"),
                          log=lambda _: None)
@@ -324,7 +328,7 @@ def test_failed_progress_callback_is_not_repeated_or_promoted_to_completion():
     assert len(rm.calls) == 16
 
 
-def test_fresh_preflight_uses_observations_and_leaves_no_manifest(tmp_path):
+def test_fresh_preflight_persists_observations_and_reuses_same_run_spool(tmp_path):
     store = ChapterManifestStore(tmp_path / "b", tmp_path / "r")
     rm = Pages({1: "<h1>-2 Joke Chapter</h1>", 2: "<h1>Chapter -1 Volume 2 Glossary</h1>",
                 3: 1, 4: 2, 5: "2.10", 6: 3})
@@ -334,7 +338,7 @@ def test_fresh_preflight_uses_observations_and_leaves_no_manifest(tmp_path):
                                  log=lambda _: None)
     assert [ChapterLabel.from_meta(m).text for m in selection.chapters] == ["1", "2", "2.10", "3"]
     assert not selection.absent and not selection.toc_gaps
-    assert not store.runtime_path(SOURCE).exists()
+    assert store.load_effective(SOURCE).effective.covers(1, 3)
     assert not store.baseline_path(SOURCE).exists()
     before = len(rm.calls)
     for meta in selection.chapters:
@@ -351,7 +355,8 @@ def test_catalog_bound_disagreement_cannot_hide_an_unscanned_reverse_suffix(tmp_
     with pytest.raises(ChapterListRefused, match="unproven"):
         resolve_chapters(spec, start=1, end=2, store=store,
                          discover=lambda **kwargs: adapter.build_chapter_index(spec, **kwargs), log=lambda _: None)
-    assert not store.runtime_path(SOURCE).exists()
+    assert len(store.load_effective(SOURCE).effective.chapters) == 2
+    assert not store.load_effective(SOURCE).effective.spans
 
 
 def test_preflight_cancellation_does_not_write_partial_coverage(tmp_path):
@@ -373,7 +378,7 @@ def test_preflight_cancellation_does_not_write_partial_coverage(tmp_path):
         resolve_chapters(SPEC, start=1, end=65, store=store, discover=discover,
                          log=lambda _: None, cancel_event=rm.cancel_event)
     assert len(rm.calls) == 17
-    assert not store.runtime_path(SOURCE).exists()
+    assert len(store.load_effective(SOURCE).effective.chapters) == 16
     assert not store.load_effective(SOURCE).effective.spans
 
 
@@ -387,7 +392,8 @@ def test_preflight_fails_closed_for_unresolved_chapters(tmp_path, missing):
     with pytest.raises(ChapterListRefused, match="unresolved|unproven"):
         resolve_chapters(SPEC, start=1, end=3, store=store,
                          discover=lambda **kwargs: adapter.build_chapter_index(SPEC, **kwargs), log=lambda _: None)
-    assert not store.runtime_path(SOURCE).exists()
+    saved = store.load_effective(SOURCE).effective
+    assert not saved.covers(1, 3) and not saved.absent
 
 
 @pytest.mark.parametrize("kind", ["baseline", "runtime", "legacy"])
@@ -398,7 +404,7 @@ def test_old_state_refusal_precedes_refresh_import_and_quarantine(tmp_path, kind
     path = {"baseline": store.baseline_path(SOURCE), "runtime": store.runtime_path(SOURCE), "legacy": legacy}[kind]
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(b"{invalid old state kept byte for byte}")
-    with pytest.raises(ChapterListRefused, match="Checkpoint 3"):
+    with pytest.raises(ChapterListRefused, match="revalidation"):
         resolve_chapters(SPEC, start=1, end=3, store=store, refresh=refresh, legacy_index=legacy,
                          discover=lambda **_: pytest.fail("must refuse before discovery"), log=lambda _: None)
     assert path.read_bytes() == b"{invalid old state kept byte for byte}"

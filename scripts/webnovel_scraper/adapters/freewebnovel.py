@@ -20,7 +20,8 @@ import re
 import tempfile
 import threading
 import weakref
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Callable, Optional
@@ -47,7 +48,9 @@ from ..models import (
     EmptyExtractionError,
     SiteSpec,
 )
-from ..source_identity import ChapterLabel
+from ..source_identity import ChapterLabel, SourceIdentity
+from ..chapter_manifest import ChapterManifest
+from ..chapter_verification import PageObservation, SourceBoundChanged, Verification, requires_verification
 from .base import BaseAdapter, extract_validated
 
 logger = logging.getLogger(__name__)
@@ -577,6 +580,7 @@ class FreeWebNovelAdapter(BaseAdapter):
         result = self._reconcile_window(
             rm, spec, 1, count, known, fetch_budget=fetch_budget,
             resume_metas=resume_metas, index_progress_cb=index_progress_cb,
+            bound_confirmed=not (discovered is None or discovered != count),
         )
         result.tail_confirmed = result.discovery_complete and not (
             discovered is None or (spec.chapter_count is not None and discovered != count)
@@ -739,20 +743,47 @@ class FreeWebNovelAdapter(BaseAdapter):
         return slug - num if isinstance(num, int) and num >= 1 else None
 
     def _reconcile_window(self, rm, spec, walk_lo, walk_hi, known, *, fetch_budget=None,
-                          resume_metas=None, index_progress_cb=None):
+                          resume_metas=None, index_progress_cb=None, bound_confirmed=True):
         """Observe every slug once. Inference never enters returned chapter rows.
 
         Callbacks contain observed pages and explicit per-URL outcomes; partial
-        results never vouch for completeness. Seeds cannot suppress page reads.
+        results never vouch for completeness. Only current-policy historical
+        observations can suppress reads; ordinary metadata seeds cannot.
         """
-        rows, evidence = {}, {}
+        rows, evidence, observations = {}, {}, {}
+        source = SourceIdentity.from_site_spec(spec)
+        policy = requires_verification(source)
+        bound_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        saved = getattr(resume_metas, "verified_manifest", None)
+        if not (policy and isinstance(saved, ChapterManifest) and saved.source == source
+                and saved.verification is not None):
+            saved = None
+        # A source-bound regression cannot quietly drop previously certified pages.
+        if saved and saved.verification.bound > walk_hi:
+            raise SourceBoundChanged("Source bound decreased; chapter completeness is unproven. A separately reviewed source-bound disposition is required.")
+        by_url = {p.url: p for p in saved.verification.pages} if saved else {}
+        saved_rows = {c.page_url: c for c in saved.chapters} if saved else {}
+        recheck = bool(getattr(resume_metas, "recheck_tail", False))
+        # Checkpoints are whole snapshots. Retain unvisited historical observations, but
+        # revoke the tail about to be checked before it can be returned by a partial callback.
+        pending_pages = {p.url: p for p in saved.verification.pending_tail(source).pages} if saved and recheck else by_url
+        for url, previous in by_url.items():
+            slug = saved.verification.slug(source, url)
+            observations[url] = pending_pages[url]
+            chapter = saved_rows.get(url)
+            if chapter and observations[url].status == "observed":
+                rows[slug] = ChapterMeta(index=chapter.label.to_index(), url=url, slug=slug,
+                                        title=chapter.title, source_id=chapter.source_id,
+                                        extra={"manifest_label": chapter.label.text})
         seeds = {m.slug: m for m in resume_metas or [] if m.slug is not None}
         self._discovery_spool = _PageSpool()
         last_emitted = None
 
         def snapshot(complete=False):
             return ChapterIndex(sorted(rows.values(), key=lambda m: (ChapterLabel.from_meta(m).sort_key, m.slug)),
-                                tail_confirmed=False, evidence=dict(evidence), discovery_complete=complete)
+                                tail_confirmed=False, evidence=dict(evidence), discovery_complete=complete,
+                                verification=Verification.create(bound=walk_hi, bound_utc=bound_utc,
+                                    bound_confirmed=bound_confirmed, pages=observations.values()) if policy else None)
 
         def emit(through):
             nonlocal last_emitted
@@ -768,9 +799,17 @@ class FreeWebNovelAdapter(BaseAdapter):
         try:
             for slug in range(walk_lo, walk_hi + 1):
                 self._check_cancelled(rm)
+                url = chapter_url_for(spec, slug)
+                previous = by_url.get(url)
+                reread = saved and recheck and slug > max(0, saved.verification.bound - 64)
+                if previous and previous.resolved and not reread:
+                    observations[url] = previous
+                    evidence[url] = DiscoveryEvidence(previous.status, "previous-observation", previous.labels, previous.detail)
+                    through = slug
+                    continue
+                rows.pop(slug, None)
                 number = self._fetch_and_read(rm, spec, slug, known, fetch_budget=fetch_budget)
                 read = known[slug]
-                url = chapter_url_for(spec, slug)
                 evidence[url] = read.evidence
                 if number is not None:
                     meta = _parsed_meta(spec, slug, number, None)
@@ -782,11 +821,26 @@ class FreeWebNovelAdapter(BaseAdapter):
                     meta.extra[_EVIDENCE_KEY] = evidence[url]
                     meta.extra[_PREFETCHED_HTML_KEY] = read.html
                     rows[slug] = meta
+                if policy:
+                    fact = evidence[url]
+                    observation = PageObservation(url, fact.status, fact.provenance, fact.labels,
+                                                  datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), fact.detail[:1000])
+                    prior_labels = previous.labels if previous and previous.resolved else (previous.prior_labels if previous else None)
+                    prior_time = previous.observed_utc if previous and previous.resolved else (previous.prior_observed_utc if previous else None)
+                    if prior_labels is not None and observation.resolved and prior_labels != observation.labels:
+                        observation = replace(observation, status="conflict", labels=tuple(sorted(set(prior_labels + observation.labels))),
+                                              detail=f"Previously observed {prior_labels} at {prior_time}; new page shows {observation.labels}. Explicit refresh required.")
+                        rows.pop(slug, None)
+                        evidence[url] = DiscoveryEvidence("conflict", "current-page", observation.labels, observation.detail)
+                    elif prior_labels is not None and not observation.resolved:
+                        observation = replace(observation, prior_labels=prior_labels, prior_observed_utc=prior_time)
+                    observations[url] = observation
                 through = slug
                 if (slug - walk_lo + 1) % _DISCOVERY_BATCH == 0:
                     emit(through)
             emit(through)
-            complete = bool(evidence) and all(e.verified or e.status == "extra" for e in evidence.values())
+            complete = (bool(observations) and all(p.resolved for p in observations.values())) if policy else (
+                bool(evidence) and all(e.verified or e.status == "extra" for e in evidence.values()))
             return snapshot(complete)
         except BaseException:
             emit(through)

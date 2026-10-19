@@ -39,6 +39,7 @@ from typing import Callable, Optional
 from urllib.parse import urlsplit
 
 from .atomic_io import write_json_atomic
+from .chapter_verification import requires_verification
 from .file_lock import FileLock, LockBusy
 from .chapter_manifest import (
     LAYER_BASELINE,
@@ -204,6 +205,19 @@ def merge_manifests(
     """
     _check_layer(source, baseline, LAYER_BASELINE)
     _check_layer(source, runtime, LAYER_RUNTIME)
+    if requires_verification(source):
+        if any(m and m.verification is None for m in (baseline, runtime)):
+            raise ManifestError("Supreme Magus legacy metadata requires current-policy revalidation.")
+        # Policy snapshots contain the full evidence universe. A runtime invalidation
+        # must suppress a historical baseline rather than reintroduce it additively.
+        if runtime is not None:
+            projected = _merge(source, [("runtime overlay", runtime)])
+            if baseline is not None:
+                disagreement = _merge(source, [("baseline", baseline), ("runtime overlay", runtime)])
+                if disagreement.conflicts:
+                    from dataclasses import replace
+                    return replace(projected, spans=(), toc_complete=False, conflicts=disagreement.conflicts)
+            return projected
     return _merge(source, [("baseline", baseline), ("runtime overlay", runtime)])
 
 
@@ -543,6 +557,55 @@ class ChapterManifestStore:
     def now_utc(self) -> str:
         return _utc_text(self._clock())
 
+    def migration_preview(self, source: SourceIdentity, legacy_index=None) -> dict:
+        """Read-only, deterministic disposition; no migration is executed by this API."""
+        paths = [("baseline", self.baseline_path(source)), ("runtime", self.runtime_path(source))]
+        if legacy_index is not None:
+            paths.append(("legacy-output-index", Path(legacy_index)))
+        entries = []
+        for layer, path in paths:
+            if not os.path.lexists(path):
+                continue
+            schema, policy, digest, reason = None, None, None, "legacy index cannot certify page identity"
+            try:
+                data = self._read_bytes(path)
+                digest = hashlib.sha256(data).hexdigest()
+                raw = load_strict_json(data)
+                if isinstance(raw, dict):
+                    schema = raw.get("schema_version")
+                    verification = raw.get("verification")
+                    policy = verification.get("policy") if isinstance(verification, dict) else None
+                if layer != "legacy-output-index":
+                    manifest = parse_manifest_bytes(data, expected_source=source, expected_layer=layer)
+                    if manifest.verification is not None:
+                        continue
+                    reason = "valid legacy metadata has no independent current-policy page observations"
+            except (OSError, ManifestError) as exc:
+                reason = str(exc)
+            backup = path.with_name(f"{path.name}.migration-{digest or 'unreadable'}.bak")
+            suffix = 0
+            while os.path.lexists(backup):
+                suffix += 1
+                backup = path.with_name(f"{path.name}.migration-{digest or 'unreadable'}.bak-{suffix}")
+            entries.append(dict(layer=layer, path=str(path.resolve()), schema=schema, policy=policy,
+                                sha256=digest, reason=reason, proposed_backup=str(backup.resolve())))
+        return dict(source=source.to_json(), files=entries,
+                    procedure="Independently read every source slug using uncached HTML and CP1 positive exact identity; retain unresolved outcomes; never seed trust from old mappings or caches.",
+                    transitions="Separate approval required. Exclusively copy exact old bytes to unique non-overwriting backups, verify hashes, retain baseline unchanged, then atomically publish a validated schema-2 runtime observation manifest under the writer lock. An incompatible baseline requires a separately approved disposition before reuse.",
+                    failure="Before publication keep original bytes; after invalidation preserve observations and backups without restoring verification authority. Restored legacy bytes remain untrusted. No automatic migration or rollback to old authority.",
+                    effect="Initial revalidation reads every source page; verified partial observations remain incomplete. Later finite ranges reuse complete historical coverage; open-ended requests recheck the bound and tail.")
+
+    def assert_compatible(self, source: SourceIdentity, legacy_index=None) -> None:
+        if not requires_verification(source):
+            return
+        preview = self.migration_preview(source, legacy_index)
+        if preview["files"]:
+            raise ManifestStoreError(
+                "Supreme Magus saved chapter list requires revalidation under the current policy. "
+                "Existing files were left unchanged. MIGRATION PREVIEW (not executed): "
+                + json.dumps(preview, ensure_ascii=True, sort_keys=True)
+            )
+
     # -- single-writer lock -------------------------------------------------
     def lock_path(self, source: SourceIdentity) -> Path:
         path = self.runtime_path(source)
@@ -557,6 +620,7 @@ class ChapterManifestStore:
         inside. Raises :class:`ManifestLockBusy` (and writes nothing) when another run or program
         instance holds it; the operating system frees it if that holder dies.
         """
+        self.assert_compatible(source)
         key = str(self.lock_path(source))
         me = threading.get_ident()
         with self._held_guard:
@@ -626,7 +690,11 @@ class ChapterManifestStore:
                 raise ManifestError(f"{path.name} is a folder, not a manifest file.")
             manifest = parse_manifest_bytes(data, expected_source=source, expected_layer=layer)
         except ManifestError as exc:
+            if requires_verification(source):
+                return LayerLoad(layer, path, "invalid", error=f"Saved chapter evidence requires policy revalidation ({exc}); left unchanged.")
             return self._reject(layer, path, str(exc), quarantine)
+        if requires_verification(source) and manifest.verification is None:
+            return LayerLoad(layer, path, "incompatible", error="Saved chapter list requires current-policy revalidation; left unchanged.")
         return LayerLoad(layer, path, "loaded", manifest=manifest)
 
     def _reject(self, layer: str, path: Path, reason: str, quarantine: bool = True) -> LayerLoad:
@@ -693,6 +761,7 @@ class ChapterManifestStore:
 
     def load_effective(self, source: SourceIdentity, *, quarantine: bool = True) -> EffectiveLoad:
         """Load both layers and merge whatever is valid."""
+        self.assert_compatible(source)
         baseline = self.load_layer(source, LAYER_BASELINE)
         runtime = self.load_layer(source, LAYER_RUNTIME, quarantine=quarantine)
         effective = merge_manifests(source, baseline.manifest, runtime.manifest)
@@ -712,6 +781,8 @@ class ChapterManifestStore:
                 f"Only runtime overlays can be saved; got a {manifest.layer} manifest."
             )
         source = manifest.source
+        if requires_verification(source) and manifest.verification is None:
+            raise ManifestStoreError("Supreme Magus publication requires current-policy page verification.")
         payload = manifest.to_json()
         ChapterManifest.from_json(payload, expected_source=source, expected_layer=LAYER_RUNTIME)
         size = len(json.dumps(payload, indent=2, ensure_ascii=False).encode("utf-8"))
@@ -743,6 +814,8 @@ class ChapterManifestStore:
         something the effective manifest does not already hold. Verified overlay entries are
         kept as they are, so a newer overlay is never overwritten by older legacy data.
         """
+        if requires_verification(source):
+            return LegacyImportResult("rejected", "Supreme Magus legacy metadata requires independent current-policy revalidation; nothing imported.")
         path = Path(legacy_index_path)
         try:
             info = path.stat()
@@ -836,6 +909,8 @@ class ChapterManifestStore:
         rather than resolved. Load, merge and publish happen under :meth:`writer_lock`, so two
         processes cannot lose each other's update; a busy lock raises :class:`ManifestLockBusy`.
         """
+        if requires_verification(source):
+            raise ManifestStoreError("Supreme Magus discovery requires per-page policy evidence; metadata alone cannot certify coverage.")
         with self.writer_lock(source):
             loaded = self.load_effective(source)
             now = self.now_utc()
@@ -902,6 +977,18 @@ class ChapterManifestStore:
             path = self.runtime_path(source)
             if not os.path.lexists(path):
                 return None
+            if requires_verification(source):
+                manifest = self.load_layer(source, LAYER_RUNTIME, quarantine=False).manifest
+                if manifest is None or manifest.verification is None:
+                    raise ManifestStoreError("Refresh requires compatible verified observations.")
+                # Copy rather than move: failures leave a whole manifest at its canonical path.
+                backup = self._copy_verified_backup(path)
+                invalidated = ChapterManifest.create(
+                    layer=LAYER_RUNTIME, source=source, provenance=manifest.provenance,
+                    verification=manifest.verification.invalidate("Explicit chapter-list refresh requires independent reobservation."),
+                )
+                self.save_runtime(invalidated)
+                return backup
             try:
                 return self._set_aside(path, "bak")
             except OSError as exc:
@@ -917,6 +1004,11 @@ class ChapterManifestStore:
         the user without the list they had. Returns whether the backup was restored; a backup is
         never moved over a newer overlay.
         """
+        self.assert_compatible(source)
+        if requires_verification(source):
+            # Refresh invalidation and conflicts must survive failure. Backups are inspection
+            # artifacts, never an automatic route back to obsolete verification authority.
+            return False
         with self.writer_lock(source):
             path = self.runtime_path(source)
             backup_path = Path(backup)
@@ -927,3 +1019,17 @@ class ChapterManifestStore:
             except OSError:
                 return False
             return True
+
+    def _copy_verified_backup(self, path: Path) -> Path:
+        digest = hashlib.sha256(self._read_bytes(path)).hexdigest()
+        for attempt in range(_MAX_QUARANTINE_TRIES):
+            backup = path.with_name(f"{path.name}.bak-{digest}-{attempt}")
+            try:
+                with backup.open("xb") as handle:
+                    handle.write(self._read_bytes(path))
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            except FileExistsError:
+                continue
+            return backup
+        raise ManifestStoreError("No unused backup name is available; nothing refreshed.")

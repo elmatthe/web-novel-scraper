@@ -829,14 +829,14 @@ def _sm_run(tmp_path, store, adapter, start, end, folder="out", **kw):
     return report, logs
 
 
-def test_real_adapter_offset_observations_are_ephemeral_and_rechecked_next_run(tmp_path, store):
+def test_real_adapter_offset_observations_persist_and_reuse_next_run(tmp_path, store):
     spec, rm, adapter = _offset_novel()
     first, _ = _sm_run(tmp_path, store, adapter, 114, 118)
     assert first.effective_range == (114, 118) and first.toc_gaps == []
     assert len(first.written) == 6                           # 114-118 plus the 116.5 insert
     sm_source = SourceIdentity.from_site_spec(spec)
-    assert not store.runtime_path(sm_source).exists()
-    assert not store.load_effective(sm_source).effective.spans
+    assert store.runtime_path(sm_source).exists()
+    assert store.load_effective(sm_source).effective.covers(114, 118)
     assert len(rm.fetched) == 501  # one TOC, one observation per source page
     selected = json.loads((first.output_dir / "run-selection.json").read_text(encoding="utf-8"))
     by_label = {row["label"]: row["slug"] for row in selected["chapters"]}
@@ -845,22 +845,22 @@ def test_real_adapter_offset_observations_are_ephemeral_and_rechecked_next_run(t
     walked = len(rm.fetched)
     toc_before = rm.fetched.count(spec.url)
     second, _ = _sm_run(tmp_path, store, adapter, 115, 117, folder="second")
-    assert rm.fetched.count(spec.url) == toc_before + 1
-    assert len(rm.fetched) - walked == 501
+    assert rm.fetched.count(spec.url) == toc_before
+    assert len(rm.fetched) - walked == 4  # saved metadata still fetches/validates selected content
     assert second.effective_range == (115, 117)
-    assert not store.runtime_path(sm_source).exists()
+    assert store.runtime_path(sm_source).exists()
 
 
-def test_real_adapter_extension_reobserves_pages_until_persisted_policy_exists(tmp_path, store):
+def test_real_adapter_wider_finite_selection_reuses_verified_coverage(tmp_path, store):
     spec, rm, adapter = _offset_novel()
     _sm_run(tmp_path, store, adapter, 100, 104)
     sm_source = SourceIdentity.from_site_spec(spec)
-    assert not store.runtime_path(sm_source).exists()
+    assert store.runtime_path(sm_source).exists()
     before = len(rm.fetched)
     report, _ = _sm_run(tmp_path, store, adapter, 100, 140, folder="wider")
     assert len(report.written) == 42  # forty-one integers and fractional 116.5
-    assert len(rm.fetched) - before == 501
-    assert not store.load_effective(sm_source).effective.spans
+    assert len(rm.fetched) - before == 42  # content only; no duplicate whole-novel discovery
+    assert store.load_effective(sm_source).effective.covers(100, 140)
 
 
 def test_real_adapter_duplicate_displayed_number_stays_two_pages_end_to_end(tmp_path, store):
@@ -876,7 +876,7 @@ def test_real_adapter_duplicate_displayed_number_stays_two_pages_end_to_end(tmp_
     spec, rm, adapter = _offset_novel(label)
     report, logs = _sm_run(tmp_path, store, adapter, 45, 50)
     sm_source = SourceIdentity.from_site_spec(spec)
-    assert not store.runtime_path(sm_source).exists()
+    assert store.runtime_path(sm_source).exists()
     metas = adapter.build_chapter_index(spec)
     assert [m.slug for m in metas if m.index == 47] == [50, 51]
     names = sorted(p.name for p in report.written)
