@@ -78,7 +78,7 @@ def test_every_marker_still_occurs_in_the_pipeline_source() -> None:
      WARNING, True),
     ("  chapter 5 FAILED: HTTP 403", WARNING, True),
     ("  chapter 9 failed after all methods.", WARNING, True),
-    ("  chapter 9 permanently unavailable (not found).", WARNING, True),
+    ("  chapter 9 URL not found; displayed chapter absence is unproven.", WARNING, True),
     ("  chapter 9 fetched but had no extractable body.", WARNING, True),
     ("  chapter 9 still rate-limited after 3 retries; recording a transient failure for resume.",
      WARNING, True),
@@ -184,7 +184,7 @@ def test_full_progress_with_failures_is_not_called_a_success(tmp_path) -> None:
     assert summary[0] == "Warning: Finished with problems: 2 chapters could not be saved."
     assert not any(line.startswith("Completed") for line in summary)
     assert "Warning: Failed chapters: 2." in summary
-    assert "Warning: Not found on the site: 3." in summary
+    assert "Warning: URL fetch failed (not proof of chapter absence): 3." in summary
     assert "Warning: Fetched but no chapter text found: 3." in summary
 
 

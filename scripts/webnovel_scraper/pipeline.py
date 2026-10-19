@@ -49,6 +49,7 @@ from .atomic_io import write_json_atomic
 from . import pdf_builder
 from . import rescue_pool as rp
 from . import txt_builder
+from .content_integrity import FailureInfo, OUTCOME_POLICY, classify_failure
 from .adapters.base import BaseAdapter
 from .chapter_preflight import ChapterListRefused
 from .chapter_store import ChapterManifestStore
@@ -234,6 +235,8 @@ class RunReport:
     absent_skipped: list[tuple[str, str]] = field(default_factory=list)  # (label, evidence): source-confirmed absent, skipped
     rescued: list[int] = field(default_factory=list)         # ch. saved by rescue (or 2nd-pass sweep)
     warnings: list[str] = field(default_factory=list)        # adapter + pipeline warnings
+    identity_failed: list = field(default_factory=list)
+    accounting: dict = field(default_factory=dict)          # page positions, requested formats, actual artifacts
     cancelled: bool = False
     resumed: bool = False            # this session continued an earlier run folder (v0.3.0 03.3)
     from_cache: int = 0              # chapter pages served by the saved-page cache (no request made)
@@ -267,7 +270,7 @@ class RunReport:
             *(f"  Range adjusted: {note}." for note in self.range_notes),
             f"  Written: {_written_text(self.written, self.formats)}",
             f"  Skipped (already present): {len(self.skipped_existing)}",
-            f"  Failed:  {len(self.failed)}",
+            f"  Failed:  {self.accounting.get('requested_failure', len(self.failed))}",
         ]
         if self.from_cache:
             lines.append(f"  From the saved-page cache: {self.from_cache} chapter page(s), no request "
@@ -292,6 +295,13 @@ class RunReport:
                 "  Extraction failures (page fetched but no body found): "
                 f"{len(self.extraction_failed)}"
             )
+        if self.identity_failed:
+            lines.append(f"  Identity failures (mismatch/unknown/conflict): {len(self.identity_failed)}")
+        if self.accounting:
+            lines.append(f"  Pages: {self.accounting['selected']} selected, {self.accounting['attempted']} attempted, "
+                         f"{self.accounting['not_attempted']} not attempted; "
+                         f"{self.accounting['requested_success']} requested-format successes, "
+                         f"{self.accounting['fallback_preserved']} with fallback artifacts preserved.")
         if self.toc_gaps:
             preview = ", ".join(str(i) for i in self.toc_gaps[:20])
             more = " ..." if len(self.toc_gaps) > 20 else ""
@@ -328,8 +338,10 @@ class RunReport:
 
 def _written_text(written: list, formats: tuple) -> str:
     """``3 PDF(s)`` for a PDF-only run (the established wording), else per format."""
-    if tuple(formats) == ("pdf",):
+    actual = {Path(p).suffix.lower().lstrip(".") for p in written}
+    if tuple(formats) == ("pdf",) and actual <= {"pdf"}:
         return f"{len(written)} PDF(s)"
+    formats = tuple(dict.fromkeys((*formats, *sorted(actual))))
     counts = [f"{sum(1 for p in written if Path(p).suffix.lower() == '.' + f)} {f.upper()}"
               for f in formats]
     return " + ".join(counts) + " file(s)"
@@ -728,6 +740,7 @@ class _RescueConductor:
     def _classify_primary(self, meta: ChapterMeta):
         """Return ``(kind, payload)`` for one fast-primary fetch. ``ScrapeCancelled``
         is allowed to propagate so the run ends cleanly."""
+        self.outputs.attempt(meta)
         try:
             content = self.primary.fetch(meta)
         except ScrapeCancelled:
@@ -737,7 +750,7 @@ class _RescueConductor:
         except RateLimitedFetchError as exc:
             return "rate_limited", exc
         except EmptyExtractionError as exc:
-            return "extraction", exc
+            return "extraction" if exc.reason_code == "EMPTY_BODY" else "identity", exc
         except ChallengeFetchError as exc:
             return "challenge", exc
         except TransientFetchError as exc:
@@ -757,6 +770,8 @@ class _RescueConductor:
     # ── per-chapter routing ───────────────────────────────────────────────────
     def handle(self, meta: ChapterMeta, *, allow_breaker: bool) -> None:
         kind, payload = self._classify_primary(meta)
+        if kind != "success":
+            self.outputs.defer_failure(meta, payload)
 
         if kind == "success":
             if self._from_cache():
@@ -767,17 +782,18 @@ class _RescueConductor:
             return
         if kind == "not_found":
             self.breaker.record_network(is_challenge=False)
-            self._fail(meta, permanent=True, reason=f"not found ({payload})")
-            self.log(f"  chapter {meta.index} permanently unavailable (not found).")
+            self._fail(meta, permanent=True, reason=classify_failure(payload))
+            self.log(f"  chapter {meta.index} URL not found; displayed chapter absence is unproven.")
             return
-        if kind == "extraction":
+        if kind in ("extraction", "identity"):
             self.breaker.record_network(is_challenge=False)
-            self._fail(meta, extraction=True, reason=str(payload))
-            self.log(f"  chapter {meta.index} fetched but had no extractable body ({payload}).")
+            self._fail(meta, extraction=kind == "extraction", reason=classify_failure(payload))
+            if kind == "extraction":
+                self.log(f"  chapter {meta.index} fetched but had no extractable body ({payload}).")
             return
         if kind == "error":
             # Not a fetch-layer signal — record a plain failure (resumeable), no rescue.
-            self._fail(meta, reason=str(payload))
+            self._fail(meta, reason=classify_failure(payload))
             self.log(f"  chapter {meta.index} FAILED: {payload}")
             return
         if kind == "rate_limited":
@@ -836,6 +852,8 @@ class _RescueConductor:
             if self.run_cancel.is_set():
                 raise ScrapeCancelled("cancelled during rate-limit retry")
             kind, payload = self._classify_primary(meta)
+            if kind != "success":
+                self.outputs.defer_failure(meta, payload)
             if kind == "success":
                 if self._from_cache():
                     self.report.from_cache += 1
@@ -847,14 +865,14 @@ class _RescueConductor:
                 continue  # still limited — the next nav waits the (re-applied) cooldown
             if kind == "not_found":
                 self.breaker.record_network(is_challenge=False)
-                self._fail(meta, permanent=True, reason=f"not found ({payload})")
+                self._fail(meta, permanent=True, reason=classify_failure(payload))
                 return
-            if kind == "extraction":
+            if kind in ("extraction", "identity"):
                 self.breaker.record_network(is_challenge=False)
-                self._fail(meta, extraction=True, reason=str(payload))
+                self._fail(meta, extraction=kind == "extraction", reason=classify_failure(payload))
                 return
             if kind == "error":
-                self._fail(meta, reason=str(payload))
+                self._fail(meta, reason=classify_failure(payload))
                 return
             # A challenge/transient surfaced once the rate limit cleared → rescue it.
             if kind == "challenge":
@@ -871,7 +889,7 @@ class _RescueConductor:
             f"  chapter {meta.index} still rate-limited after {RATE_LIMIT_RETRY_BUDGET} "
             "retries; recording a transient failure for resume."
         )
-        self._fail(meta, reason="still rate-limited")  # plain failed — not permanent, not rescued, not a block
+        self._fail(meta, reason=classify_failure(payload))
 
     def _submit_rescue(self, meta: ChapterMeta, kind: str) -> None:
         pool = self._ensure_pool()
@@ -901,9 +919,13 @@ class _RescueConductor:
 
     def _fail(
         self, meta: ChapterMeta, *, permanent: bool = False, extraction: bool = False,
-        reason: str = "failed",
+        reason: str | FailureInfo = "failed",
     ) -> None:
         index = meta.index
+        info = classify_failure(reason)
+        self.log(f"  chapter {chapter_preflight.meta_label(meta)} FAILED [{info.reason_code}] at {meta.url}: {info.reason}")
+        if info.reason_code.startswith("IDENTITY_") and index not in self.report.identity_failed:
+            self.report.identity_failed.append(index)
         self._mark_failed(meta, reason)
         if permanent and index not in self.report.permanent_failed:
             self.report.permanent_failed.append(index)
@@ -922,19 +944,21 @@ class _RescueConductor:
             self._store_content(res.meta, res.content)  # ticks + writes SEPARATE
             self.log(f"  chapter {idx} rescued ({res.strategy}).")
         elif res.status == rp.RESCUE_EXHAUSTED:
-            self._mark_failed(res.meta, "failed after every recovery method")
+            self._mark_failed(res.meta, res.failure or FailureInfo("RESCUE_ERROR", res.error or "failed after every recovery method"))
             if idx not in self.report.rescue_exhausted:
                 self.report.rescue_exhausted.append(idx)
             self.state.tick()
             self.log(f"  chapter {idx} failed after all methods.")
         elif res.status == rp.NOT_FOUND:
-            self._fail(res.meta, permanent=True, reason="not found (via rescue)")
-            self.log(f"  chapter {idx} permanently unavailable (not found, via rescue).")
-        elif res.status == rp.EXTRACTION_FAILED:
-            self._fail(res.meta, extraction=True, reason=f"no usable chapter text ({res.error})")
-            self.log(f"  chapter {idx} fetched but had no extractable body (via rescue).")
+            self._fail(res.meta, permanent=True, reason=res.failure or FailureInfo("URL_NOT_FOUND", res.error or "URL not found (via rescue)"))
+            self.log(f"  chapter {idx} URL not found via rescue; displayed chapter absence is unproven.")
+        elif res.status in (rp.EXTRACTION_FAILED, rp.IDENTITY_FAILED):
+            self._fail(res.meta, extraction=res.status == rp.EXTRACTION_FAILED,
+                       reason=res.failure or FailureInfo("EMPTY_BODY" if res.status == rp.EXTRACTION_FAILED else "IDENTITY_MISMATCH", res.error or "extraction failed"))
+            if res.status == rp.EXTRACTION_FAILED:
+                self.log(f"  chapter {idx} fetched but had no extractable body (via rescue).")
         elif res.status == rp.POOL_FAILED:
-            self._mark_failed(res.meta, f"rescue pool error: {res.error}")
+            self._mark_failed(res.meta, res.failure or FailureInfo("RESCUE_ERROR", f"rescue pool error: {res.error}"))
             self.state.tick()
             self.log(f"  chapter {idx} failed (rescue pool error: {res.error}).")
         elif res.status == rp.CANCELLED:
@@ -1488,6 +1512,7 @@ def _prepare_run(
                 formats=tuple(job.formats), grouping_mode=job.output_mode.value,
                 chunk_size=int(job.chunk_size), manifest_sha256=_manifest_digest(effective),
                 notes=tuple(notes), created_utc=store.now_utc(),
+                outcome_policy=OUTCOME_POLICY,
             )
             journal = RunJournal.create(run_dir, header, chapters)
         except BaseException:
@@ -1558,16 +1583,22 @@ def _finish_run(run: _Run, report: RunReport, log: LogFn) -> None:
             log("Run cancelled: stopped while the output files were being built; the files already "
                 "finished are kept and Resume Existing Run builds the rest.")
         outputs = run.outputs
+        audit = outputs.audit()
+        report.failed = list(dict.fromkeys(outputs.metas[p].index for p in sorted(outputs.failed)))
         if report.cancelled:
             state = "cancelled"
-        elif outputs.failed or outputs.pending:
+        elif outputs.failed or outputs.pending or report.accounting.get("integrity_suspicions"):
             state = "complete_with_problems"
         else:
             state = "complete"
         _end_journal(run.journal, state, log, files=len(report.written),
-                     failed=len(outputs.failed), incomplete_groups=len(outputs.pending))
+                     failed=report.accounting["requested_failure"],
+                     attempted=report.accounting["attempted"], processed=report.accounting["processed"],
+                     fallback_preserved=report.accounting["fallback_preserved"],
+                     not_attempted=report.accounting["not_attempted"],
+                     fetch_failures=report.accounting["fetch_failures"], incomplete_groups=len(outputs.pending))
         try:
-            write_json_atomic(run.run_dir / AUDIT_FILENAME, outputs.audit())
+            write_json_atomic(run.run_dir / AUDIT_FILENAME, audit)
         except OSError as exc:
             log(f"WARNING: the run audit could not be written ({exc}).")
     finally:
@@ -1577,6 +1608,7 @@ def _finish_run(run: _Run, report: RunReport, log: LogFn) -> None:
 def _abort_run(run: _Run, log: LogFn) -> None:
     """An unexpected error ended the run: record it (best effort) and release the folder."""
     try:
+        run.outputs.flush_deferred_failures()
         _end_journal(run.journal, "failed", log)
     finally:
         run.lock.release()
@@ -1616,7 +1648,8 @@ def _drive(
         _collect_warnings(adapter, report)
         return report
 
-    reasons: dict[str, str] = {}
+    reasons: dict[str, FailureInfo] = {}
+    non_retryable: set[str] = set()
     try:
         obtained: set[str] = set()
         try:
@@ -1627,16 +1660,17 @@ def _drive(
                 if _cancelled(cancel_event):
                     report.cancelled = True
                     break
+                run.outputs.attempt(meta)
                 content = _fetch_one(adapter, meta, spec, report, log, job, cancel_event, pacer,
-                                     sleep_after=True, reasons=reasons)
+                                     sleep_after=True, reasons=reasons, failure_cb=run.outputs.fail,
+                                     non_retryable=non_retryable)
                 if content is not None:
                     obtained.add(meta.url)
                     run.outputs.add(meta, content)
                 run.state.tick()
 
             sweep = [m for m in run.fetch_list if m.url not in obtained and m.url in reasons
-                     and m.index not in report.permanent_failed
-                     and m.index not in report.extraction_failed]
+                     and m.url not in non_retryable]
             if sweep and not report.cancelled and not _cancelled(cancel_event):
                 log(f"Second-pass sweep: re-attempting {len(sweep)} failed chapter(s)…")
                 for meta in sweep:
@@ -1644,7 +1678,8 @@ def _drive(
                         report.cancelled = True
                         break
                     content = _fetch_one(adapter, meta, spec, report, log, job, cancel_event,
-                                         pacer, sleep_after=True, reasons=reasons)
+                                         pacer, sleep_after=True, reasons=reasons,
+                                         failure_cb=run.outputs.fail, non_retryable=non_retryable)
                     if content is not None:
                         obtained.add(meta.url)
                         if meta.index in report.failed:
@@ -1715,9 +1750,12 @@ class _Progress:
 
 
 def _is_permanent_failure(exc: Exception) -> bool:
-    """True for a permanently-dead chapter (a true 403/404). These must NOT be
-    swept — re-attempting them only wastes time and can never succeed, so they
-    short-circuit the relentless-retry treatment (Phase 9C fault tolerance)."""
+    """URL failures excluded from this run's sweep, preserving the retry policy.
+
+    Neither a missing URL nor a denied request proves a displayed chapter absent.
+    """
+    if isinstance(exc, NotFoundFetchError):
+        return True
     msg = str(exc).lower()
     # Only 403 (forbidden) and 404 (not found) are permanent. 401 (unauthorized)
     # is transient here — it must be swept and trigger auto-slowdown, not skipped.
@@ -1736,6 +1774,8 @@ def _fetch_one(
     *,
     sleep_after: bool,
     reasons: Optional[dict] = None,
+    failure_cb: Optional[Callable] = None,
+    non_retryable: Optional[set] = None,
 ) -> Optional[ChapterContent]:
     """Fetch one chapter. A failure is recorded and returns None (never fatal);
     ``ScrapeCancelled`` is allowed to propagate so the run ends cleanly.
@@ -1760,24 +1800,36 @@ def _fetch_one(
         # extractable body. This is an extraction failure, NOT a block: record it
         # as a plain failure, but do NOT register an auto-slowdown step and do NOT
         # mark it sweepable (re-fetching the same page yields the same empty body).
-        log(f"  chapter {meta.index} FAILED (extraction, not a block): {exc}")
+        info = classify_failure(exc)
+        log(f"  chapter {chapter_preflight.meta_label(meta)} FAILED [{info.reason_code}] at {meta.url}: {exc}")
         if reasons is not None:
-            reasons[meta.url] = f"no usable chapter text ({exc})"
+            reasons[meta.url] = info
+        if failure_cb is not None:
+            failure_cb(meta, info)
+        if non_retryable is not None:
+            non_retryable.add(meta.url)
         if meta.index not in report.failed:
             report.failed.append(meta.index)
-        if meta.index not in report.extraction_failed:
+        if info.reason_code == "EMPTY_BODY" and meta.index not in report.extraction_failed:
             report.extraction_failed.append(meta.index)
+        elif info.reason_code.startswith("IDENTITY_") and meta.index not in report.identity_failed:
+            report.identity_failed.append(meta.index)
         # Still observe normal inter-fetch politeness (pacer was not raised).
         if sleep_after and not _cancelled(cancel_event):
             pacer.sleep()
         return None
     except Exception as exc:  # one bad chapter must never kill the run
-        log(f"  chapter {meta.index} FAILED: {exc}")
+        info = classify_failure(exc)
+        log(f"  chapter {chapter_preflight.meta_label(meta)} FAILED [{info.reason_code}] at {meta.url}: {exc}")
         if reasons is not None:
-            reasons[meta.url] = str(exc)
+            reasons[meta.url] = info
+        if failure_cb is not None:
+            failure_cb(meta, info)
         if meta.index not in report.failed:
             report.failed.append(meta.index)
         if _is_permanent_failure(exc):
+            if non_retryable is not None:
+                non_retryable.add(meta.url)
             if meta.index not in report.permanent_failed:
                 report.permanent_failed.append(meta.index)
         else:

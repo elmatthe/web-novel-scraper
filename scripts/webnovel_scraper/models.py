@@ -28,6 +28,15 @@ class EmptyExtractionError(Exception):
     block/challenge (so it never triggers auto-slowdown or the second-pass sweep).
     """
 
+    reason_code = "EMPTY_BODY"
+
+    def __init__(self, message: str, *, requested_label: str | None = None,
+                 observed_labels: tuple[str, ...] = (), page_url: str | None = None):
+        super().__init__(message)
+        self.requested_label = requested_label
+        self.observed_labels = tuple(observed_labels)
+        self.page_url = page_url
+
 
 class ChapterMismatchError(EmptyExtractionError):
     """The page was fetched and has a body, but it shows a different chapter than the chapter
@@ -35,6 +44,20 @@ class ChapterMismatchError(EmptyExtractionError):
 
     An extraction-class failure: never a block, never swept, and never published as if it were
     the expected chapter. The usual cure is an explicit chapter-list refresh."""
+
+    reason_code = "IDENTITY_MISMATCH"
+
+
+class ChapterIdentityUnknownError(ChapterMismatchError):
+    """No positive numbered page identity could be authenticated."""
+
+    reason_code = "IDENTITY_UNKNOWN"
+
+
+class ChapterIdentityConflictError(ChapterMismatchError):
+    """Independent numbered headings on one page disagree."""
+
+    reason_code = "IDENTITY_CONFLICT"
 
 
 class OutputMode(str, Enum):

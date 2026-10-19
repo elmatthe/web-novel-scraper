@@ -18,10 +18,13 @@ line, which replay ignores (and a resume trims before appending). A bad line any
 in ``seq`` or a header that does not describe this folder makes the journal unusable: Resume
 refuses and a new run is the remedy.
 
-Event types: ``publish`` (an output file: group key, format, relative path, size, SHA-256, the
-selection positions it holds and the ones it lacks), ``failure`` (a page that could not be saved),
-``resume`` (a resumed session began) and ``end`` (how a session ended). Nothing here contains
-chapter text.
+Event types: ``publish`` (actual format, path, file hash and held/missing positions),
+``failure`` (legacy reason or typed fetch/render outcome), ``attempt`` (a selected
+page was attempted), ``content`` (compact canonical-body fingerprint), ``resume``
+and ``end``. CP4 page events use event_version=1 and immutable position/URL/label;
+new readers retain old journals, while older readers refuse unknown event types.
+No event contains chapter prose. A TXT fallback is a publish with fallback_for=pdf,
+alongside the requested PDF failure, never an extra selected page.
 """
 
 from __future__ import annotations
@@ -37,7 +40,8 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 from .atomic_io import write_json_atomic
-from .source_identity import ChapterIdentity, SourceIdentity, SourceIdentityError
+from .source_identity import ChapterIdentity, ChapterLabel, SourceIdentity, SourceIdentityError
+from .content_integrity import BODY_POLICY, OUTCOME_POLICY, REASON_CODES
 
 JOURNAL_FILENAME = "run-journal.jsonl"
 SELECTION_FILENAME = "run-selection.json"
@@ -109,6 +113,7 @@ class RunHeader:
     notes: tuple[str, ...] = ()
     app_version: str = APP_VERSION
     created_utc: str = ""
+    outcome_policy: Optional[str] = None
 
     def __post_init__(self) -> None:
         if self.grouping_mode not in GROUPING_MODES:
@@ -121,6 +126,8 @@ class RunHeader:
             raise JournalError("The run's selection checksum is malformed.")
         if self.source.novel_slug != self.novel_slug:
             raise JournalError("The run's source belongs to another novel.")
+        if self.outcome_policy not in (None, OUTCOME_POLICY):
+            raise JournalError("The run's outcome policy is unsupported.")
 
     def to_json(self) -> dict:
         return {
@@ -140,6 +147,7 @@ class RunHeader:
             "notes": list(self.notes),
             "app_version": self.app_version,
             "created_utc": self.created_utc,
+            "outcome_policy": self.outcome_policy,
         }
 
     @classmethod
@@ -161,6 +169,7 @@ class RunHeader:
                 chunk_size=grouping["chunk_size"], manifest_sha256=raw["manifest"]["content_sha256"],
                 notes=tuple(str(n) for n in raw.get("notes", ())), app_version=str(raw["app_version"]),
                 created_utc=str(raw["created_utc"]),
+                outcome_policy=raw.get("outcome_policy"),
             )
         except JournalError:
             raise
@@ -174,6 +183,8 @@ class Replay:
     header: RunHeader
     publishes: dict = field(default_factory=dict)    # (group key, format) -> latest publish record
     failures: list = field(default_factory=list)
+    attempts: dict = field(default_factory=dict)    # position -> latest explicit attempt
+    contents: dict = field(default_factory=dict)    # position -> latest compact body observation
     ends: list = field(default_factory=list)
     sessions: int = 1
     next_seq: int = 1
@@ -189,16 +200,66 @@ def _check_publish(record: dict, count: int) -> None:
     for name in ("key", "format", "path", "size", "sha256", "pages", "missing"):
         if name not in record:
             raise JournalError(f"a publish record lacks {name!r}")
-    if record["format"] not in FORMATS or not _REL_PATH.fullmatch(record["path"]):
+    if not isinstance(record["format"], str) or record["format"] not in FORMATS or not isinstance(record["path"], str) or not _REL_PATH.fullmatch(record["path"]):
         raise JournalError("a publish record names an unexpected file")
     if not record["path"].upper().startswith(record["format"].upper() + "/"):
         raise JournalError("a publish record's file is in the wrong format folder")
+    if not record["path"].lower().endswith("." + record["format"]):
+        raise JournalError("a publish record's actual file extension disagrees with its format")
+    if record.get("fallback_for") is not None and (record["fallback_for"] != "pdf" or record["format"] != "txt"):
+        raise JournalError("a publish record has an unsupported fallback format")
     if type(record["size"]) is not int or record["size"] < 0 or not _HEX64.fullmatch(str(record["sha256"])):
         raise JournalError("a publish record has a malformed checksum")
     for name in ("pages", "missing"):
         values = record[name]
         if not isinstance(values, list) or any(type(v) is not int or not 0 <= v < count for v in values):
             raise JournalError(f"a publish record has malformed {name}")
+
+
+def _check_page_event(record: dict, header: RunHeader, chapters: list[ChapterIdentity]) -> None:
+    position = record.get("position")
+    if type(position) is not int or not 0 <= position < header.selection_count:
+        raise JournalError("a page event has an invalid selection position")
+    chapter = chapters[position]
+    if record.get("label") != chapter.label.text or record.get("page_url") != chapter.page_url:
+        raise JournalError("a page event does not match its immutable selected identity")
+    kind = record["type"]
+    if kind in ("attempt", "content") and (type(record.get("event_version")) is not int or record["event_version"] != 1):
+        raise JournalError("a page event has an unsupported version")
+    if kind == "failure":
+        if not isinstance(record.get("reason_code"), str) or record["reason_code"] not in REASON_CODES or record.get("stage") not in ("fetch", "render"):
+            raise JournalError("a typed failure has an unsupported reason or stage")
+        if not isinstance(record.get("reason"), str) or len(record["reason"]) > 1000:
+            raise JournalError("a typed failure has an invalid reason")
+        fmt = record.get("format")
+        if fmt is not None and fmt not in FORMATS:
+            raise JournalError("a typed failure has an unsupported format")
+        if record["stage"] == "render" and fmt not in FORMATS:
+            raise JournalError("a render failure must identify its format")
+        if record["stage"] == "fetch" and fmt is not None:
+            raise JournalError("a fetch failure cannot identify an output format")
+        if record["reason_code"].startswith("IDENTITY_") and record["stage"] != "fetch":
+            raise JournalError("identity failure is a fetch/extraction outcome")
+        if record["reason_code"] == "PDF_GLYPH_UNSUPPORTED" and (record["stage"], fmt) != ("render", "pdf"):
+            raise JournalError("a glyph failure must identify PDF rendering")
+        labels = record.get("observed_labels")
+        if not isinstance(labels, list) or len(labels) > 20:
+            raise JournalError("a typed failure has invalid observed labels")
+        try:
+            for label in labels:
+                ChapterLabel(label)
+        except SourceIdentityError as exc:
+            raise JournalError(str(exc)) from exc
+        if record.get("http_status") is not None and (type(record["http_status"]) is not int or not 100 <= record["http_status"] <= 599):
+            raise JournalError("a typed failure has an invalid HTTP status")
+    elif kind == "content":
+        if record.get("body_policy") != BODY_POLICY or not isinstance(record.get("body_sha256"), str) or not _HEX64.fullmatch(record["body_sha256"]):
+            raise JournalError("a content observation has an invalid fingerprint policy/hash")
+        if any(type(record.get(k)) is not int or record[k] <= 0 for k in ("body_bytes", "paragraph_count")):
+            raise JournalError("a content observation has invalid body dimensions")
+        other = record.get("duplicate_of")
+        if other is not None and (type(other) is not int or not 0 <= other < header.selection_count or other == position):
+            raise JournalError("a duplicate-body observation has an invalid referenced position")
 
 
 def replay_journal(path: Path) -> Replay:
@@ -215,6 +276,7 @@ def replay_journal(path: Path) -> Replay:
     complete = lines[:-1]                  # every line that ended with a newline
     tail = lines[-1]                       # b"" when the file ends with a newline
     replay: Optional[Replay] = None
+    event_chapters = None
     offset = 0
     for number, raw_line in enumerate(complete):
         is_last = number == len(complete) - 1 and not tail
@@ -238,12 +300,25 @@ def replay_journal(path: Path) -> Replay:
         else:
             assert replay is not None
             kind = record.get("type")
+            if kind in ("attempt", "content") or (kind == "failure" and "reason_code" in record):
+                if event_chapters is None:
+                    event_chapters = load_selection(path.parent, replay.header)
+                _check_page_event(record, replay.header, event_chapters)
             if kind == "publish":
                 try:
                     _check_publish(record, replay.header.selection_count)
                 except JournalError as exc:
                     raise JournalError(f"Line {number + 1} of the run journal: {exc}.") from None
+                if record.get("fallback_for") and (record["fallback_for"] not in replay.header.formats or record["format"] in replay.header.formats):
+                    raise JournalError("a fallback publication must preserve an unrequested format for a failed requested format")
                 replay.publishes[(record["key"], record["format"])] = record
+            elif kind == "attempt":
+                replay.attempts[record["position"]] = record
+            elif kind == "content":
+                other = record.get("duplicate_of")
+                if other is not None and (replay.contents.get(other, {}).get("body_sha256") != record["body_sha256"]):
+                    raise JournalError("a duplicate-body observation does not reference matching earlier evidence")
+                replay.contents[record["position"]] = record
             elif kind == "failure":
                 replay.failures.append(record)
             elif kind == "end":
@@ -356,13 +431,20 @@ class RunJournal:
         return record
 
     def publish(self, *, key: str, fmt: str, path: str, size: int, sha256: str,
-                pages: list[int], missing: list[int]) -> dict:
+                pages: list[int], missing: list[int], fallback_for: Optional[str] = None) -> dict:
         return self.append("publish", key=key, format=fmt, path=path, size=size, sha256=sha256,
-                           pages=list(pages), missing=list(missing))
+                           pages=list(pages), missing=list(missing),
+                           **({"fallback_for": fallback_for} if fallback_for else {}))
 
-    def failure(self, *, position: int, page_url: str, label: str, reason: str) -> dict:
+    def failure(self, *, position: int, page_url: str, label: str, reason: str, **details) -> dict:
         return self.append("failure", position=position, page_url=page_url, label=label,
-                           reason=str(reason)[:500])
+                           reason=str(reason)[:1000], **details)
+
+    def attempt(self, *, position: int, page_url: str, label: str) -> dict:
+        return self.append("attempt", event_version=1, position=position, page_url=page_url, label=label)
+
+    def content(self, *, position: int, page_url: str, label: str, **fingerprint) -> dict:
+        return self.append("content", event_version=1, position=position, page_url=page_url, label=label, **fingerprint)
 
     def resumed(self) -> dict:
         return self.append("resume")

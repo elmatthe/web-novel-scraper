@@ -41,6 +41,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 from webnovel_scraper.models import OutputMode  # noqa: E402
+from webnovel_scraper.run_accounting import page_accounting  # noqa: E402
 from webnovel_scraper.run_journal import (  # noqa: E402
     JOURNAL_FILENAME, LOCK_FILENAME, SELECTION_FILENAME, file_sha256, load_selection, replay_journal,
 )
@@ -138,18 +139,22 @@ def audit(run_dir: Path, *, pdf_text: bool = False) -> dict:
 
     # ── files ────────────────────────────────────────────────────────────
     groups = plan_groups(len(chapters), OutputMode(header.grouping_mode), header.chunk_size)
-    files, held = [], {fmt: {} for fmt in header.formats}
+    actual_formats = tuple(dict.fromkeys((*header.formats, *(r["format"] for r in replay.publishes.values()))))
+    files, held, good_records = [], {fmt: {} for fmt in actual_formats}, {}
     for group in groups:
-        for fmt in header.formats:
+        for fmt in actual_formats:
             record = replay.publishes.get((group.key, fmt))
+            if fmt not in header.formats and record is None:
+                continue
             entry = {"group": group.key, "format": fmt, "chapters": [labels[p] for p in group.positions]}
+            entry["requested"] = fmt in header.formats
             if record is None:
                 entry["state"] = "not written"
                 files.append(entry)
                 continue
             path = run_dir / record["path"]
             entry.update(file=record["path"], recorded_sha256=record["sha256"],
-                         lacks=[labels[p] for p in record["missing"]])
+                         lacks=[labels[p] for p in record["missing"]], fallback_for=record.get("fallback_for"))
             if not path.is_file():
                 entry["state"] = "missing on disk"
                 problems.append(f"{record['path']} is recorded but missing")
@@ -159,6 +164,7 @@ def audit(run_dir: Path, *, pdf_text: bool = False) -> dict:
                     entry["state"] = "changed since it was written"
                     problems.append(f"{record['path']} does not match its recorded checksum")
                 else:
+                    good_records[(group.key, fmt)] = record
                     entry["state"] = "ok" if not record["missing"] else "ok but incomplete"
                     for position in record["pages"]:
                         held[fmt][position] = record["path"]
@@ -190,10 +196,13 @@ def audit(run_dir: Path, *, pdf_text: bool = False) -> dict:
 
     # ── chapters ─────────────────────────────────────────────────────────
     failures = {f["position"]: f["reason"] for f in replay.failures}
+    outcomes, accounting = page_accounting(len(chapters), header.formats, replay.attempts,
+        replay.contents, replay.failures, good_records, explicit=header.outcome_policy is not None)
     rows, counts = [], Counter()
     for position, chapter in enumerate(chapters):
-        where = {fmt: held[fmt].get(position) for fmt in header.formats}
-        if all(where.values()):
+        where = {fmt: held[fmt].get(position) for fmt in actual_formats
+                 if fmt in header.formats or position in held[fmt]}
+        if all(outcome == "success" for outcome in outcomes[position]["requested_format_outcomes"].values()):
             status = "saved"
         elif position in failures:
             status = "failed"
@@ -202,11 +211,22 @@ def audit(run_dir: Path, *, pdf_text: bool = False) -> dict:
         counts[status] += 1
         rows.append({"position": position, "label": chapter.label.text, "title": chapter.title,
                      "page_url": chapter.page_url, "status": status, "files": where,
-                     "reason": failures.get(position) if status != "saved" else None})
+                     "reason": failures.get(position) if status != "saved" else None,
+                     "attempted": outcomes[position]["attempted"],
+                     "processed": outcomes[position]["processed"],
+                     "requested_format_outcomes": outcomes[position]["requested_format_outcomes"],
+                     "fallback_formats": outcomes[position]["fallback_formats"],
+                     "body_evidence": outcomes[position]["content"]})
     if counts["failed"] or counts["not saved"]:
         problems.append(f"{counts['failed']} chapter(s) failed and {counts['not saved']} are not saved "
                         "in every format")
 
+    integrity = [record for record in replay.contents.values() if record.get("duplicate_of") is not None]
+    for record in integrity:
+        other = record["duplicate_of"]
+        problems.append(f"suspected duplicate canonical body: position {other} chapter {labels[other]} "
+                        f"({chapters[other].page_url}) and position {record['position']} chapter {record['label']} "
+                        f"({record['page_url']}); {record['body_sha256']}. Both pages retained; equality does not prove absence.")
     return {
         "run_folder": str(run_dir),
         "novel": header.novel_slug,
@@ -227,6 +247,9 @@ def audit(run_dir: Path, *, pdf_text: bool = False) -> dict:
         "files": files,
         "unrecorded_files": unrecorded,
         "chapters": rows,
+        "accounting": accounting,
+        "failure_evidence": replay.failures,
+        "integrity_diagnostics": integrity,
         "problems": problems,
     }
 

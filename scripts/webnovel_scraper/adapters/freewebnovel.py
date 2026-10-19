@@ -45,6 +45,8 @@ from ..models import (
     ChapterIndex,
     DiscoveryEvidence,
     ChapterMismatchError,
+    ChapterIdentityUnknownError,
+    ChapterIdentityConflictError,
     EmptyExtractionError,
     SiteSpec,
 )
@@ -385,7 +387,8 @@ def _observed_heading(soup: BeautifulSoup) -> tuple[Optional[int | Decimal], str
         return None, "", None
     labels = {ChapterLabel.parse(str(number)).text for number, _ in evidence}
     if len(labels) != 1:
-        raise ChapterMismatchError("conflicting chapter identity evidence: " + ", ".join(sorted(labels)))
+        raise ChapterIdentityConflictError("conflicting chapter identity evidence: " + ", ".join(sorted(labels)),
+                                           observed_labels=tuple(sorted(labels)))
     number = evidence[0][0]
     title = next((title for _, title in evidence if title), "")
     shown = f"{composite[0]}-{composite[1]}" if composite else None
@@ -885,10 +888,22 @@ class FreeWebNovelAdapter(BaseAdapter):
 
     def _extract_chapter(self, html: str, meta: ChapterMeta) -> ChapterContent:
         soup = BeautifulSoup(html, "html.parser")
-        number, title, shown = _observed_heading(soup)
-        if number is None:
-            raise ChapterMismatchError(f"the page at {meta.url} has no observed chapter identity.")
         label = _meta_label(meta)
+        from ..cloudflare_detection import is_cloudflare_challenge
+        from ..request_manager import ChallengeFetchError, RateLimitedFetchError
+        headings = " ".join(node.get_text(" ") for node in soup.select("title, h1, span.chapter"))
+        if is_cloudflare_challenge(html) or re.search(r"access denied", headings, re.I):
+            raise ChallengeFetchError(f"Access document at {meta.url}; chapter identity is unavailable.")
+        if re.search(r"error\s*1015|you are being rate limited|rate limit exceeded", headings, re.I):
+            raise RateLimitedFetchError(f"Rate-limit document at {meta.url}; chapter absence is unproven.", status=429)
+        try:
+            number, title, shown = _observed_heading(soup)
+        except ChapterIdentityConflictError as exc:
+            exc.requested_label, exc.page_url = label, meta.url
+            raise
+        if number is None:
+            raise ChapterIdentityUnknownError(f"the page at {meta.url} has no observed chapter identity.",
+                                             requested_label=label, page_url=meta.url)
         observed = ChapterLabel.parse(str(number)).text
         if observed != ChapterLabel.parse(label).text:
             # The offset guard (plan §9.6): a page showing another chapter is never published
@@ -896,7 +911,8 @@ class FreeWebNovelAdapter(BaseAdapter):
             raise ChapterMismatchError(
                 f"the page at {meta.url} shows chapter {number}, but the chapter list expects "
                 f"chapter {label} there (the site's numbering may have moved; refresh the "
-                "chapter list and run again)."
+                "chapter list and run again).", requested_label=label,
+                observed_labels=(observed,), page_url=meta.url,
             )
 
         title = clean_title(title, label) or clean_title(meta.title or "", label)
@@ -908,7 +924,8 @@ class FreeWebNovelAdapter(BaseAdapter):
             # extraction failure (its own class) — NOT a Cloudflare block. The
             # pipeline records it as a plain failure without auto-slowdown.
             raise EmptyExtractionError(
-                f"Could not extract body paragraphs for chapter {meta.index}."
+                f"Could not extract body paragraphs for chapter {meta.index}.",
+                requested_label=label, observed_labels=(observed,), page_url=meta.url,
             )
 
         if not title:

@@ -63,7 +63,7 @@ PIPELINE_MESSAGE_RULES: tuple[tuple[str, str, str, bool], ...] = (
     # A chapter that could not be saved.
     ("contains", "FAILED", WARNING, True),
     ("contains", "failed after all methods", WARNING, True),
-    ("contains", "permanently unavailable", WARNING, True),
+    ("contains", "URL not found", WARNING, True),
     ("contains", "had no extractable body", WARNING, True),
     ("contains", "still rate-limited after", WARNING, True),
     # Recovery the user should know about.
@@ -171,10 +171,10 @@ def final_counts(report: object | None) -> FinalCounts | None:
                 | set(getattr(report, "extraction_failed", ()) or ()))
     files = [Path(p) for p in (getattr(report, "written", ()) or ())]
     return FinalCounts(
-        pdfs=sum(1 for p in files if p.suffix.lower() != ".txt"),
+        pdfs=sum(1 for p in files if p.suffix.lower() == ".pdf"),
         txts=sum(1 for p in files if p.suffix.lower() == ".txt"),
         already_present=len(getattr(report, "skipped_existing", ()) or ()),
-        failed=len(problems),
+        failed=(getattr(report, "accounting", {}) or {}).get("requested_failure", len(problems)),
         recovered=len(set(getattr(report, "rescued", ()) or ()) - problems),
         not_listed=len(_gaps_in_range(report)),
     )
@@ -269,8 +269,10 @@ def _files_wording(report: object) -> tuple[str, str, str]:
     ("files", "3 PDFs and 3 TXT files", "3 PDF, 3 TXT")."""
     formats = tuple(getattr(report, "formats", ("pdf",)) or ("pdf",))
     files = [Path(p) for p in (getattr(report, "written", ()) or ())]
-    if formats == ("pdf",):
+    actual = {p.suffix.lower().lstrip(".") for p in files}
+    if formats == ("pdf",) and actual <= {"pdf"}:
         return "PDFs", _plural(len(files), "PDF"), str(len(files))
+    formats = tuple(dict.fromkeys((*formats, *sorted(actual))))
     per = {f: sum(1 for p in files if p.suffix.lower() == "." + f) for f in formats}
     text = " and ".join(_plural(n, "PDF" if f == "pdf" else "TXT file") for f, n in per.items())
     detail = ", ".join(f"{n} {f.upper()}" for f, n in per.items())
@@ -317,7 +319,9 @@ def outcome_events(report: object | None, *, processed: tuple[int, int] | None =
         failed = list(getattr(report, "failed", ()) or ())
         missing = list(getattr(report, "permanent_failed", ()) or ())
         empty = list(getattr(report, "extraction_failed", ()) or ())
-        problems = len(set(failed) | set(missing) | set(empty))
+        accounting = getattr(report, "accounting", {}) or {}
+        problems = accounting.get("requested_failure", len(set(failed) | set(missing) | set(empty)))
+        integrity = accounting.get("integrity_suspicions", 0)
         unaccounted = (processed[1] - processed[0]) if processed else 0
         gaps = _gaps_in_range(report)
         if getattr(report, "cancelled", False):
@@ -327,6 +331,10 @@ def outcome_events(report: object | None, *, processed: tuple[int, int] | None =
             outcome = "completed_with_problems"
             events.append(run(f"Finished with problems: {_plural(problems, 'chapter')} could "
                               "not be saved.", WARNING))
+        elif integrity:
+            outcome = "completed_with_problems"
+            events.append(run(f"Finished with content-integrity concerns: {integrity} suspected duplicate "
+                              "body observation(s). All chapters were retained; matching bodies do not prove source absence.", WARNING))
         elif gaps and (written or skipped):
             # Everything listed was saved, but numbers inside the range are missing from the
             # site's own list: the output is not a complete copy of the range (owner rule).
@@ -355,13 +363,22 @@ def outcome_events(report: object | None, *, processed: tuple[int, int] | None =
         events.append(_processed_line(processed))
         events.append(run(f"{files_word[0].upper() + files_word[1:]} written: {written_detail}. "
                           f"Already present (skipped): {skipped}."))
+        if accounting:
+            events.append(run(f"Requested-format success: {accounting['requested_success']} pages; "
+                              f"requested-format failure: {accounting['requested_failure']}; "
+                              f"fallback artifact preserved: {accounting['fallback_preserved']}; "
+                              f"not attempted: {accounting['not_attempted']}."))
         if failed:
             events.append(run(f"Failed chapters: {_chapter_list(failed)}.", WARNING))
         if missing:
-            events.append(run(f"Not found on the site: {_chapter_list(missing)}.", WARNING))
+            events.append(run(f"URL fetch failed (not proof of chapter absence): {_chapter_list(missing)}.", WARNING))
         if empty:
             events.append(run(f"Fetched but no chapter text found: {_chapter_list(empty)}.",
                               WARNING))
+        identity = list(getattr(report, "identity_failed", ()) or ())
+        if identity:
+            events.append(run(f"Chapter identity could not be authenticated (mismatch/unknown/conflict): "
+                              f"{_chapter_list(identity)}.", WARNING))
         rescued = list(getattr(report, "rescued", ()) or ())
         if rescued:
             events.append(run(f"Recovered by the rescue browser or the second pass: "

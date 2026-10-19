@@ -268,6 +268,26 @@ _fallback_cache: list | None = None
 missing_glyphs: set[str] = set()   # characters no available font could draw (diagnostics)
 
 
+class UnsupportedGlyphError(ValueError):
+    """A PDF cannot faithfully draw these characters with the installed fonts."""
+
+
+def unsupported_characters(chapters: list[ChapterContent]) -> set[str]:
+    chars = {c for chapter in chapters for text in (chapter.heading, *chapter.paragraphs)
+             for c in text if not _encodable(c)}
+    if not chars:
+        return set()
+    coverage = set().union(*(cmap for _name, cmap in _fallback_fonts()))
+    return {c for c in chars if ord(c) not in coverage}
+
+
+def require_glyph_coverage(chapters: list[ChapterContent]) -> None:
+    missing = unsupported_characters(chapters)
+    if missing:
+        codes = ", ".join(f"U+{ord(c):04X}" for c in sorted(missing))
+        raise UnsupportedGlyphError(f"PDF fonts cannot represent {codes}; original text needs TXT output.")
+
+
 def _font_dirs() -> list[Path]:
     dirs = []
     windir = os.environ.get("WINDIR") or os.environ.get("SystemRoot")

@@ -37,6 +37,9 @@ from typing import Callable, Optional
 from .adapters.base import BaseAdapter
 from .models import ChapterContent, ChapterMeta, OutputMode
 from .run_journal import FORMATS, Replay, RunJournal, file_sha256
+from .content_integrity import BodyFingerprints, FailureInfo, OUTCOME_POLICY, classify_failure
+from .run_accounting import page_accounting
+from .pdf_builder import UnsupportedGlyphError, require_glyph_coverage
 
 FORMAT_DIRS = {"pdf": "PDF", "txt": "TXT"}
 _TEMP_SUFFIXES = (".part", ".tmp")
@@ -137,6 +140,11 @@ class RunOutputs:
         self.groups = plan_groups(len(self.metas), mode, chunk_size)
         self._group_of = {p: g for g in self.groups for p in g.positions}
         self._position = {m.url: i for i, m in enumerate(self.metas)}
+        if len(self._position) != len(self.metas):
+            repeated = Counter(m.url for m in self.metas)
+            raise ValueError("DUPLICATE SOURCE URL in selection: " + "; ".join(
+                f"{url} at positions {[p for p, meta in enumerate(self.metas) if meta.url == url]}"
+                for url, count in repeated.items() if count > 1))
         self.cancel_event = cancel_event
         # Content waiting to be published (released once its file is written, so a long run does
         # not keep the whole novel's text in memory), and what the audit needs afterwards.
@@ -144,6 +152,16 @@ class RunOutputs:
         self.obtained: set[int] = set()
         self.titles: dict[int, str] = {}
         self.failed: dict[int, str] = {}
+        self._attempts = dict(replay.attempts) if replay else {}
+        self._content_records = dict(replay.contents) if replay else {}
+        self._failure_history = list(replay.failures) if replay else []
+        self._explicit_outcomes = replay is None or replay.header.outcome_policy == OUTCOME_POLICY
+        self._fingerprints = BodyFingerprints(self._content_records.values())
+        self._session_attempted: set[int] = set()
+        self._session_contents: set[int] = set()
+        self._recorded_failures: dict[tuple, FailureInfo] = {}
+        self._deferred_failures: dict[int, FailureInfo] = {}
+        self._finished = False
         self.pending: dict[str, set[str]] = {}         # group key -> formats still to publish
         self.resumed_positions: list[int] = []
         # Which group owns which relative path (from earlier sessions and this one).
@@ -196,9 +214,36 @@ class RunOutputs:
     def position_of(self, meta: ChapterMeta) -> int:
         return self._position[meta.url]
 
+    def attempt(self, meta: ChapterMeta) -> None:
+        position = self.position_of(meta)
+        if position not in self._session_attempted:
+            self._attempts[position] = self.journal.attempt(
+                position=position, page_url=meta.url, label=self.labels[position])
+            self._session_attempted.add(position)
+
     def add(self, meta: ChapterMeta, content: ChapterContent) -> None:
         """A page's content is ready; an individual-chapter file is published now."""
         position = self._position[meta.url]
+        self.attempt(meta)
+        if not content.paragraphs or not any(paragraph.strip() for paragraph in content.paragraphs):
+            self.fail(meta, FailureInfo("EMPTY_BODY", "The adapter returned no usable canonical story paragraphs."))
+            return
+        fingerprint = self._fingerprints.observe(position, content.paragraphs)
+        previous = self._content_records.get(position)
+        if position not in self._session_contents or previous is None or previous["body_sha256"] != fingerprint["body_sha256"]:
+            self._content_records[position] = self.journal.content(
+                position=position, page_url=meta.url, label=self.labels[position], **fingerprint)
+            other = fingerprint["duplicate_of"]
+            if other is not None:
+                same_label = self.labels[other] == self.labels[position]
+                kind = "same label, different URLs" if same_label else "different labels, identical canonical body"
+                message = (f"DUPLICATE CONTENT: {kind}: position {other} chapter {self.labels[other]} "
+                           f"({self.metas[other].url}) and position {position} chapter {self.labels[position]} "
+                           f"({meta.url}); {fingerprint['body_sha256']}. Suspicion only; both pages are retained.")
+                self.report.warnings.append(message)
+                self.log(message)
+        self._session_contents.add(position)
+        self._deferred_failures.pop(position, None)
         self.contents[position] = content
         self.obtained.add(position)
         self.titles[position] = content.title
@@ -207,17 +252,43 @@ class RunOutputs:
         if self.mode is OutputMode.SEPARATE and group.key in self.pending:
             self._publish(group)
 
-    def fail(self, meta: ChapterMeta, reason: str) -> None:
+    def fail(self, meta: ChapterMeta, reason) -> None:
         position = self._position.get(meta.url)
-        if position is not None and position not in self.obtained:
-            self.failed[position] = str(reason)
+        if position is None:
+            return
+        self._deferred_failures.pop(position, None)
+        info = classify_failure(reason)
+        self.attempt(meta)
+        self.failed[position] = info.reason
+        if meta.index not in self.report.failed:
+            self.report.failed.append(meta.index)
+        if info.reason_code == "EMPTY_BODY" and meta.index not in self.report.extraction_failed:
+            self.report.extraction_failed.append(meta.index)
+        key = (position, info.stage, info.format)
+        if self._recorded_failures.get(key) != info:
+            record = self.journal.failure(position=position, page_url=meta.url,
+                                          label=self.labels[position], **info.fields())
+            self._failure_history.append(record)
+            self._recorded_failures[key] = info
+
+    def defer_failure(self, meta, error) -> None:
+        """A real primary response failed but recovery is still pending, not a new page."""
+        self._deferred_failures[self.position_of(meta)] = classify_failure(error)
+
+    def flush_deferred_failures(self) -> None:
+        for position, info in list(self._deferred_failures.items()):
+            self.fail(self.metas[position], info)
 
     def finish(self, *, cancelled: bool) -> None:
         """Build the grouped files still pending (none after a Stop: Resume builds them), then
         record the pages that could not be saved. Raises ``ScrapeCancelled`` when Stop is pressed
         during the build; every file finished before it is kept and recorded."""
-        if cancelled:
+        if self._finished:
             return
+        self._finished = True
+        self.flush_deferred_failures()
+        if cancelled:
+            return  # known failures were already durably appended by fail(), with no rendering
         for group in self.groups:
             if group.key not in self.pending:
                 continue
@@ -231,13 +302,11 @@ class RunOutputs:
             self._publish(group)
         if not cancelled:
             self._keep_saved_failures()
-            for position, reason in sorted(self.failed.items()):
-                self.journal.failure(position=position, page_url=self.metas[position].url,
-                                     label=self.labels[position], reason=reason)
 
     def _keep_saved_failures(self) -> None:
         """A chapter that failed this session but is still in an earlier session's intact file in
-        every format is saved, not failed: it is neither recorded nor reported as a failure."""
+        every format is saved. The fetch failure stays in journal history; it does not
+        negate the preserved artifact's publication outcome."""
         if not self._earlier or not self.failed:
             return                                  # only an earlier session's file can hold one
         held: dict[tuple[str, str], set] = {}
@@ -248,7 +317,9 @@ class RunOutputs:
                 held[(key, fmt)] = set((self._intact(key, fmt) or {}).get("pages", ()))
             return position in held[(key, fmt)]
 
-        kept = [p for p in sorted(self.failed) if all(holds(p, fmt) for fmt in self.formats)]
+        kept = [p for p in sorted(self.failed)
+                if not any(position == p and stage == "render" for position, stage, _fmt in self._recorded_failures)
+                and all(holds(p, fmt) for fmt in self.formats)]
         if not kept:
             return
         for position in kept:
@@ -279,7 +350,17 @@ class RunOutputs:
         present = [p for p in group.positions if p in self.contents]
         missing = [p for p in group.positions if p not in self.contents]
         contents = [self.contents[p] for p in present]
-        for fmt in self.formats:
+        formats = list(self.formats)
+        if "pdf" in self.pending.get(group.key, ()):
+            try:
+                require_glyph_coverage(contents)
+            except UnsupportedGlyphError as exc:
+                self._render_failure(present, "pdf", exc, glyph=True)
+                formats = [f for f in self.formats if f != "pdf"]
+                if "txt" not in formats:
+                    formats.append("txt")
+                self.pending[group.key].add("txt")
+        for fmt in formats:
             if fmt not in self.pending.get(group.key, ()):
                 continue
             # Never replace an earlier file with one that lacks a chapter it holds (a resume that
@@ -296,12 +377,27 @@ class RunOutputs:
             path.parent.mkdir(parents=True, exist_ok=True)
             # A multi-chapter build can take minutes, so it stops at the next chapter on Stop; a
             # single chapter's file is always finished.
-            self._render(fmt, contents, path, self.title,
-                         cancel_event=self.cancel_event if len(group.positions) > 1 else None)
+            try:
+                self._render(fmt, contents, path, self.title,
+                             cancel_event=self.cancel_event if len(group.positions) > 1 else None)
+            except Exception as exc:
+                from .request_manager import ScrapeCancelled
+                if isinstance(exc, ScrapeCancelled):
+                    raise
+                self._render_failure(present, fmt, exc, glyph=isinstance(exc, UnsupportedGlyphError))
+                if isinstance(exc, OSError):
+                    raise  # retain fatal filesystem/publication failure semantics after durable evidence
+                if fmt == "pdf" and isinstance(exc, UnsupportedGlyphError):
+                    if "txt" not in formats:
+                        formats.append("txt")
+                    self.pending[group.key].add("txt")
+                continue
             size, digest = file_sha256(path)
             record = self.journal.publish(key=group.key, fmt=fmt, path=relative, size=size,
-                                          sha256=digest, pages=present, missing=missing)
+                                          sha256=digest, pages=present, missing=missing,
+                                          **({"fallback_for": "pdf"} if fmt not in self.formats else {}))
             self._records[(group.key, fmt)] = record
+            self.pending[group.key].discard(fmt)
             self._owner[relative.casefold()] = group.key
             self.report.written.append(path)
             detail = "" if len(contents) == 1 else f" ({len(contents)} chapters)"
@@ -309,34 +405,46 @@ class RunOutputs:
                 detail += f" — {len(missing)} chapter(s) missing; a resume adds them"
             self.log(f"  wrote {path.name}{detail}")
         if not missing:
-            self.pending.pop(group.key, None)
+            if not self.pending.get(group.key):
+                self.pending.pop(group.key, None)
             for position in present:          # published for good: its text is no longer needed
                 self.contents.pop(position, None)
         else:
             # Published as far as it goes; still pending, so a resume re-renders it complete.
             self.pending[group.key] = set(self.formats)
 
+    def _render_failure(self, positions, fmt, error, *, glyph=False):
+        info = classify_failure(error, stage="render", fmt=fmt,
+                                code="PDF_GLYPH_UNSUPPORTED" if glyph else "RENDER_ERROR")
+        for position in positions:
+            self.fail(self.metas[position], info)
+        message = f"{fmt.upper()} failed [{info.reason_code}]: {info.reason}."
+        if glyph:
+            message += " Original Unicode is preserved for TXT publication; the requested PDF remains unfinished."
+        self.report.warnings.append(message)
+        self.log(f"WARNING: {message}")
+
     # ── audit ──────────────────────────────────────────────────────────────
     def audit(self) -> dict:
         """Expected versus actual, page by page, with no chapter text: what was selected, which
         file holds it in each format (with that file's checksum), and what is missing and why."""
-        holders: dict[tuple[int, str], dict] = {}
-        for (key, fmt), record in self._records.items():
-            for position in record["pages"]:
-                holders[(position, fmt)] = record
+        intact = {key: record for key in self._records
+                  if (record := self._intact(*key)) is not None}
+        outcomes, accounting = page_accounting(len(self.metas), self.formats, self._attempts,
+            self._content_records, self._failure_history, intact, explicit=self._explicit_outcomes)
+        self.report.accounting = accounting
         resumed = set(self.resumed_positions)
         rows = []
         for position, meta in enumerate(self.metas):
             outputs = {}
-            for fmt in self.formats:
-                record = holders.get((position, fmt))
-                if record is not None:
-                    outputs[fmt] = {"file": record["path"], "sha256": record["sha256"],
-                                    "complete_file": not record["missing"]}
-            if position in self.failed:
-                status = "failed"
-            elif len(outputs) == len(self.formats):
+            outcome = outcomes[position]
+            for fmt, record in outcome["outputs"].items():
+                outputs[fmt] = {"file": record["path"], "sha256": record["sha256"],
+                                "complete_file": not record["missing"]}
+            if all(state == "success" for state in outcome["requested_format_outcomes"].values()):
                 status = "resumed" if position in resumed and position not in self.obtained else "saved"
+            elif position in self.failed:
+                status = "failed"
             else:
                 status = "not saved"
             rows.append({
@@ -348,5 +456,12 @@ class RunOutputs:
                 "status": status,
                 "reason": self.failed.get(position),
                 "outputs": outputs,
+                "attempted": outcome["attempted"],
+                "processed": outcome["processed"],
+                "requested_format_outcomes": outcome["requested_format_outcomes"],
+                "fallback_formats": outcome["fallback_formats"],
+                "body_evidence": outcome["content"],
             })
-        return {"formats": list(self.formats), "grouping": self.mode.value, "chapters": rows}
+        return {"formats": list(self.formats), "grouping": self.mode.value, "chapters": rows,
+                "accounting": accounting, "failures": self._failure_history,
+                "integrity_diagnostics": [r for r in self._content_records.values() if r.get("duplicate_of") is not None]}

@@ -395,7 +395,8 @@ def test_resume_refuses_a_damaged_journal_and_changes_nothing(tmp_path, store):
     folder = _made(tmp_path, store)
     path = folder / JOURNAL_FILENAME
     lines = path.read_text(encoding="utf-8").splitlines()
-    lines[1] = lines[1].replace('"pdf"', '"txt"', 1)
+    published = next(i for i, line in enumerate(lines) if json.loads(line)["type"] == "publish")
+    lines[published] = lines[published].replace('"pdf"', '"txt"', 1)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     before = {p.name: p.read_bytes() for p in (folder / "PDF").iterdir()}
     site = Site(3)

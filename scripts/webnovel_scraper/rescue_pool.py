@@ -63,6 +63,7 @@ from __future__ import annotations
 
 import queue
 import threading
+from .content_integrity import FailureInfo, classify_failure
 import time
 from dataclasses import dataclass
 from typing import Callable, Optional
@@ -137,6 +138,7 @@ RESCUE_EXHAUSTED = "rescue_exhausted"
 CANCELLED = "cancelled"
 NOT_FOUND = "not_found"             # pipeline maps to permanent_failed
 EXTRACTION_FAILED = "extraction_failed"
+IDENTITY_FAILED = "identity_failed"
 POOL_FAILED = "pool_failed"         # worker-crash / init failure (§3.12)
 
 # Refuse to begin a rescue attempt with less than this many seconds left on the
@@ -167,12 +169,17 @@ class RescueResult:
     strategy: Optional[str] = None
     attempts: int = 0
     error: Optional[str] = None
+    failure: Optional[FailureInfo] = None
 
 
 class _PoolFailure(Exception):
     """Internal: the worker could not continue (manager/adapter init failed or an
     unexpected crash). Surfaced to the pipeline as a pool-level failure (§3.12),
     never silently swallowed."""
+
+    def __init__(self, message, failure=None):
+        super().__init__(message)
+        self.failure = failure
 
 
 # Default rescue fetch function. Kept module-level so the pipeline (Phase 3) and the
@@ -413,7 +420,7 @@ class RescuePool:
                         self._accepting = False
                         self._stopping = True
                     self._log(f"  rescue pool FAILED: {pf}")
-                    self._emit(meta, POOL_FAILED, error=str(pf))
+                    self._emit(meta, POOL_FAILED, error=str(pf), failure=pf.failure)
         finally:
             self._teardown()
 
@@ -425,6 +432,7 @@ class RescuePool:
         deadline = started_at + self._deadline_per_chapter
         attempts = 0
         last_error: Optional[str] = None
+        last_failure = None
 
         for step in self._steps_for_current_latch():
             for attempt_in_step in range(step.attempts):
@@ -441,6 +449,7 @@ class RescuePool:
                     self._emit(
                         meta, RESCUE_EXHAUSTED, attempts=attempts,
                         error=last_error or "per-chapter deadline budget exhausted",
+                        failure=last_failure or FailureInfo("NETWORK_ERROR", "per-chapter deadline budget exhausted"),
                     )
                     return
                 budget = min(self._attempt_timeout, remaining)
@@ -465,16 +474,18 @@ class RescuePool:
                     self._emit(meta, CANCELLED, attempts=attempts)
                     return
                 except NotFoundFetchError as exc:
-                    self._emit(meta, NOT_FOUND, attempts=attempts, error=str(exc))
+                    self._emit(meta, NOT_FOUND, attempts=attempts, error=str(exc), failure=classify_failure(exc))
                     return
                 except EmptyExtractionError as exc:
-                    self._emit(meta, EXTRACTION_FAILED, attempts=attempts, error=str(exc))
+                    self._emit(meta, EXTRACTION_FAILED if exc.reason_code == "EMPTY_BODY" else IDENTITY_FAILED,
+                               attempts=attempts, error=str(exc), failure=classify_failure(exc))
                     return
                 except FetchError as exc:
                     # Challenge / transient / rate-limited — a failed attempt; the
                     # ladder escalates. (A 429 already parked the host on the shared
                     # limiter inside the manager, so the next nav waits it out.)
                     last_error = str(exc)
+                    last_failure = classify_failure(exc)
                     self._log(
                         f"  chapter {meta.index} rescue attempt {attempts} "
                         f"({step.mode}) failed: {exc}"
@@ -484,7 +495,7 @@ class RescuePool:
                     raise
                 except Exception as exc:  # genuinely unexpected → pool-level failure
                     raise _PoolFailure(
-                        f"rescue worker crashed on chapter {meta.index}: {exc!r}"
+                        f"rescue worker crashed on chapter {meta.index}: {exc!r}", classify_failure(exc)
                     ) from exc
                 else:
                     self._emit(
@@ -492,7 +503,7 @@ class RescuePool:
                     )
                     return
 
-        self._emit(meta, RESCUE_EXHAUSTED, attempts=attempts, error=last_error)
+        self._emit(meta, RESCUE_EXHAUSTED, attempts=attempts, error=last_error, failure=last_failure)
 
     def _steps_for_current_latch(self) -> list[RescueStep]:
         """Ladder steps at or above the worker's current (only-ever-rising) mode —
@@ -546,6 +557,7 @@ class RescuePool:
         strategy: Optional[str] = None,
         attempts: int = 0,
         error: Optional[str] = None,
+        failure: Optional[FailureInfo] = None,
     ) -> None:
         self._out_q.put(
             RescueResult(
@@ -555,6 +567,7 @@ class RescuePool:
                 strategy=strategy,
                 attempts=attempts,
                 error=error,
+                failure=failure,
             )
         )
         with self._lock:
