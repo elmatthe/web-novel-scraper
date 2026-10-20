@@ -104,7 +104,8 @@ class WindowAdapter:
     def fetch_chapter(self, meta, spec, **_kw):
         self.fetched.append(meta.url)
         return ChapterContent(index=meta.index, title=f"T{meta.index}",
-                              paragraphs=[f"Body of chapter {meta.index}, long enough to render."])
+                              paragraphs=[f"Body of chapter {meta.index}, long enough to render."],
+                              label=ChapterLabel.from_meta(meta).text)
 
 
 def job(tmp_path, start, end, *, mode=OutputMode.SEPARATE, refresh=False, folder="out",

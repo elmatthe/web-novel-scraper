@@ -342,7 +342,7 @@ def test_a_real_offline_run_reports_the_outcome_from_the_run_report(monkeypatch,
         summary, detailed = _text(win, "Summary"), _text(win, "Detailed")
         assert "Run started: Shadow Slave from Free Web Novel (.com)." in summary
         assert "Building chapter index (TOC) …" in summary
-        assert "Warning: chapter 2 FAILED (extraction, not a block)" in summary
+        assert "Warning: chapter 2 FAILED [EMPTY_BODY]" in summary
         # Both chapters were processed, yet the run is not called a success.
         assert win._counts_var.get() == "2 / 2 · 100%"
         assert "Warning: Finished with problems: 1 chapter could not be saved." in summary

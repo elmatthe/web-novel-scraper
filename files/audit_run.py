@@ -124,6 +124,14 @@ def _unrecorded_files(run_dir: Path, recorded: set[str], labels: list[str], held
 def audit(run_dir: Path, *, pdf_text: bool = False) -> dict:
     replay = replay_journal(run_dir / JOURNAL_FILENAME)
     header = replay.header
+    from webnovel_scraper.semantic_resume import validate_admission
+    from webnovel_scraper.run_journal import JournalError
+    try:
+        validate_admission(replay)
+        semantic_reason = "Current application provenance; byte integrity is checked separately. External story correctness is not authenticated."
+        semantic_eligible = True
+    except JournalError as exc:
+        semantic_reason, semantic_eligible = str(exc), False
     chapters = load_selection(run_dir, header)
     labels = [c.label.text for c in chapters]
     values = [c.label.value for c in chapters]
@@ -147,6 +155,7 @@ def audit(run_dir: Path, *, pdf_text: bool = False) -> dict:
             if fmt not in header.formats and record is None:
                 continue
             entry = {"group": group.key, "format": fmt, "chapters": [labels[p] for p in group.positions]}
+            entry["semantic_status"] = "INCOMPLETE" if semantic_eligible else "LEGACY UNVERIFIED" if header.resume_policy is None else "INCOMPATIBLE"
             entry["requested"] = fmt in header.formats
             if record is None:
                 entry["state"] = "not written"
@@ -166,6 +175,9 @@ def audit(run_dir: Path, *, pdf_text: bool = False) -> dict:
                 else:
                     good_records[(group.key, fmt)] = record
                     entry["state"] = "ok" if not record["missing"] else "ok but incomplete"
+                    if semantic_eligible:
+                        entry["semantic_status"] = "INCOMPLETE" if record["missing"] else "SUSPICIOUS" if any(
+                            replay.contents.get(p, {}).get("duplicate_of") is not None for p in record["pages"]) else "CERTIFIED"
                     for position in record["pages"]:
                         held[fmt][position] = record["path"]
                     expected = [labels[p] for p in record["pages"]]
@@ -249,6 +261,9 @@ def audit(run_dir: Path, *, pdf_text: bool = False) -> dict:
         "chapters": rows,
         "accounting": accounting,
         "failure_evidence": replay.failures,
+        "semantic_resume": {"eligible": semantic_eligible, "reason": semantic_reason,
+                            "policy": header.resume_policy, "extraction_policy": header.extraction_policy},
+        "content_conflicts": replay.conflicts,
         "integrity_diagnostics": integrity,
         "problems": problems,
     }

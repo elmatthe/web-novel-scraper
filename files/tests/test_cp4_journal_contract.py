@@ -110,8 +110,11 @@ def test_old_journal_without_page_events_or_policy_remains_readable(tmp_path):
     records = [json.loads(line) for line in path.read_text().splitlines()]
     records = [r for r in records if r["type"] not in ("attempt", "content")]
     records[0].pop("outcome_policy", None)
+    records[0].pop("resume_policy", None)
+    records[0].pop("extraction_policy", None)
     for seq, record in enumerate(records):
         record["seq"] = seq
+        record.pop("certificate", None)
         if record["type"] == "failure":
             for name in ("reason_code", "stage", "format", "observed_labels", "http_status"):
                 record.pop(name, None)

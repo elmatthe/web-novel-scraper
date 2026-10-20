@@ -83,6 +83,7 @@ from .run_output import (
 )
 from .run_storage import RunStorageError, allocate_run_dir, open_existing_run
 from .source_identity import SourceIdentity, SourceIdentityError
+from .semantic_resume import RESUME_POLICY, EXTRACTION_POLICY
 from .request_manager import (
     HOST_MIN_INTERVAL,
     ChallengeFetchError,
@@ -1393,10 +1394,11 @@ def _open_resume(job: ScrapeJob, spec: SiteSpec, store: ChapterManifestStore, lo
     found = open_existing_run(run_dir.parent, run_dir, expected_novel_slug=spec.novel_slug)
     from .observed_preflight import guard_observed_resume_store, validate_observed_resume
     guard_observed_resume_store(SourceIdentity.from_site_spec(spec), store)
-    lock = _lock_run(found.path)
-    try:
+    def validate():
         replay = replay_journal(found.path / "run-journal.jsonl")
         header = replay.header
+        from .semantic_resume import validate_admission
+        validate_admission(replay)
         if header.novel_slug != found.novel_slug or header.run_number != found.number:
             raise JournalError("The run journal describes another run folder.")
         current = SourceIdentity.from_site_spec(spec)
@@ -1421,6 +1423,8 @@ def _open_resume(job: ScrapeJob, spec: SiteSpec, store: ChapterManifestStore, lo
         known = {c.page_url: c for c in loaded.effective.chapters}
         for chapter in chapters:
             now = known.get(chapter.page_url)
+            if now is None:
+                raise JournalError("The selected page is missing from the current source manifest. Start a new run.")
             if now is not None and (
                 now.label != chapter.label
                 or (now.slug is not None and chapter.slug is not None and now.slug != chapter.slug)
@@ -1429,6 +1433,13 @@ def _open_resume(job: ScrapeJob, spec: SiteSpec, store: ChapterManifestStore, lo
                     f"The site's chapter list changed since this run began: {chapter.page_url} was "
                     f"chapter {chapter.label} and is now chapter {now.label}. Start a new run."
                 )
+        return replay, chapters
+
+    # No lock creation, tail trimming, cleanup or journal append before admission.
+    validate()
+    lock = _lock_run(found.path)
+    try:
+        replay, chapters = validate()
     except BaseException:
         lock.release()
         raise
@@ -1457,14 +1468,10 @@ def _prepare_run(
     if resumed:
         run_dir, lock, replay, chapters = _open_resume(job, spec, store, log)
         header = replay.header
-        try:
-            journal = RunJournal.resume(run_dir, replay)
-            journal.resumed()
-            for orphan in remove_orphan_temps(run_dir):
-                log(f"  removed an interrupted temporary file: {orphan.name}")
-        except BaseException:
-            lock.release()
-            raise
+        # A read-only writer handle permits output planning/hash checks before any
+        # torn-tail repair, append or cleanup. It does not open or change a file.
+        journal = RunJournal(run_dir, replay.next_seq)
+        journal.header = header
         metas = [chapter_preflight.meta_from_identity(c) for c in chapters]
         report.requested_range = header.requested
         report.effective_range = header.effective
@@ -1513,6 +1520,7 @@ def _prepare_run(
                 chunk_size=int(job.chunk_size), manifest_sha256=_manifest_digest(effective),
                 notes=tuple(notes), created_utc=store.now_utc(),
                 outcome_policy=OUTCOME_POLICY,
+                resume_policy=RESUME_POLICY, extraction_policy=EXTRACTION_POLICY,
             )
             journal = RunJournal.create(run_dir, header, chapters)
         except BaseException:
@@ -1521,6 +1529,7 @@ def _prepare_run(
 
     report.output_dir = run_dir
     labels = [c.label.text for c in chapters]
+    resume_started = not resumed
     outputs = RunOutputs(
         run_dir=run_dir, journal=journal, metas=metas, labels=labels, mode=job.output_mode,
         chunk_size=job.chunk_size, formats=tuple(job.formats), title=spec.novel_title,
@@ -1532,6 +1541,13 @@ def _prepare_run(
         if job.output_mode is OutputMode.SEPARATE:
             _record_duplicate_output_numbers(metas, report, log)
         fetch_list = outputs.plan_fetch()
+        if resumed:
+            journal = RunJournal.resume(run_dir, replay)
+            outputs.journal = journal
+            journal.resumed()
+            resume_started = True
+            for orphan in remove_orphan_temps(run_dir):
+                log(f"  removed an interrupted temporary file: {orphan.name}")
         state = _Progress(total=len(metas), cb=progress_cb, phase_cb=phase_cb,
                           cached=lambda: report.from_cache)
         state.phase(PHASE_SCRAPING)
@@ -1539,9 +1555,10 @@ def _prepare_run(
         if done:
             report.skipped_existing.extend(metas[p].index for p in done)
             state.tick(len(done), skipped=True)
-            log(f"  {len(done)} chapter(s) already saved and verified by checksum; skipping them.")
+            log(f"  {len(done)} chapter(s) already saved with compatible semantic certificates and intact bytes; skipping them.")
     except BaseException:
-        _end_journal(journal, "failed", log)
+        if resume_started:
+            _end_journal(journal, "failed", log)
         lock.release()
         raise
     return _Run(run_dir=run_dir, journal=journal, outputs=outputs, fetch_list=fetch_list,

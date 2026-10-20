@@ -213,7 +213,10 @@ def test_empty_extraction_classified_as_extraction_failure_not_block(tmp_path) -
     # NOT swept: chapter 2 is fetched exactly once (no second-pass re-attempt).
     assert adapter.fetched == [1, 2, 3]
     assert report.rescued == []
-    assert any("extraction, not a block" in line for line in log_lines)
+    assert any("chapter 2 FAILED [EMPTY_BODY]" in line for line in log_lines)
+    from webnovel_scraper.run_journal import JOURNAL_FILENAME, replay_journal
+    [failure] = replay_journal(report.output_dir / JOURNAL_FILENAME).failures
+    assert (failure["label"], failure["stage"], failure["reason_code"]) == ("2", "fetch", "EMPTY_BODY")
 
 
 def test_empty_extraction_not_swept_in_single_mode(tmp_path) -> None:

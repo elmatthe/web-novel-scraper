@@ -114,6 +114,8 @@ class RunHeader:
     app_version: str = APP_VERSION
     created_utc: str = ""
     outcome_policy: Optional[str] = None
+    resume_policy: Optional[str] = None
+    extraction_policy: Optional[str] = None
 
     def __post_init__(self) -> None:
         if self.grouping_mode not in GROUPING_MODES:
@@ -148,6 +150,8 @@ class RunHeader:
             "app_version": self.app_version,
             "created_utc": self.created_utc,
             "outcome_policy": self.outcome_policy,
+            "resume_policy": self.resume_policy,
+            "extraction_policy": self.extraction_policy,
         }
 
     @classmethod
@@ -170,6 +174,8 @@ class RunHeader:
                 notes=tuple(str(n) for n in raw.get("notes", ())), app_version=str(raw["app_version"]),
                 created_utc=str(raw["created_utc"]),
                 outcome_policy=raw.get("outcome_policy"),
+                resume_policy=raw.get("resume_policy"),
+                extraction_policy=raw.get("extraction_policy"),
             )
         except JournalError:
             raise
@@ -185,6 +191,9 @@ class Replay:
     failures: list = field(default_factory=list)
     attempts: dict = field(default_factory=dict)    # position -> latest explicit attempt
     contents: dict = field(default_factory=dict)    # position -> latest compact body observation
+    conflicts: list = field(default_factory=list)
+    semantic_groups: Optional[dict] = None
+    publication_owners: dict = field(default_factory=dict)
     ends: list = field(default_factory=list)
     sessions: int = 1
     next_seq: int = 1
@@ -200,6 +209,8 @@ def _check_publish(record: dict, count: int) -> None:
     for name in ("key", "format", "path", "size", "sha256", "pages", "missing"):
         if name not in record:
             raise JournalError(f"a publish record lacks {name!r}")
+    if not isinstance(record["key"], str):
+        raise JournalError("a publish record has a malformed group key")
     if not isinstance(record["format"], str) or record["format"] not in FORMATS or not isinstance(record["path"], str) or not _REL_PATH.fullmatch(record["path"]):
         raise JournalError("a publish record names an unexpected file")
     if not record["path"].upper().startswith(record["format"].upper() + "/"):
@@ -284,7 +295,7 @@ def replay_journal(path: Path) -> Replay:
             record = json.loads(raw_line.decode("utf-8"))
             if not isinstance(record, dict) or record.get("crc") != record_crc(record):
                 raise ValueError("checksum mismatch")
-            if record.get("seq") != number:
+            if type(record.get("seq")) is not int or record["seq"] != number:
                 raise ValueError("sequence gap")
         except (ValueError, UnicodeDecodeError) as exc:
             if is_last:                    # a torn final line: ignore it, resume trims it
@@ -300,6 +311,7 @@ def replay_journal(path: Path) -> Replay:
         else:
             assert replay is not None
             kind = record.get("type")
+            from .semantic_resume import check_event
             if kind in ("attempt", "content") or (kind == "failure" and "reason_code" in record):
                 if event_chapters is None:
                     event_chapters = load_selection(path.parent, replay.header)
@@ -311,14 +323,22 @@ def replay_journal(path: Path) -> Replay:
                     raise JournalError(f"Line {number + 1} of the run journal: {exc}.") from None
                 if record.get("fallback_for") and (record["fallback_for"] not in replay.header.formats or record["format"] in replay.header.formats):
                     raise JournalError("a fallback publication must preserve an unrequested format for a failed requested format")
+                check_event(replay, record)
                 replay.publishes[(record["key"], record["format"])] = record
             elif kind == "attempt":
                 replay.attempts[record["position"]] = record
             elif kind == "content":
+                check_event(replay, record)
                 other = record.get("duplicate_of")
                 if other is not None and (replay.contents.get(other, {}).get("body_sha256") != record["body_sha256"]):
                     raise JournalError("a duplicate-body observation does not reference matching earlier evidence")
                 replay.contents[record["position"]] = record
+            elif kind == "content_conflict":
+                if event_chapters is None:
+                    event_chapters = load_selection(path.parent, replay.header)
+                _check_page_event(record, replay.header, event_chapters)
+                check_event(replay, record)
+                replay.conflicts.append(record)
             elif kind == "failure":
                 replay.failures.append(record)
             elif kind == "end":
@@ -360,6 +380,7 @@ class RunJournal:
         self._seq = next_seq
         self._clock = clock
         self._broken = False        # a failed write could not be cut back off the end of the file
+        self.header = None
 
     # -- creation -----------------------------------------------------------
     @classmethod
@@ -390,13 +411,19 @@ class RunJournal:
             os.fsync(fd)
         finally:
             os.close(fd)
-        return cls(run_dir, 1, clock)
+        journal = cls(run_dir, 1, clock)
+        journal.header = header
+        return journal
 
     @classmethod
     def resume(cls, run_dir: Path, replay: Replay, *, clock=_utc_now) -> "RunJournal":
         """Continue a verified journal: a torn last line is trimmed first, so the next record
         follows the last intact one."""
         journal = cls(run_dir, replay.next_seq, clock)
+        journal.header = replay.header
+        if replay.header.resume_policy is not None:
+            from .semantic_resume import validate_admission
+            validate_admission(replay)
         if replay.torn_tail:
             with open(journal.path, "r+b") as handle:
                 handle.truncate(replay.good_length)
@@ -431,10 +458,15 @@ class RunJournal:
         return record
 
     def publish(self, *, key: str, fmt: str, path: str, size: int, sha256: str,
-                pages: list[int], missing: list[int], fallback_for: Optional[str] = None) -> dict:
-        return self.append("publish", key=key, format=fmt, path=path, size=size, sha256=sha256,
-                           pages=list(pages), missing=list(missing),
-                           **({"fallback_for": fallback_for} if fallback_for else {}))
+                pages: list[int], missing: list[int], fallback_for: Optional[str] = None,
+                contents: Optional[dict] = None) -> dict:
+        fields = dict(key=key, format=fmt, path=path, size=size, sha256=sha256,
+                      pages=list(pages), missing=list(missing),
+                      **({"fallback_for": fallback_for} if fallback_for else {}))
+        if self.header is not None and self.header.resume_policy is not None:
+            from .semantic_resume import publication_certificate
+            fields["certificate"] = publication_certificate(self.header, fields, contents or {})
+        return self.append("publish", **fields)
 
     def failure(self, *, position: int, page_url: str, label: str, reason: str, **details) -> dict:
         return self.append("failure", position=position, page_url=page_url, label=label,
@@ -481,4 +513,6 @@ def load_selection(run_dir: Path, header: RunHeader) -> list[ChapterIdentity]:
         raise JournalError("The run's selection file was changed since the run began (checksum mismatch).")
     if len(chapters) != header.selection_count or len({c.page_url for c in chapters}) != len(chapters):
         raise JournalError("The run's selection file is inconsistent.")
+    if not chapters or (chapters[0].label.text, chapters[-1].label.text) != (header.first_label, header.last_label):
+        raise JournalError("The run's selection boundaries disagree with its exact labels.")
     return chapters

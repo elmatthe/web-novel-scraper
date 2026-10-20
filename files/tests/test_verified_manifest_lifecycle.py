@@ -340,6 +340,8 @@ def test_new_policy_run_can_resume_only_its_exact_certified_snapshot(tmp_path):
     from webnovel_scraper.models import OutputMode, ScrapeJob
     from webnovel_scraper.run_journal import RunHeader, RunJournal, selection_sha256
     from webnovel_scraper.run_storage import allocate_run_dir
+    from webnovel_scraper.semantic_resume import RESUME_POLICY, EXTRACTION_POLICY
+    from webnovel_scraper.content_integrity import OUTCOME_POLICY
 
     store = store_at(tmp_path)
     run(store, Pages({1: 1, 2: 2, 3: 3}))
@@ -352,6 +354,7 @@ def test_new_policy_run_can_resume_only_its_exact_certified_snapshot(tmp_path):
         first_label="1", last_label="3", requested=(1, 3), effective=(1, 3),
         formats=("txt",), grouping_mode="separate", chunk_size=10,
         manifest_sha256=pipeline._manifest_digest(effective),
+        outcome_policy=OUTCOME_POLICY, resume_policy=RESUME_POLICY, extraction_policy=EXTRACTION_POLICY,
     )
     RunJournal.create(reserved.path, header, chapters)
     job = ScrapeJob(novel_slug=SOURCE.novel_slug, adapter_key=SOURCE.adapter_key, start=1, end=3,

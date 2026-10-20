@@ -141,7 +141,11 @@ def test_a_resume_that_fetches_fewer_chapters_never_shrinks_a_saved_file(tmp_pat
     replay = replay_journal(folder / JOURNAL_FILENAME)
     assert len(replay.publishes[("chunk-00001", "txt")]["pages"]) == 9
     assert replay.last_end == "complete_with_problems"
-    assert [int(f["label"]) for f in replay.failures if f["seq"] > first_end_seq(replay)] == [3]
+    # CP4 preserves every real fetch failure even when an earlier intact partial
+    # publication still holds the page. Current outcome and history are distinct.
+    assert [int(f["label"]) for f in replay.failures if f["seq"] > first_end_seq(replay)] == list(range(3, 11))
+    assert again.accounting["requested_success"] == 9
+    assert again.accounting["requested_failure"] == 1
     rows = json.loads((folder / pipeline.AUDIT_FILENAME).read_text(encoding="utf-8"))["chapters"]
     assert {r["label"]: r["status"] for r in rows} == {
         **{str(n): "saved" for n in range(1, 11)}, "3": "failed"}
@@ -277,7 +281,15 @@ def test_a_long_run_with_intermittent_failures_adds_up_exactly(tmp_path, store):
     assert len(report.written) == count - len(dead)
     replay = replay_journal(report.output_dir / JOURNAL_FILENAME)
     assert len(replay.publishes) == count - len(dead)
-    assert sorted(int(f["label"]) for f in replay.failures) == sorted(dead)
+    assert sorted(int(f["label"]) for f in replay.failures) == sorted(dead | flaky)
+    assert report.accounting["requested_success"] == count - len(dead)
+    assert report.accounting["requested_failure"] == len(dead)
+    assert report.accounting["attempted"] == count and report.accounting["not_attempted"] == 0
+    for failure in replay.failures:
+        if int(failure["label"]) in flaky:
+            position = failure["position"]
+            assert replay.contents[position]["seq"] > failure["seq"]
+            assert replay.publishes[(f"chapter-{position + 1:05d}", "txt")]["seq"] > failure["seq"]
     assert replay.last_end == "complete_with_problems"
     # every saved file holds exactly its own chapter
     for path in (report.output_dir / "TXT").glob("*.txt"):

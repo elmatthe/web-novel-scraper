@@ -14,8 +14,9 @@ Both pipeline paths hand every chapter they obtain to one :class:`RunOutputs`. I
 * **Publication.** Render to a temp file in the destination folder, ``fsync``, ``os.replace``, then
   hash the published file and append a ``publish`` record to the journal. A file without a record
   is unverified and is rendered again under the same name.
-* **Resume.** A group/format is complete only if its latest record lacks no page and the file it
-  names exists with the recorded size and SHA-256; filename presence alone never counts. Complete
+* **Resume.** A group/format is complete only with current semantic policy, accepted content-event
+  references, immutable group membership and intact recorded bytes. Legacy outputs refuse Resume.
+  The latest record must lack no page. Complete
   groups are skipped without any network or cache read; everything else is fetched (the HTML cache
   makes repeats cheap) and rendered again. A group that was published with pages missing is
   re-rendered once they are obtained.
@@ -29,6 +30,7 @@ Both pipeline paths hand every chapter they obtain to one :class:`RunOutputs`. I
 from __future__ import annotations
 
 import re
+import hashlib
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -36,8 +38,9 @@ from typing import Callable, Optional
 
 from .adapters.base import BaseAdapter
 from .models import ChapterContent, ChapterMeta, OutputMode
-from .run_journal import FORMATS, Replay, RunJournal, file_sha256
-from .content_integrity import BodyFingerprints, FailureInfo, OUTCOME_POLICY, classify_failure
+from .run_journal import FORMATS, Replay, RunJournal, JournalError, file_sha256
+from .semantic_resume import EXTRACTION_POLICY, content_reference, observed_label
+from .content_integrity import BodyFingerprints, FailureInfo, OUTCOME_POLICY, body_fingerprint, classify_failure
 from .run_accounting import page_accounting
 from .pdf_builder import UnsupportedGlyphError, require_glyph_coverage
 
@@ -129,6 +132,8 @@ class RunOutputs:
             raise ValueError(f"unsupported output formats: {formats!r}")
         self.run_dir = Path(run_dir)
         self.journal = journal
+        self._semantic = bool(journal and journal.header and journal.header.resume_policy)
+        self._conflicted: set[int] = set()
         self.metas = list(metas)
         self.labels = list(labels)
         self.mode = mode
@@ -196,11 +201,13 @@ class RunOutputs:
 
     def _verified(self, key: str, fmt: str) -> bool:
         record = self._intact(key, fmt)
-        return record is not None and not record["missing"]
+        return self._semantic and record is not None and "certificate" in record and not record["missing"]
 
     def plan_fetch(self) -> list[ChapterMeta]:
         """Record already-complete groups as resumed and return the pages still needed."""
         needed: list[ChapterMeta] = []
+        self.resumed_positions.clear()
+        self.pending.clear()
         for group in self.groups:
             missing = {fmt for fmt in self.formats if not self._verified(group.key, fmt)}
             if not missing:
@@ -228,11 +235,24 @@ class RunOutputs:
         if not content.paragraphs or not any(paragraph.strip() for paragraph in content.paragraphs):
             self.fail(meta, FailureInfo("EMPTY_BODY", "The adapter returned no usable canonical story paragraphs."))
             return
-        fingerprint = self._fingerprints.observe(position, content.paragraphs)
+        observed = observed_label(content)
+        if self._semantic and observed != self.labels[position]:
+            self.fail(meta, FailureInfo("IDENTITY_MISMATCH", "Accepted content differs from the exact selected label.", (observed,)))
+            return
         previous = self._content_records.get(position)
+        candidate_digest = body_fingerprint(content.paragraphs)[0]
+        if self._semantic and previous and previous["body_sha256"] != candidate_digest:
+            self.journal.append("content_conflict", position=position, page_url=meta.url,
+                                label=self.labels[position], accepted=content_reference(previous),
+                                observed_body_sha256=candidate_digest)
+            self._conflicted.add(position)
+            self.fail(meta, FailureInfo("CONTENT_CONFLICT", "Canonical body changed since acceptance; previous publications preserved. Start a new run."))
+            return
+        fingerprint = self._fingerprints.observe(position, content.paragraphs)
         if position not in self._session_contents or previous is None or previous["body_sha256"] != fingerprint["body_sha256"]:
             self._content_records[position] = self.journal.content(
-                position=position, page_url=meta.url, label=self.labels[position], **fingerprint)
+                position=position, page_url=meta.url, label=self.labels[position], **fingerprint,
+                **({"extraction_policy": EXTRACTION_POLICY, "observed_label": observed} if self._semantic else {}))
             other = fingerprint["duplicate_of"]
             if other is not None:
                 same_label = self.labels[other] == self.labels[position]
@@ -347,6 +367,9 @@ class RunOutputs:
         return relative
 
     def _publish(self, group: OutputGroup) -> None:
+        if any(p in self._conflicted for p in group.positions):
+            self.log("CONTENT_CONFLICT: group preserved; start a new run after reviewing changed source text.")
+            return
         present = [p for p in group.positions if p in self.contents]
         missing = [p for p in group.positions if p not in self.contents]
         contents = [self.contents[p] for p in present]
@@ -393,8 +416,23 @@ class RunOutputs:
                     self.pending[group.key].add("txt")
                 continue
             size, digest = file_sha256(path)
+            if self._semantic:
+                if len(contents) != len(present) or any(
+                    body_fingerprint(content.paragraphs) != (
+                        self._content_records[p]["body_sha256"], self._content_records[p]["body_bytes"],
+                        self._content_records[p]["paragraph_count"])
+                    or observed_label(content) != self.labels[p]
+                    for p, content in zip(present, contents)
+                ):
+                    raise JournalError("Renderer input changed from accepted canonical content; no certificate issued.")
+            if self._semantic and fmt == "txt":
+                from .txt_builder import chapters_to_txt
+                expected = chapters_to_txt(contents).encode("utf-8")
+                if (size, digest) != (len(expected), hashlib.sha256(expected).hexdigest()):
+                    raise JournalError("TXT publication differs from the accepted canonical content; no certificate issued.")
             record = self.journal.publish(key=group.key, fmt=fmt, path=relative, size=size,
                                           sha256=digest, pages=present, missing=missing,
+                                          contents=self._content_records,
                                           **({"fallback_for": "pdf"} if fmt not in self.formats else {}))
             self._records[(group.key, fmt)] = record
             self.pending[group.key].discard(fmt)
@@ -461,6 +499,11 @@ class RunOutputs:
                 "requested_format_outcomes": outcome["requested_format_outcomes"],
                 "fallback_formats": outcome["fallback_formats"],
                 "body_evidence": outcome["content"],
+                "semantic_status": ("INCOMPATIBLE" if position in self._conflicted else
+                                    "LEGACY UNVERIFIED" if not self._semantic else
+                                    "SUSPICIOUS" if outcome["content"] and outcome["content"].get("duplicate_of") is not None else
+                                    "CERTIFIED" if outputs and all(not r["missing"] for r in outcome["outputs"].values())
+                                    and all(f in outputs for f in self.formats) else "INCOMPLETE"),
             })
         return {"formats": list(self.formats), "grouping": self.mode.value, "chapters": rows,
                 "accounting": accounting, "failures": self._failure_history,

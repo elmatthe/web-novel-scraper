@@ -48,7 +48,7 @@ def _saved(p):
 
 
 def validate_observed_resume(source, loaded, header, chapters, digest):
-    """Conservative CP3 gate; semantic output-certificate redesign remains CP5."""
+    """Conservative CP3 manifest gate, retained alongside CP5 publication admission."""
     from .chapter_verification import requires_verification
     from .run_journal import JournalError
     if not requires_verification(source):
