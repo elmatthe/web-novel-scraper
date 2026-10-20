@@ -149,9 +149,10 @@ class _PageSpool:
     Only one page is materialized at a time. Never a cross-run identity cache.
     TemporaryFile closes and removes itself when the last reference is released.
     """
-    def __init__(self):
-        _DISCOVERY_TEMP.mkdir(parents=True, exist_ok=True)
-        self.file = tempfile.TemporaryFile(dir=_DISCOVERY_TEMP)
+    def __init__(self, directory=None):
+        directory = Path(directory) if directory is not None else _DISCOVERY_TEMP
+        directory.mkdir(parents=True, exist_ok=True)
+        self.file = tempfile.TemporaryFile(dir=directory)
         weakref.finalize(self, self.file.close)
         self.lock = threading.Lock()
 
@@ -453,9 +454,11 @@ class FreeWebNovelAdapter(BaseAdapter):
     key = "freewebnovel"
     enabled = True
 
-    def __init__(self, request_manager=None, log=None) -> None:
+    def __init__(self, request_manager=None, log=None, *, spool_factory=None) -> None:
         self._rm = request_manager
         self._log = log or logger.info
+        # Developer acceptance can own/close isolated spools without global redirection.
+        self._spool_factory = spool_factory or _PageSpool
         self.warnings: list[str] = []
 
     # ── helpers ──────────────────────────────────────────────────────────────
@@ -721,7 +724,7 @@ class FreeWebNovelAdapter(BaseAdapter):
                     evidence = DiscoveryEvidence("saved_unknown", "historical-cache", evidence.labels,
                                                  "fetch unexpectedly supplied cached HTML; " + evidence.detail)
                 if evidence.verified:
-                    spool = getattr(self, "_discovery_spool", None) or _PageSpool()
+                    spool = getattr(self, "_discovery_spool", None) or self._spool_factory()
                     reference = spool.put(html)
         if not evidence.verified:
             number = None
@@ -779,7 +782,7 @@ class FreeWebNovelAdapter(BaseAdapter):
                                         title=chapter.title, source_id=chapter.source_id,
                                         extra={"manifest_label": chapter.label.text})
         seeds = {m.slug: m for m in resume_metas or [] if m.slug is not None}
-        self._discovery_spool = _PageSpool()
+        self._discovery_spool = self._spool_factory()
         last_emitted = None
 
         def snapshot(complete=False):
