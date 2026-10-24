@@ -15,10 +15,7 @@ every chapter starts with one heading such as `Chapter 12: The Lost Tomb`.
 | Novel | Website | Status in this version |
 |-------|---------|------------------------|
 | Shadow Slave | Free Web Novel (.com) | ✅ Available |
-| Shadow Slave | Empire Novel | ⏳ Coming soon |
-| Shadow Slave | Telegraph | ⏳ Coming soon |
 | The Noble Queen | WebNovel (Dynamic) | ✅ Available |
-| The Noble Queen | Novel Bin | ⏳ Coming soon |
 | Reverend Insanity | Free Web Novel (.com) | ✅ Available |
 | Renegade Immortal | Free Web Novel (.com) | ✅ Available |
 | Supreme Magus | Free Web Novel (.com) | ✅ Available |
