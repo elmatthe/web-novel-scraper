@@ -30,11 +30,42 @@ from typing import Optional
 
 from bs4 import BeautifulSoup
 
-from ..models import ChapterContent, ChapterIndex, ChapterMeta, EmptyExtractionError, SiteSpec
+from ..models import ChapterContent, ChapterIndex, ChapterMeta, ChapterMismatchError, EmptyExtractionError, SiteSpec
 from ..content import clean_paragraphs, clean_title, is_site_chrome, label_text, normalize_text
 from .base import BaseAdapter, extract_validated
 
 logger = logging.getLogger(__name__)
+
+
+def _validate_identity(html: str, meta: ChapterMeta, raw_title: Optional[str]) -> None:
+    """Reject explicit page identity conflicts before requested metadata can hide them."""
+    data = parse_next_data(html) or {}
+    try:
+        next_info = data["props"]["pageProps"]["data"]["chapterInfo"]
+    except (KeyError, TypeError):
+        next_info = None
+    expected_id = meta.source_id or meta.url.rstrip("/").rsplit("/", 1)[-1]
+    titles = [raw_title]
+    soup = BeautifulSoup(html, "html.parser")
+    for selector in _TITLE_SELECTORS:
+        heading = soup.select_one(selector)
+        if heading is not None:
+            titles.append(heading.get_text(" ", strip=True))
+    for info in (next_info, parse_g_data_chapter(html)):
+        if not isinstance(info, dict):
+            continue
+        expected_book = meta.url.rstrip("/").rsplit("/", 2)[-2]
+        for field, expected in (("chapterIndex", str(meta.index)), ("chapterId", str(expected_id)),
+                                ("bookId", expected_book)):
+            if info.get(field) is not None and str(info[field]) != expected:
+                raise ChapterMismatchError(
+                    f"Chapter {meta.index}: page {field} {info[field]!r} disagrees with {expected!r}."
+                )
+        titles.append(info.get("chapterName"))
+    for title in titles:
+        match = re.match(r"^\s*Chapter\s+(\d+(?:\.\d+)?)\b", str(title or ""), re.IGNORECASE)
+        if match and label_text(match.group(1)) != label_text(meta.index):
+            raise ChapterMismatchError(f"Chapter {meta.index}: page heading identifies {title!r}.")
 
 # Default dynamic host, used only if a spec carries no base_url.
 _DEFAULT_HOST = "https://dynamic.webnovel.com"
@@ -270,6 +301,7 @@ class WebNovelDynamicAdapter(BaseAdapter):
         """
         rm = self._manager(spec)
         # Always fresh and never cached (v0.3.0 03.2b): this page is where new chapters appear.
+        self._log(f"Fresh index/TOC request: {spec.url}")
         html = rm.fetch(spec.url, use_browser=spec.use_browser, use_cache=False)
 
         data = parse_next_data(html)
@@ -358,6 +390,7 @@ class WebNovelDynamicAdapter(BaseAdapter):
 
     def _extract_chapter(self, html: str, meta: ChapterMeta) -> ChapterContent:
         raw_title, paragraphs = extract_chapter(html, meta.index)
+        _validate_identity(html, meta, raw_title)
 
         if not paragraphs:
             # Fully-fetched page, no extractable body: an extraction failure (its

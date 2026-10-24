@@ -384,3 +384,23 @@ def test_the_status_word_and_the_summary_agree_for_every_kind_of_report(tmp_path
         label = {"warning": "Warning:", "error": "Error:"}.get(view.severity)
         assert (label is None and not first.startswith(("Warning:", "Error:"))) or \
                (label is not None and first.startswith(label)), (outcome, first, view.severity)
+
+
+@pytest.mark.parametrize("cancelled", [False, True])
+@pytest.mark.parametrize("selected,attempted,processed,success,not_attempted", [
+    (201, 16, 15, 15, 185),  # one interrupted attempt after 15 complete chapters
+    (1, 1, 1, 0, 0),        # all content processed, but a publication is missing
+])
+def test_pending_publication_is_visible_in_summary(tmp_path, cancelled, selected,
+                                                  attempted, processed, success, not_attempted):
+    report = _report(tmp_path, written=[tmp_path / "c.pdf"], cancelled=cancelled)
+    report.accounting = dict(selected=selected, attempted=attempted, processed=processed,
+                             requested_success=success, requested_failure=0,
+                             fallback_preserved=0, not_attempted=not_attempted, pending=1)
+    outcome, events = ra.outcome_events(report, processed=(processed, selected))
+    assert outcome == ("stopped" if cancelled else "completed_with_problems")
+    summary = "\n".join(_summary(events))
+    assert "pending: 1" in summary
+    assert f"{attempted} attempted, {processed} processed" in summary
+    if not cancelled:
+        assert "pending requested-format publication" in summary

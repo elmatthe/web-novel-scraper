@@ -237,6 +237,47 @@ def test_pdf_and_txt_carry_the_same_text_in_the_same_order(tmp_path):
     assert _pdf_words(pdf) == _txt_words(txt)
 
 
+def test_supplementary_unicode_and_rune_survive_pdf_extraction(tmp_path):
+    from pypdf import PdfReader
+    line = "Symbols: \U0001f62e \U0001f4a8 \u16b1 \U0001d633 \U0001d400."
+    pdf = pdf_builder.create_pdf([ChapterContent(1, "Unicode", [line])], tmp_path / "u.pdf", "T")
+    assert line in PdfReader(pdf).pages[0].extract_text()
+    with pdfplumber.open(pdf) as doc:
+        assert line in doc.pages[0].extract_text()
+
+
+def test_unsupported_glyph_refuses_pdf_without_replacing_a_previous_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(pdf_builder, "_fallback_fonts", lambda: [])
+    path = tmp_path / "u.pdf"
+    path.write_bytes(b"previous")
+    with pytest.raises(ValueError, match="U\\+16B1"):
+        pdf_builder.create_pdf([ChapterContent(1, "Rune", ["A \u16b1 rune."])], path, "T")
+    assert path.read_bytes() == b"previous"
+
+
+@pytest.mark.parametrize("formats", [("pdf",), ("pdf", "txt"), ("txt", "pdf")])
+def test_unsupported_pdf_keeps_original_txt_and_unfinished_status(tmp_path, monkeypatch, formats):
+    from webnovel_scraper.run_journal import JOURNAL_FILENAME, replay_journal
+    monkeypatch.setattr(pdf_builder, "_fallback_fonts", lambda: [])
+    original = "An unsupported \u16b1 rune in the original story."
+
+    class UnicodeSite(Site):
+        def fetch_chapter(self, meta, spec, **kw):
+            return ChapterContent(meta.index, "Rune", [original])
+
+    job = ScrapeJob(novel_slug="shadow-slave", adapter_key="freewebnovel", start=1, end=1,
+                    delay=0, output_mode=OutputMode.SEPARATE, formats=formats,
+                    output_dir=tmp_path / "out", allocate_run=True, use_cache=False)
+    report = pipeline.run_scrape(job, adapter=UnicodeSite(1), log=lambda m: None,
+                                 sleep_fn=lambda s: None)
+    assert report.failed == [1] and any("U+16B1" in w for w in report.warnings)
+    assert not list(report.output_dir.glob("PDF/*.pdf"))
+    assert original in next(report.output_dir.glob("TXT/*.txt")).read_text(encoding="utf-8")
+    replay = replay_journal(report.output_dir / JOURNAL_FILENAME)
+    assert replay.last_end == "complete_with_problems"
+    assert ("chapter-00001", "txt") in replay.publishes
+
+
 def test_each_chapter_starts_a_page_and_headings_are_styled_as_headings(tmp_path):
     pdf = pdf_builder.create_pdf(CHAPTERS, tmp_path / "out.pdf", title="Test")
     with pdfplumber.open(str(pdf)) as doc:

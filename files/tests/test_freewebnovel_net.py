@@ -121,6 +121,28 @@ def test_a_full_discovery_reads_every_list_page_fresh_and_confirms_the_tail():
     assert all(use_cache is False for _u, use_cache in rm.fetched)              # never a cached list
 
 
+@pytest.mark.parametrize("destination", [
+    "http://127.0.0.1:8765/private", "https://example.org/list",
+    "https://freewebnovel.net/ajax-chapter-list", "/other-novel.html?page=2",
+    f"{NOVEL_PATH}.html?page=3", f"{NOVEL_PATH}.html?page=2&redirect=private",
+    f"https://user@freewebnovel.net{NOVEL_PATH}.html?page=2",
+    f"https://freewebnovel.net:8443{NOVEL_PATH}.html?page=2",
+    f"{NOVEL_PATH}.html?page=2#fragment",
+])
+def test_pagination_refuses_untrusted_selector_urls_before_fetch(destination):
+    rm, a = adapter(60)
+    original_fetch = rm.fetch
+
+    def fetch(url, **kw):
+        page = original_fetch(url, **kw)
+        return page.replace(f'{NOVEL_PATH}.html?page=2', destination)
+
+    rm.fetch = fetch
+    with pytest.raises(ValueError, match="pagination"):
+        a.build_chapter_index(NET)
+    assert rm.fetched == [(NET.url, False)]
+
+
 def test_a_bounded_window_reads_only_the_pages_around_it():
     rm, a = adapter(232)                                                        # 6 pages
     metas = a.build_chapter_index(NET, start_hint=85, end_hint=90)

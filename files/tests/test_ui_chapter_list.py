@@ -47,7 +47,12 @@ def test_the_refresh_box_is_in_advanced_settings_off_and_explained() -> None:
         assert win._refresh_var.get() is False
         assert win._refresh_check.winfo_toplevel() is win._advanced
         assert "Refresh chapter list" in win._refresh_check.cget("text")
-        assert ".bak" in app.REFRESH_HINT and "next run only" in app.REFRESH_HINT
+        # Tail updates retain the verified prefix rather than promising a full-list .bak.
+        assert "use verified saved chapters" in app.REFRESH_HINT
+        assert "newer chapters are not checked" in app.REFRESH_HINT
+        assert "check the live source for updates" in app.REFRESH_HINT
+        assert "verified prefix" in app.REFRESH_HINT and "full revalidation" in app.REFRESH_HINT
+        assert "next run only" in app.REFRESH_HINT.lower()
     finally:
         win.destroy()
 

@@ -138,7 +138,7 @@ def test_certified_cancel_resume_and_complete_skip(tmp_path, store, mode, format
     assert first.cancelled
     second_site = Site(4)
     second = resume(store, first.output_dir, second_site, end=4, mode=mode, formats=formats)
-    assert second_site.fetched == ([3, 4] if mode is OutputMode.SEPARATE else [1, 2, 3, 4])
+    assert second_site.fetched == [3, 4]
     assert second.accounting["requested_success"] == 4
     third_site = Site(4)
     third = resume(store, first.output_dir, third_site, end=4, mode=mode, formats=formats)
@@ -152,7 +152,11 @@ def test_certified_cancel_resume_and_complete_skip(tmp_path, store, mode, format
 
 
 @pytest.mark.parametrize("mode", [OutputMode.CHUNKED, OutputMode.SINGLE])
-def test_changed_content_preserves_partial_publications_and_refuses_next_resume(tmp_path, store, mode):
+def test_changed_content_preserves_partial_publications_and_refuses_next_resume(tmp_path, store, mode, monkeypatch):
+    # Historical semantic runs without durable bodies still re-fetch, and must
+    # retain their original conflict guard rather than accepting changed text.
+    from webnovel_scraper import run_output
+    monkeypatch.setattr(run_output, "save_body", lambda *_: None)
     first = new_run(tmp_path, store, Site(4, fail={2}), end=4, mode=mode, formats=("txt", "pdf"))
     replay = replay_journal(first.output_dir / JOURNAL_FILENAME)
     before = {r["path"]: (first.output_dir / r["path"]).read_bytes() for r in replay.publishes.values()}
@@ -180,7 +184,7 @@ def test_partial_groups_reuse_only_same_accepted_bodies(tmp_path, store, mode):
     assert any(r["missing"] for r in replay.publishes.values())
     site = Site(4)
     second = resume(store, first.output_dir, site, end=4, mode=mode, formats=("txt",))
-    assert site.fetched == ([1, 2] if mode is OutputMode.CHUNKED else [1, 2, 3, 4])
+    assert site.fetched == [2]
     assert second.accounting["requested_success"] == 4
     assert all(not r["missing"] for r in replay_journal(first.output_dir / JOURNAL_FILENAME).publishes.values())
 
@@ -195,7 +199,7 @@ def test_missing_or_modified_certified_output_is_recovered_without_false_skip(tm
         path.write_bytes(b"Edited synthetic output")
     site = Site(2)
     resume(store, first.output_dir, site, end=2, formats=("txt",))
-    assert site.fetched == [1]
+    assert site.fetched == []
     assert b"Body paragraph of chapter 1" in path.read_bytes()
 
 
@@ -332,7 +336,7 @@ def test_fallback_remains_txt_and_resume_still_requires_pdf(tmp_path, store, mon
     assert publication["certificate"]
     site = GlyphSite(1)
     second = resume(store, first.output_dir, site, end=1)
-    assert site.fetched == [1] and second.accounting["requested_success"] == 0
+    assert site.fetched == [] and second.accounting["requested_success"] == 0
     assert second.accounting["requested_failure"] == second.accounting["fallback_preserved"] == 1
 
 

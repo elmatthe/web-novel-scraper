@@ -107,7 +107,36 @@ def _locked(p):
     if saved and not p.refresh and p.end is not None and saved.covers(p.start, p.end):
         return _select(p, saved, discovered=False)
 
-    if p.refresh and saved:
+    if (saved and not p.refresh and p.list_mode == "saved"
+            and not saved.verification.complete_for(p.source)):
+        raise ChapterListRefused(
+            "The saved Supreme Magus chapter list has an incomplete tail refresh. "
+            "Enable Refresh chapter list to finish validating pending/new slugs; "
+            "fast saved-list mode cannot claim complete coverage from partial observations.")
+
+    if (saved and not p.refresh and p.list_mode == "saved"
+            and saved.verification.complete_for(p.source)):
+        effective = EffectiveManifest(p.source, saved.chapters, (), saved.spans, False)
+        saved_end = p._saved_list_suffices(effective)
+        if saved_end is not None:
+            # Validate the observation policy and conflicts before accepting a
+            # historical range; never turn this choice into live-tail evidence.
+            requested_end = p.end
+            try:
+                p.end = saved_end if requested_end is None else min(requested_end, saved_end)
+                selection = _select(p, saved, discovered=False)
+            finally:
+                p.end = requested_end
+            note = (f"Loaded saved chapter list through {saved_end}; newer chapters were not checked "
+                    "because Refresh chapter list is off. Enable it to check for updates.")
+            p.log("WARNING: " + note)
+            selection.range_notes.append(note)
+            selection.saved_only = True
+            return selection
+
+    full_refresh = p.refresh and saved and (p.list_mode != "update" or
+        any(page.status == "conflict" for page in saved.verification.pages))
+    if full_refresh:
         # Backup copying and invalidation use the same per-source writer lock. No restore
         # path runs for this policy, even on cancellation or an exception during discovery.
         backup = p.store.refresh_runtime(p.source)
@@ -123,6 +152,8 @@ def _locked(p):
                          verified_manifest=saved,
                          recheck_tail=bool(saved and saved.verification.complete_for(p.source)))
     if seeds.recheck_tail:
+        p.log("Chapter identity revalidation: checking the last 64 source slugs and new slugs; "
+              "previously verified prefix identities are retained.")
         # Persist invalidation BEFORE any network read. If publication of a later conflict
         # fails, a subsequent process still cannot select the obsolete tail as verified.
         verification = saved.verification

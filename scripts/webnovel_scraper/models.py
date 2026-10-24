@@ -254,6 +254,9 @@ class ScrapeJob:
     # baseline) and rediscover it for this run. Never set silently; the GUI clears it
     # after every run.
     refresh_chapter_list: bool = False
+    # GUI explicitly chooses saved/update. "auto" retains discovery behavior for
+    # existing developer callers that have not selected a list policy.
+    chapter_list_mode: str = "auto"
     # ── 0.3.0 03.2b ──────────────────────────────────────────────────────────
     # One-shot, explicit: fetch every selected chapter page from the site again instead of
     # serving it from the HTML cache; the fresh valid pages replace the cached ones.
@@ -271,6 +274,8 @@ class ScrapeJob:
 
     def __post_init__(self) -> None:
         formats = tuple(self.formats)
+        if self.chapter_list_mode not in {"auto", "saved", "update"}:
+            raise ValueError("chapter_list_mode must be auto, saved or update.")
         if not formats or any(f not in ("pdf", "txt") for f in formats) or len(set(formats)) != len(formats):
             raise ValueError(f"formats must be one or both of 'pdf' and 'txt' (got {self.formats!r}).")
         self.formats = formats

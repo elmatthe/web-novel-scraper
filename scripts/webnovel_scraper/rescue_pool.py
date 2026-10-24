@@ -60,6 +60,7 @@ Standard library only for the concurrency/queueing.
 """
 
 from __future__ import annotations
+from contextlib import nullcontext
 
 import queue
 import threading
@@ -207,6 +208,7 @@ class RescuePool:
         cancel_event: Optional[threading.Event] = None,
         cache_root: object = None,
         use_cache: bool = False,
+        performance=None,
         site_key: Optional[str] = None,
         request_timeout: float = 30.0,
         log: Optional[Callable[[str], None]] = None,
@@ -238,6 +240,7 @@ class RescuePool:
         self._cancel_event = cancel_event if cancel_event is not None else threading.Event()
         self._cache_root = cache_root
         self._use_cache = use_cache
+        self._performance = performance
         self._site_key = site_key
         self._request_timeout = float(request_timeout)
         self._log: Callable[[str], None] = log or (lambda _m: None)
@@ -610,6 +613,7 @@ class RescuePool:
             http_timeout=self._request_timeout,
             sleep_fn=self._sleep,
             site_key=self._site_key,
+            performance=self._performance,
         )
         # Share the run-wide cancel signal (the manager makes its own by default).
         manager.cancel_event = self._cancel_event
@@ -638,8 +642,9 @@ class RescuePool:
         manager._browser_nav_timeout_ms = int(max(0.0, budget) * 1000)
         manager._cloudflare_timeout = max(0.0, budget)
         strategy = _MODE_STRATEGY[mode][bool(fresh)]
-        html = manager._fetch_uncached_strategy(meta.url, strategy)
-        content = adapter._extract_chapter(html, meta)
+        with self._performance.measure("fetching_seconds") if self._performance else nullcontext():
+            html = manager._fetch_uncached_strategy(meta.url, strategy)
+            content = adapter._extract_chapter(html, meta)
         # Only a page that extracted as the expected chapter is kept (v0.3.0 03.2b), so the
         # next run needs no rescue for it.
         cache = getattr(manager, "cache", None)

@@ -44,6 +44,7 @@ from webnovel_scraper.models import OutputMode  # noqa: E402
 from webnovel_scraper.run_accounting import page_accounting  # noqa: E402
 from webnovel_scraper.run_journal import (  # noqa: E402
     JOURNAL_FILENAME, LOCK_FILENAME, SELECTION_FILENAME, file_sha256, load_selection, replay_journal,
+    source_list_gaps,
 )
 from webnovel_scraper.run_output import FORMAT_DIRS, plan_groups  # noqa: E402
 from webnovel_scraper.run_storage import RESERVATION_FILENAME  # noqa: E402
@@ -92,10 +93,11 @@ def _unrecorded_files(run_dir: Path, recorded: set[str], labels: list[str], held
     ``recorded`` holds the journal's relative paths, case-folded. Read-only: it lists and hashes."""
     found: list[tuple[str, str | None]] = []            # (relative path, format of its folder)
     folders = {name.casefold(): fmt for fmt, name in FORMAT_DIRS.items()}
+    folders["chapter-bodies"] = None
     for entry in sorted(run_dir.iterdir(), key=lambda e: e.name):
-        if entry.name.casefold() in folders and entry.is_dir() and not entry.is_symlink():
+        if entry.name.casefold() in folders and entry.is_dir() and not (entry.is_symlink() or entry.is_junction()):
             for base, dirs, names in os.walk(entry):
-                dirs[:] = [d for d in dirs if not (Path(base) / d).is_symlink()]
+                dirs[:] = [d for d in dirs if not ((Path(base) / d).is_symlink() or (Path(base) / d).is_junction())]
                 for name in sorted(names):
                     found.append((Path(base, name).relative_to(run_dir).as_posix(), folders[entry.name.casefold()]))
         elif entry.name not in _RUN_FILES:
@@ -128,6 +130,9 @@ def audit(run_dir: Path, *, pdf_text: bool = False) -> dict:
     from webnovel_scraper.run_journal import JournalError
     try:
         validate_admission(replay)
+        from webnovel_scraper.chapter_bodies import load_body
+        for record in replay.contents.values():
+            load_body(run_dir, record)
         semantic_reason = "Current application provenance; byte integrity is checked separately. External story correctness is not authenticated."
         semantic_eligible = True
     except JournalError as exc:
@@ -136,6 +141,10 @@ def audit(run_dir: Path, *, pdf_text: bool = False) -> dict:
     labels = [c.label.text for c in chapters]
     values = [c.label.value for c in chapters]
     problems: list[str] = []
+    gaps = source_list_gaps(header, chapters)
+    if gaps:
+        problems.append("source chapter list skips requested chapter number(s): " +
+                        ", ".join(str(n) for n in gaps[:20]))
 
     # ── the selection ─────────────────────────────────────────────────────
     out_of_order = [labels[i] for i in range(1, len(values)) if values[i] < values[i - 1]]
@@ -198,6 +207,8 @@ def audit(run_dir: Path, *, pdf_text: bool = False) -> dict:
 
     # ── files the run did not publish ────────────────────────────────────
     recorded = {record["path"].casefold() for record in replay.publishes.values()}
+    recorded.update(record["body_artifact"]["path"].casefold()
+                    for record in replay.contents.values() if record.get("body_artifact"))
     unrecorded = _unrecorded_files(run_dir, recorded, labels, held)
     if unrecorded:
         duplicates = sum(1 for row in unrecorded if row.get("recorded_file_for_that_chapter"))
@@ -255,6 +266,7 @@ def audit(run_dir: Path, *, pdf_text: bool = False) -> dict:
         "last": labels[-1] if labels else None,
         "numbers_on_more_than_one_page": repeated,
         "whole_numbers_missing_from_the_selection": missing_numbers,
+        "source_list_gaps": gaps,
         "chapter_counts": dict(counts),
         "files": files,
         "unrecorded_files": unrecorded,

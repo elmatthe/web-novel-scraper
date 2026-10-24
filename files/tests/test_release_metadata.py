@@ -1,8 +1,7 @@
 """Release-metadata checks (offline, no imports of the package).
 
-0.3.0 is the unreleased Windows release candidate at the top of CHANGELOG.md; it is stamped with
-a date only when the owner accepts and releases it. Briefing.md still records the latest released
-version, so the release guard checks that 0.2.0 remains stamped and dated below it, and that the
+0.3.0 is the current Windows implementation; GitHub publication remains deferred. The release
+guard checks that the historical 0.2.0 release remains stamped and dated below it, and that the
 package version and every module that stamps it into saved files say 0.3.0.
 """
 
@@ -65,14 +64,12 @@ def test_the_package_and_every_saved_file_stamp_the_changelog_version() -> None:
         assert _assigned(package / module, "APP_VERSION") == version, module
 
 
-def test_briefing_current_version_is_0_2_0() -> None:
-    assert _briefing_current_version() == "0.2.0"
+def test_briefing_current_version_is_0_3_0() -> None:
+    assert _briefing_current_version() == "0.3.0"
 
 
-def test_changelog_released_version_and_briefing_agree() -> None:
-    released = _briefing_current_version()
-    assert released == "0.2.0"
-    assert _changelog_heading(released)
+def test_changelog_current_version_and_briefing_agree() -> None:
+    assert _briefing_current_version() == _top_changelog_version()
 
 
 def test_0_2_0_is_released_and_dated() -> None:

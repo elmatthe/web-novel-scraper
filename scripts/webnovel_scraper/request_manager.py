@@ -627,12 +627,14 @@ class RequestManager:
         host_limiter: Optional[HostRateLimiter] = None,
         site_key: Optional[str] = None,
         refresh_cache: bool = False,
+        performance=None,
     ) -> None:
         self.slug = slug
         self.use_cache = use_cache
         self.headless = headless
         self.try_http_first = try_http_first
         self.refresh_cache = bool(refresh_cache)
+        self.performance = performance
         self._log: Callable[[str], None] = log_fn or logger.info
         self.cache_root = Path(cache_root) if cache_root is not None else DEFAULT_CACHE_ROOT
         # The pre-0.3.0 cache folder (``files/cache/<slug>/``): only ever read, as a source of
@@ -794,9 +796,22 @@ class RequestManager:
             return
         self.cache.store(url, html, strategy=strategy, final_url=self._last_final_url)
 
+    def retain_validated_html(self, url: str, html: str) -> None:
+        """Retain the just-observed discovery response after adapter validation.
+
+        Called synchronously before another fetch; the transport's original final
+        URL and strategy remain authoritative. Discovery still bypasses cache reads.
+        """
+        info = self.last_fetch_info
+        if info is not None and not info.from_cache and info.classification == "success":
+            self._write_cache(url, html, info.strategy or "unknown")
+
     def invalidate_cache(self, url: str, reason: str) -> bool:
         """Stop serving ``url``'s cached page (an adapter found it unusable). The bytes are kept
         aside for diagnosis; the next fetch goes to the network."""
+        if self.performance is not None and getattr(self.last_fetch_info, "from_cache", False):
+            self.performance.count("cache_hits", -1)
+            self._log(f"  Chapter HTML cache rejected by extraction: {url}: {reason}")
         return self.cache.invalidate(url, reason)
 
     # ── HTTP path ────────────────────────────────────────────────────────────
@@ -826,6 +841,10 @@ class RequestManager:
         """
         if self.host_limiter is not None:
             self.host_limiter.acquire(url, cancel_event=self.cancel_event)
+        if self.performance is not None:
+            self.performance.count("website_requests")
+        kind = "network chapter" if re.search(r"/chapter-|/story/[0-9]+/[0-9]+", url) else "website"
+        self._log(f"  Actual {kind} request: {url}")
 
     def _get_text(self, session: Any, url: str) -> str:
         """One HTTP GET, classified BODY-FIRST (§3.3).
@@ -1020,8 +1039,14 @@ class RequestManager:
         if use_cache:
             cached = self._read_cache(url)
             if cached is not None:
+                if self.performance is not None:
+                    self.performance.count("cache_hits")
+                self._log(f"  Chapter HTML cache HIT: {url}")
                 self.last_fetch_info = FetchInfo(from_cache=True, classification="cache")
                 return cached
+            if self.performance is not None:
+                self.performance.count("cache_misses")
+            self._log(f"  Chapter HTML cache MISS: {url}" + (" (explicit refresh)" if self.refresh_cache else ""))
 
         max_attempts = max(1, int(max_retries) + 1)
         last_exc: Optional[Exception] = None

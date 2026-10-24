@@ -95,6 +95,7 @@ class Selection:
     toc_gaps: list = field(default_factory=list)       # whole numbers the site's list skipped
     absent: list = field(default_factory=list)         # (label, evidence): source-confirmed absent
     discovered: bool = False                           # the adapter was asked this run
+    saved_only: bool = False                           # historical limit, not a live maximum
     empty_index: bool = False                          # the adapter returned nothing at all
     range_notes: list = field(default_factory=list)    # human lines: how the range was adjusted
 
@@ -193,11 +194,13 @@ class _Preflight:
         log: LogFn,
         legacy_index: Optional[Path],
         refresh: bool,
+        list_mode: str,
         cancel_event: object,
     ) -> None:
         self.source, self.start, self.end = source, start, end
         self.store, self.discover, self.log = store, discover, log
         self.legacy_index, self.refresh, self.cancel_event = legacy_index, refresh, cancel_event
+        self.list_mode = list_mode
         self.writable = False
         self.backup: Optional[Path] = None
         self.originals: dict[str, ChapterMeta] = {}
@@ -457,9 +460,18 @@ class _Preflight:
             effective = self._import_legacy(effective)
 
         window = self._window(effective)
+        if window is not None and self.list_mode == "saved" and not self.refresh:
+            saved_end = self._saved_list_suffices(effective)
+            if saved_end is not None:
+                return self._select_saved(effective, saved_end, "Refresh chapter list is off")
+            if effective.chapters:
+                raise ChapterListRefused(
+                    "The saved chapter list does not verify this whole range. Choose a covered "
+                    "range or enable Refresh chapter list to validate the missing coverage; "
+                    "fast saved-list mode has made no website requests.")
         examined: Optional[tuple[int, int]] = None
         if window is not None:
-            saved_end = self._saved_list_suffices(effective)
+            saved_end = self._saved_list_suffices(effective) if self.end is None else None
             if not self.writable:
                 if saved_end is not None:
                     return self._select_saved(
@@ -483,10 +495,7 @@ class _Preflight:
         return self._select(effective, examined, discovered=window is not None)
 
     def _saved_list_suffices(self, effective: EffectiveManifest) -> Optional[int]:
-        """For an open-ended request, the last saved chapter when the saved list already covers
-        everything from Start to it (the network would only look for NEWER chapters); else None."""
-        if self.end is not None:
-            return None
+        """The saved upper bound when Start through that bound has verified coverage."""
         wholes = [n for n in (whole_number(c.label) for c in effective.chapters) if n is not None]
         known_hi = max(wholes, default=None)
         if known_hi is None or self.start > known_hi or effective.uncovered_spans(self.start, known_hi):
@@ -497,14 +506,20 @@ class _Preflight:
         """Cache-only operation (v0.3.0 06): use the saved list as it is, say so prominently, and
         never take the failure as evidence of where the novel ends."""
         self.log(
-            f"WARNING: newer chapters could not be looked for because {why}. This run uses the saved "
-            f"chapter list, which ends at chapter {saved_end}; chapters published since are not included."
+            f"WARNING: Loaded saved chapter list through chapter {saved_end}; newer chapters were not "
+            f"checked because {why}. Enable Refresh chapter list to look for updates."
         )
-        selection = self._select(effective, None, discovered=True)
+        requested_end = self.end
+        try:
+            self.end = saved_end if requested_end is None else min(requested_end, saved_end)
+            selection = self._select(effective, None, discovered=False)
+        finally:
+            self.end = requested_end
         selection.range_notes.append(
             f"the site was not checked for chapters after {saved_end} ({why.split(' (')[0]}); the saved "
             "chapter list was used"
         )
+        selection.saved_only = True
         return selection
 
     def _select(
@@ -656,6 +671,7 @@ def resolve_chapters(
     log: LogFn,
     legacy_index: Optional[Path] = None,
     refresh: bool = False,
+    list_mode: str = "auto",
     cancel_event: object = None,
 ) -> Selection:
     """Decide the chapters of one run from the validated, source-specific manifest.
@@ -666,6 +682,8 @@ def resolve_chapters(
     satisfied from verified data, and ``ScrapeCancelled`` (from ``discover`` or between steps)
     when the run is stopped; evidence already persisted is kept either way.
     """
+    if list_mode not in {"auto", "saved", "update"}:
+        raise ValueError(f"Unknown chapter list mode: {list_mode}")
     try:
         source = SourceIdentity.from_site_spec(spec)
     except SourceIdentityError as exc:
@@ -675,5 +693,5 @@ def resolve_chapters(
         ) from exc
     return _Preflight(
         source, start=start, end=end, store=store, discover=discover, log=log,
-        legacy_index=legacy_index, refresh=refresh, cancel_event=cancel_event,
+        legacy_index=legacy_index, refresh=refresh, list_mode=list_mode, cancel_event=cancel_event,
     ).execute()

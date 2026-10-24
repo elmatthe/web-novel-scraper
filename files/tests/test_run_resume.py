@@ -278,8 +278,10 @@ def test_a_stopped_run_resumes_only_what_is_missing(tmp_path, store, mode):
     assert first.cancelled
     folder = first.output_dir
     before = set(pdfs(folder))
-    if mode is not OutputMode.SEPARATE:
-        assert before == set()                                  # Stop builds no grouped file (06)
+    if mode is OutputMode.SINGLE:
+        assert before == set()  # Stop does not build an incomplete whole-range file
+    elif mode is OutputMode.CHUNKED:
+        assert before == {"Shadow_Slave_Chapters_1-2.pdf"}
 
     second_site = Site(6)
     logs: list[str] = []
@@ -288,9 +290,8 @@ def test_a_stopped_run_resumes_only_what_is_missing(tmp_path, store, mode):
     expected = {OutputMode.SEPARATE: 6, OutputMode.CHUNKED: 3, OutputMode.SINGLE: 1}[mode]
     assert len(pdfs(folder)) == expected
     assert before <= set(pdfs(folder))                          # nothing earlier was lost
-    # pages already safely in a finished file were not fetched again
-    saved_first = {OutputMode.SEPARATE: {1, 2, 3, 4}, OutputMode.CHUNKED: set(),
-                   OutputMode.SINGLE: set()}[mode]
+    # Published pages and verified durable bodies both avoid another fetch.
+    saved_first = {1, 2, 3, 4}
     assert set(second_site.fetched) == set(range(1, 7)) - saved_first
     assert replay_journal(folder / JOURNAL_FILENAME).last_end == "complete"
 
@@ -312,7 +313,7 @@ def test_a_failed_page_inside_a_group_is_added_by_a_later_resume(tmp_path, store
     assert replay.last_end == "complete_with_problems"
     site = Site(4)
     resume(store, folder, site, mode=OutputMode.CHUNKED)
-    assert site.fetched == [3, 4]                               # only the incomplete group again
+    assert site.fetched == [3]  # chapter 4 is restored from its accepted body
     after = replay_journal(folder / JOURNAL_FILENAME)
     assert after.publishes[("chunk-00002", "pdf")]["missing"] == []
     assert pdfs(folder) == ["Shadow_Slave_Chapters_1-2.pdf", "Shadow_Slave_Chapters_3-4.pdf"]
@@ -337,7 +338,7 @@ def test_a_crash_after_writing_a_file_but_before_recording_it_re_renders_it(tmp_
     assert replay_journal(folder / JOURNAL_FILENAME).last_end == "failed"
     site = Site(4)
     resume(store, folder, site, end=4)
-    assert site.fetched == [3, 4]                               # the unverified file is rendered again
+    assert site.fetched == [4]  # chapter 3's unrecorded PDF is rebuilt from its verified body
     assert replay_journal(folder / JOURNAL_FILENAME).last_end == "complete"
 
 
@@ -347,16 +348,84 @@ def test_an_output_edited_after_publication_is_rendered_again(tmp_path, store):
     target.write_bytes(target.read_bytes()[:-50])               # truncated by something else
     site = Site(3)
     resume(store, first.output_dir, site, end=3)
-    assert site.fetched == [2]
+    assert site.fetched == []
+    from pypdf import PdfReader
+    assert "Body paragraph of chapter 2" in PdfReader(target).pages[0].extract_text()
 
 
 def test_orphan_temp_files_are_removed_on_resume(tmp_path, store):
     first = new_run(tmp_path, store, Site(2), end=2)
-    orphan = first.output_dir / "PDF" / "Chapter 2_ Title 2.pdf.abc123.part"
+    orphan = first.output_dir / "PDF" / ".wns-output-abc12345.part"
     orphan.write_bytes(b"half")
     logs: list[str] = []
     resume(store, first.output_dir, Site(2), logs=logs, end=2)
     assert not orphan.exists() and any("interrupted temporary file" in line for line in logs)
+
+
+def test_resume_keeps_unrelated_temporary_files(tmp_path, store):
+    first = new_run(tmp_path, store, Site(6))
+    sentinel = first.output_dir / "PDF" / "unrelated.tmp"
+    sentinel.write_bytes(b"owner data")
+    resume(store, first.output_dir, Site(6))
+    assert sentinel.read_bytes() == b"owner data"
+
+
+@pytest.mark.parametrize("stop", [False, True])
+def test_source_list_gap_survives_stop_and_resume(tmp_path, store, stop):
+    from webnovel_scraper.run_index import list_runs
+
+    class SparseSite(Site):
+        def build_chapter_index(self, spec, **kw):
+            return [m for m in super().build_chapter_index(spec, **kw) if m.index != 3]
+
+    cancel = threading.Event()
+    site = SparseSite(5, cancel=cancel, stop_at=2 if stop else None)
+    first = run(store, job(tmp_path / "out", end=5, allocate_run=True), site, cancel=cancel)
+    assert first.toc_gaps == [3]
+    again = resume(store, first.output_dir, SparseSite(5), end=5)
+    assert again.toc_gaps == [3]
+    assert replay_journal(first.output_dir / JOURNAL_FILENAME).last_end == "complete_with_problems"
+    assert [r.path for r in list_runs(first.output_dir.parent)] == [first.output_dir]
+
+
+def test_legacy_gap_notes_restore_only_source_confirmed_gaps():
+    from webnovel_scraper.run_journal import source_list_gaps
+    chapters = [c for c in _chapters(5) if c.label.text != "3"]
+    header = _header(chapters, effective=(1, 5), notes=(
+        "1 chapter number(s) inside the range are not on the site's chapter list",))
+    raw = header.to_json()
+    del raw["selection"]["toc_gaps"]
+    assert source_list_gaps(RunHeader.from_json(raw), chapters) == [3]
+    assert source_list_gaps(replace(header, notes=()), chapters) == []
+    assert source_list_gaps(replace(header, toc_gaps=()), chapters) == []
+
+
+@pytest.mark.parametrize("fmt", ["PDF", "TXT"])
+def test_format_junction_is_refused_without_read_write_or_cleanup(tmp_path, store, fmt):
+    import os
+    import subprocess
+    from webnovel_scraper.run_output import remove_orphan_temps
+
+    first = new_run(tmp_path, store, Site(6))
+    outside = tmp_path / "outside-run"
+    outside.mkdir()
+    sentinel = outside / ".wns-output-abc12345.part"
+    sentinel.write_bytes(b"owner data")
+    directory = first.output_dir / fmt
+    if directory.exists():
+        # Move only this test's synthetic outputs, keeping the destination empty for the link.
+        directory.rename(first.output_dir / (fmt + "-original"))
+    if os.name == "nt":
+        subprocess.run(["cmd", "/c", "mklink", "/J", str(directory), str(outside)], check=True,
+                       capture_output=True)
+    else:
+        directory.symlink_to(outside, target_is_directory=True)
+    with pytest.raises(RunStorageError, match="[Ll]ink|[Rr]eparse"):
+        remove_orphan_temps(first.output_dir)
+    with pytest.raises(RunStorageError, match="[Ll]ink|[Rr]eparse"):
+        resume(store, first.output_dir, Site(6))
+    assert list(outside.iterdir()) == [sentinel]
+    assert sentinel.read_bytes() == b"owner data"
 
 
 # ── resume refusals ───────────────────────────────────────────────────────────

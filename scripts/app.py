@@ -160,8 +160,9 @@ HEADLESS_HINT = (
 # box clears itself after every run, so a refresh is never silent or repeated.
 REFRESH_LABEL = "Refresh chapter list on the next run"
 REFRESH_HINT = (
-    "Rebuilds the saved chapter list from the site. The current saved list is kept as a "
-    ".bak backup file. Applies to the next run only."
+    "Off: use verified saved chapters; newer chapters are not checked. On: check the live "
+    "source for updates. Supreme Magus retains its verified prefix and validates the tail "
+    "and new slugs; conflicting identities require full revalidation. Next run only."
 )
 # HTML cache (v0.3.0 03.2b): chapter pages are saved with a checksum and reused until they are
 # found unusable. This one-shot box asks the next run to fetch every selected chapter page from
@@ -1305,6 +1306,7 @@ class ScraperApp(tk.Tk):
             headless=bool(self._headless_var.get()),
             request_timeout=timeout,
             refresh_chapter_list=bool(self._refresh_var.get()),
+            chapter_list_mode="update" if self._refresh_var.get() else "saved",
             refresh_html_cache=bool(self._refetch_var.get()) and bool(self._cache_var.get()),
         )
         # One-shot: the request now travels on the job, so clear the boxes. A refresh is never

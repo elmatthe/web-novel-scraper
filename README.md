@@ -1,5 +1,7 @@
 # Web Novel Scraper
 
+**Version 0.3.0 · Windows 10/11.**
+
 A simple desktop app for Windows that downloads web-novel chapters from supported
 websites and saves them as clean, print-ready **PDF** and/or plain **TXT** files.
 Pick a website and a novel, choose a chapter range and how the chapters are grouped
@@ -39,14 +41,18 @@ terminal.
 3. The first time, the setup window gets everything ready. If no suitable Python
    (3.12 or 3.13) is on your PC, it asks first and then installs Python 3.12 for
    your account only (no admin needed; the official installer is checked before it
-   runs). Everything else (the program's packages and its browser engines) is
-   installed **inside the project folder**.
+   runs). Packages and Chromium are installed **inside the project folder**.
+   Camoufox also uses its normal per-user browser cache.
 4. When setup finishes, the app window opens. Every time after that, the same
    double-click checks that nothing is missing, repairs anything that is, and opens
    the app.
 
 If the program ever stops starting, delete the **`.venv`** folder inside the
 project folder and double-click the setup file again; it rebuilds everything.
+
+The `.venv` and `files` folders are created automatically. A fresh download needs
+only the Windows setup file and `scripts/`; no saved settings, caches, test files
+or previous downloads are needed. Internet access is required for first-time setup.
 
 Keep the project folder somewhere short and writable, such as Downloads or the
 Desktop: Windows cannot load the program from a folder path longer than about 140
@@ -83,7 +89,10 @@ may warn you the **first** time you run it ("Windows protected your PC"). Click
 - Click **Start**. Use **Stop** to stop cleanly at any time; files already finished
   are kept.
 - **Resume Existing Run** continues a stopped or unfinished run in its own folder. The
-  files that are already saved are checked and kept, and only what is missing is done.
+  files and saved chapter bodies are checked and reused, and only missing chapters
+  need fetching. Missing or damaged output files can be rebuilt from verified saved
+  bodies even when the HTML cache is off. Completed chunks are saved during downloading.
+  Warnings about gaps in the website's chapter list remain visible after Resume.
 
 The app does not give up on a chapter easily: each chapter is retried through
 escalating methods, and after the main pass it makes a **second pass** over any
@@ -105,8 +114,22 @@ You normally won't need these:
 - **Use HTML cache** and **Re-download saved chapter pages on the next run**: chapter
   pages are saved and reused, so a repeat run is much faster. The re-download box
   fetches them fresh once.
-- **Refresh chapter list on the next run**: rebuilds the saved chapter list from the
-  website once (the old list is kept as a backup).
+- **Refresh chapter list on the next run**: checks the live source for updates once.
+  Supreme Magus retains its verified prefix and checks the last 64 source slugs
+  and new slugs; conflicting identities require full revalidation. A full refresh
+  keeps the previous list as a backup. An interrupted update cannot certify an
+  unfinished tail.
+
+For repeat runs, leave **Use HTML cache on**, **Re-download saved chapter pages
+off**, and **Refresh chapter list off**. Verified saved chapter lists need no
+website request. A saved upper bound is historical: the Activity panel warns
+that newer chapters were not checked. Incomplete saved coverage requires a
+refresh or a covered range. Missing or rejected HTML still needs fetching;
+cache reuse is not an offline-only mode. Cache hits bypass website pacing.
+Chapter lists and HTML are kept separately for each source and novel. HTML
+checksums, provenance and chapter identity are checked before reuse; rejected
+pages are retained for diagnosis. The Activity panel reports cache hits/misses,
+website requests, saved-body reuse and time spent fetching and rendering.
 
 ### Browser windows
 
@@ -134,6 +157,60 @@ C:\Users\<you>\Downloads\Web-Novel-Scraper-Outputs\lord-of-the-mysteries-1\
 Click **Browse…** to choose a different parent folder. Each run folder also holds a
 small run record (`run-journal.jsonl`, `run-audit.json`) that lets **Resume** pick up
 exactly where a run stopped and lists every chapter that was saved or missed.
+Keep the run's records and saved chapter bodies together so Resume can verify them.
+
+PDFs use the fonts installed on Windows. If a character cannot be represented,
+the app reports its Unicode number, keeps the complete original text in a TXT file
+(even when only PDF was selected), and marks the PDF unfinished. Linked PDF/TXT
+folders are refused; choose a normal output folder.
+
+### Source-content warnings
+
+Missing titles, repeated bodies and gaps in a site's chapter list are reported;
+the app preserves accepted source text instead of inventing or editing chapters.
+Supreme Magus has fractional chapter labels, unnumbered extras, repeated source
+bodies and untitled pages. URL chapter slugs can differ from displayed numbers.
+Lord of Mysteries 2 on .com has confirmed two-number headings around chapters
+1130–1138. Some .net entries lack titles or have misspelt URLs. These cases have
+regression coverage. Renaming a published file makes its recorded path invalid;
+keep original filenames and journals together for Resume and auditing.
+
+## Development and regression testing
+
+Run the complete offline gate from the repository root using the existing
+environment:
+
+```powershell
+.venv/Scripts/python.exe -B scripts/verify.py
+```
+
+It runs `files/tests/`, checks exact dependency pins and checks permanent docs.
+For a focused test, use `python -B -m pytest files/tests/<test_file>.py -q` with
+that environment. Tests isolate preferences, manifests and outputs; fixtures
+live in `files/test-files/`. Real adapter/GUI tests cover all nine enabled
+novel/site choices, publication grouping, cache reuse and Stop/Resume.
+`files/tests/windows_clean_install_smoke.py` is a separate, explicit acceptance
+utility that installs dependencies and opens a GUI; it is outside the offline gate.
+
+To add a novel on an existing site, add a `SiteSpec` in
+`scripts/webnovel_scraper/catalog.py` with its exact index URL and identifiers,
+then add sanitized fixtures and adapter/pipeline regressions. Novel slugs must
+remain stable; website identity also includes the adapter, host and index URL.
+For a new website, implement `BaseAdapter.build_chapter_index` and
+`fetch_chapter` under `scripts/webnovel_scraper/adapters/`, register it in
+`registry.py`, and keep its catalog entries disabled until verified. Use the
+request manager for transport, pacing and caching; validate observed chapter
+identity before returning `ChapterContent`. Keep exact fractional labels and
+URL slugs separate. See [developer guidance](md-instructions/Briefing.md).
+
+Reusable tools in `files/` include `audit_run.py` (read-only publication audit),
+`audit_html_cache.py` (read-only cache/extraction audit), `bypass_eval.py`
+(independent transport diagnostics), and `option_b_runner.py` with
+`full_publication.py` and `offline_pdf_repair.py` (isolated discovery,
+publication and offline repair). See [runner usage](files/option_b_runner.md).
+Live diagnostic modes require an intentional run; the offline test gate never
+downloads novels. Local historical references and acceptance datasets are
+gitignored and are not required to launch the application.
 
 ## Platform
 

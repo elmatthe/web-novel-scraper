@@ -39,9 +39,16 @@ files/test-logs/
 files/cache/
 files/output/
 files/test-output/
+files/run-temp/
+files/temp/
 # GUI preferences and other per-machine runtime state (v0.3.0, plan section 8 C6).
 files/runtime-data/
 files/**/cache/
+
+# Historical audit/repair evidence is local data, not application source.
+# Keep reusable development scripts and tracked fixtures eligible for versioning.
+files/dev-work/*-audit-*.json
+files/dev-work/final-live-triage-*/
 
 # Output PDFs are generated artifacts — do NOT ignore committed test fixtures.
 *.pdf

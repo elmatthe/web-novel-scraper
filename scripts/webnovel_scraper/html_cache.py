@@ -111,19 +111,43 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _same_page(requested: str, final: Optional[str]) -> bool:
+def _same_page(requested: str, final: Optional[str], html: str = "") -> bool:
     """Whether a fetch ended on the page that was asked for (same host and path; a trailing
     slash or fragment does not matter). A redirect elsewhere is never cached under the key."""
     if not final:
         return True
+    if not isinstance(final, str):
+        return False
     try:
         a, b = urlsplit(requested), urlsplit(final)
     except ValueError:
         return False
-    return (
+    same = (
         (a.hostname or "").lower() == (b.hostname or "").lower()
         and a.path.rstrip("/") == b.path.rstrip("/")
     )
+    if same:
+        return True
+    # WebNovel moved dynamic chapter routes to its canonical reader. This is an
+    # exact resource alias, never a general cross-host redirect permission. Bind
+    # both numeric IDs and the page's own chapter payload before retaining bytes.
+    if (a.scheme, a.netloc, b.scheme, b.netloc) != (
+        "https", "dynamic.webnovel.com", "https", "www.webnovel.com"
+    ):
+        return False
+    original = re.fullmatch(r"/story/([0-9]+)/([0-9]+)/?", a.path)
+    target = re.fullmatch(r"/book/([0-9]+)/([0-9]+)/?", b.path)
+    if not original or not target or original.groups() != target.groups() or a.query or b.query:
+        return False
+    # Imported only for this source at read/write time to avoid a module cycle.
+    from .adapters.webnovel_dynamic import parse_g_data_chapter, parse_next_data
+    data = parse_next_data(html) or {}
+    try:
+        info = data["props"]["pageProps"]["data"]["chapterInfo"]
+    except (KeyError, TypeError):
+        info = parse_g_data_chapter(html)
+    return (isinstance(info, dict) and str(info.get("chapterId")) == original[2]
+            and str(info.get("bookId", original[1])) == original[1])
 
 
 def _write_atomic(path: Path, data: bytes) -> None:
@@ -214,6 +238,8 @@ class HtmlCache:
             return "its provenance record is not a cache entry"
         if raw.get("url") != url:
             return "its provenance record belongs to another page"
+        if not isinstance(raw.get("final_url"), str) or not raw["final_url"]:
+            return "its provenance record has no final page URL"
         if raw.get("host") != page_host(url) or (self.site_key and raw.get("host") != self.site_key):
             return "its provenance record belongs to another website"
         if raw.get("novel_slug") != self.novel_slug:
@@ -260,6 +286,8 @@ class HtmlCache:
                 problem = "the saved page is not valid UTF-8"
             else:
                 problem = content_problem(html)
+                if problem is None and not _same_page(url, raw.get("final_url"), html):
+                    problem = "its final URL does not identify the requested page"
         if problem is not None:
             self._report(url, problem)
             return None
@@ -298,7 +326,7 @@ class HtmlCache:
         html_path, sidecar_path = self.html_path(url), self.sidecar_path(url)
         if html_path is None or sidecar_path is None:
             return False
-        if not _same_page(url, final_url):
+        if not _same_page(url, final_url, html):
             self._log(f"  not caching {url}: the site answered from {final_url}.")
             return False
         problem = content_problem(html)

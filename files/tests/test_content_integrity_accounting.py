@@ -240,6 +240,20 @@ def test_stop_before_first_page_records_no_manufactured_failures(tmp_path, path)
 
 
 @pytest.mark.parametrize("path", ["primary", "rescue-primary"])
+def test_interrupted_attempt_is_pending_not_failed_or_not_attempted(tmp_path, path):
+    from webnovel_scraper.request_manager import ScrapeCancelled
+
+    site = Site([1, 2, 3], {2: ScrapeCancelled("stopped before navigation")}, cancel_on_fetch=(2,))
+    report, replay, _logs = run(tmp_path, site, path=path)
+    expected = dict(selected=3, attempted=2, processed=1, requested_success=1,
+                    requested_failure=0, not_attempted=1, pending=1)
+    assert {key: report.accounting[key] for key in expected} == expected
+    assert report.cancelled and replay.last_end == "cancelled"
+    assert replay.failures == []
+    assert set(replay.attempts) == {0, 1} and set(replay.contents) == {0}
+
+
+@pytest.mark.parametrize("path", ["primary", "rescue-primary"])
 def test_stop_after_final_page_keeps_every_published_artifact(tmp_path, path):
     report, replay, _logs = run(tmp_path, Site([1, 2, 3]), path=path, stop_after=3)
     assert report.cancelled and replay.last_end == "cancelled"
@@ -287,6 +301,23 @@ def test_successful_formats_count_pages_once_and_artifacts_separately(tmp_path, 
     assert all(row["state"] == "ok" for row in audit["files"])
     for record in replay.publishes.values():
         assert hashlib.sha256((report.output_dir / record["path"]).read_bytes()).hexdigest() == record["sha256"]
+
+
+def test_moved_publication_is_pending_and_run_ends_with_problems(tmp_path):
+    class MovingSite(Site):
+        def fetch_chapter(self, meta, spec, **kwargs):
+            if meta.slug == 2:
+                path = next((tmp_path / "out").rglob("Chapter 1_*.txt"))
+                path.rename(path.with_name("moved.txt"))
+            return super().fetch_chapter(meta, spec, **kwargs)
+
+    report, replay, logs = run(tmp_path, MovingSite([1, 2]))
+    assert report.accounting["requested_success"] == 1
+    assert report.accounting["requested_failure"] == 0
+    assert report.accounting["pending"] == 1
+    assert replay.last_end == "complete_with_problems"
+    assert replay.ends[-1]["incomplete_groups"] == 1
+    assert any("1 pending" in line for line in logs)
 
 
 @pytest.mark.parametrize("path", ["primary", "rescue-primary", "rescued"])
@@ -423,7 +454,11 @@ def test_stop_with_rescue_queued_keeps_primary_failure_without_inventing_next_pa
 
 
 @pytest.mark.parametrize("old_artifact", ["intact", "missing", "damaged"])
-def test_cancelled_refetch_counts_only_intact_previous_artifacts_and_keeps_fetch_evidence(tmp_path, old_artifact):
+def test_cancelled_refetch_counts_only_intact_previous_artifacts_and_keeps_fetch_evidence(tmp_path, old_artifact, monkeypatch):
+    # Keep the legacy no-body-artifact path covered, including its cancellation
+    # and fetch-error evidence. Current runs reuse their verified saved bodies.
+    from webnovel_scraper import run_output
+    monkeypatch.setattr(run_output, "save_body", lambda *_: None)
     initial, _replay, _logs = run(tmp_path, Site([1, 2, 3], {3: page("Chapter 3: Empty", body="")}),
                                  mode=OutputMode.SINGLE)
     assert len(initial.written) == 1

@@ -501,6 +501,7 @@ class FreeWebNovelAdapter(BaseAdapter):
         # ``use_cache=False`` (v0.3.0 03.2b): the index page is where the newest chapter is
         # learned, so it is always fetched fresh and never cached; a stale copy would hide
         # chapters the site has published since.
+        self._log(f"Fresh index/TOC request: {spec.url}")
         if fast_path:
             html = rm.fetch(spec.url, use_browser=spec.use_browser, use_cache=False, fast_path=True)
         else:
@@ -680,9 +681,10 @@ class FreeWebNovelAdapter(BaseAdapter):
         from ..cloudflare_detection import is_cloudflare_challenge
         url = chapter_url_for(spec, slug)
         number, reference = None, None
+        self._log(f"Chapter identity revalidation: {url}")
         try:
-            # No historical cache generation certifies current identity. No writes
-            # to persistent HTML caches occur through this uncached discovery call.
+            # Historical HTML cannot certify current identity. Fetch fresh, then
+            # retain the original response only after its chapter body validates.
             html = rm.fetch(url, use_browser=spec.use_browser, use_cache=False)
         except NotFoundFetchError as exc:
             evidence = DiscoveryEvidence("inaccessible", "current-response", detail=f"HTTP {exc.status}: URL missing; chapter absence unproven")
@@ -724,6 +726,10 @@ class FreeWebNovelAdapter(BaseAdapter):
                     evidence = DiscoveryEvidence("saved_unknown", "historical-cache", evidence.labels,
                                                  "fetch unexpectedly supplied cached HTML; " + evidence.detail)
                 if evidence.verified:
+                    retain = getattr(rm, "retain_validated_html", None)
+                    if callable(retain):
+                        self._extract_for_source(html, _parsed_meta(spec, slug, number, None), spec)
+                        retain(url, html)
                     spool = getattr(self, "_discovery_spool", None) or self._spool_factory()
                     reference = spool.put(html)
         if not evidence.verified:
@@ -869,7 +875,11 @@ class FreeWebNovelAdapter(BaseAdapter):
             # again, exactly as for a saved page (``extract_validated``).
             try:
                 html = prefetched.read() if isinstance(prefetched, _PageRef) else prefetched
-                return self._extract_chapter(html, meta)
+                content = self._extract_for_source(html, meta, spec)
+                from ..request_manager import FetchInfo
+                rm.last_fetch_info = FetchInfo(from_cache=False, classification="prefetched")
+                self._log(f"  Same-run discovery HTML reuse: {meta.url}")
+                return content
             except EmptyExtractionError as exc:
                 invalidate = getattr(rm, "invalidate_cache", None)
                 if callable(invalidate):
@@ -887,7 +897,22 @@ class FreeWebNovelAdapter(BaseAdapter):
                 return rm.fetch(meta.url, use_browser=spec.use_browser, fast_path=True)
             return rm.fetch(meta.url, use_browser=spec.use_browser)
 
-        return extract_validated(rm, meta, fetch, self._extract_chapter, self._log)
+        return extract_validated(rm, meta, fetch,
+                                 lambda html, chapter: self._extract_for_source(html, chapter, spec), self._log)
+
+    def _extract_for_source(self, html: str, meta: ChapterMeta, spec: SiteSpec) -> ChapterContent:
+        content = self._extract_chapter(html, meta)
+        if requires_verification(SourceIdentity.from_site_spec(spec)):
+            # Match the certified full-publication path: the observed title was
+            # already separated from its heading. Cleaning it again can delete
+            # original words/numbers (2475), and a missing title must stay empty.
+            _number, source_title, _shown = _observed_heading(BeautifulSoup(html, "html.parser"))
+            if meta.title is not None and (source_title or "") != meta.title:
+                raise ChapterMismatchError(
+                    f"Chapter {meta.index}: source title contradicts the verified chapter inventory.",
+                    requested_label=_meta_label(meta), observed_labels=(_meta_label(meta),), page_url=meta.url)
+            content.title = source_title or ""
+        return content
 
     def _extract_chapter(self, html: str, meta: ChapterMeta) -> ChapterContent:
         soup = BeautifulSoup(html, "html.parser")

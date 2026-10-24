@@ -137,18 +137,31 @@ def test_building_is_announced_after_the_last_chapter_and_before_the_pdf(tmp_pat
     run = _Run()
     original = pipeline.pdf_builder.create_pdf
     seen_when_building: list[list] = []
+    adapter = _Adapter(5)
+    fetched_when_building: list[list] = []
 
     def spy(*args, **kwargs):
         seen_when_building.append(list(run.calls))
+        fetched_when_building.append(list(adapter.fetched))
         return original(*args, **kwargs)
 
     monkeypatch.setattr(pipeline.pdf_builder, "create_pdf", spy)
-    run.run(_job(tmp_path, mode), adapter=_Adapter(5))
-    assert run.phases == [("phase", "scraping", 5, 0), ("phase", "building", 5, 0)]
-    first_build = run.calls.index(("phase", "building", 5, 0))
-    assert all(c[0] == "progress" for c in run.calls[1:first_build])
-    assert run.progress_calls[-1] == ("progress", 5, 5) and first_build > len(run.calls) - 3
-    assert seen_when_building and ("phase", "building", 5, 0) in seen_when_building[0]
+    run.run(_job(tmp_path, mode), adapter=adapter)
+    if mode is OutputMode.SINGLE:
+        assert run.phases == [("phase", "scraping", 5, 0), ("phase", "building", 5, 0)]
+        first_build = run.calls.index(("phase", "building", 5, 0))
+        assert all(c[0] == "progress" for c in run.calls[1:first_build])
+        assert first_build > len(run.calls) - 3
+        assert seen_when_building and ("phase", "building", 5, 0) in seen_when_building[0]
+        assert fetched_when_building == [[1, 2, 3, 4, 5]]
+    else:
+        # Complete chunks publish inside acquisition, before the next chapter is fetched.
+        # No final build phase is announced when nothing remains to render.
+        assert run.phases == [("phase", "scraping", 5, 0)]
+        assert fetched_when_building == [[1, 2], [1, 2, 3, 4], [1, 2, 3, 4, 5]]
+        assert [calls[-1] for calls in seen_when_building] == [
+            ("progress", 1, 5), ("progress", 3, 5), ("progress", 4, 5)]
+    assert run.progress_calls[-1] == ("progress", 5, 5)
     view = run.finish()
     assert view.state == rpg.COMPLETE and view.counts == "5 / 5 · 100%"
     assert view.detail == ("3 PDFs" if mode is OutputMode.CHUNKED else "1 PDF")
@@ -223,12 +236,15 @@ def test_chapters_already_present_are_counted_and_reported_as_skipped(tmp_path) 
     made = pipeline.run_scrape(replace(_job(tmp_path), allocate_run=True), adapter=_Adapter(5),
                                log=lambda _m: None)
     for pdf in sorted(made.output_dir.rglob("*.pdf"))[:2]:
-        pdf.unlink()                                   # two chapters will be fetched again
+        pdf.unlink()                                   # two PDFs will be rebuilt from verified bodies
     adapter = _Adapter(5)
     run = _Run().run(replace(_job(made.output_dir), resume=True), adapter=adapter)
-    assert adapter.fetched == [1, 2]
+    assert adapter.fetched == []
+    assert run.report.from_bodies == 2 and len(run.report.written) == 2
     assert run.progress_calls[-1] == ("progress", 5, 5)
-    assert run.phases[-1] == ("phase", "scraping", 5, 3)
+    assert run.phases == [("phase", "scraping", 5, 0), ("phase", "scraping", 5, 3),
+                          ("phase", "scraping", 5, 5)]
+    assert run.progress_calls == [("progress", 3, 5), ("progress", 5, 5)]
     assert len(run.report.skipped_existing) == 3
     skips = [c[3] for c in run.phases]
     assert skips == sorted(skips) and skips[0] == 0
@@ -287,7 +303,8 @@ def test_a_failure_while_the_output_is_built_ends_as_failed_not_complete(tmp_pat
         raise OSError("disk full")
 
     monkeypatch.setattr(pipeline.pdf_builder, "create_pdf", broken)
-    run = _Run().run(_job(tmp_path, OutputMode.CHUNKED), adapter=_Adapter(5))
+    # Whole-range output still builds after all fetching; chunks now publish earlier.
+    run = _Run().run(_job(tmp_path, OutputMode.SINGLE), adapter=_Adapter(5))
     assert isinstance(run.error, OSError) and run.report is None
     assert run.phases[-1] == ("phase", "building", 5, 0)
     assert run.tracker.view().status == "Building output…"
@@ -295,6 +312,25 @@ def test_a_failure_while_the_output_is_built_ends_as_failed_not_complete(tmp_pat
     assert view.state == rpg.FAILED and view.status == "Run failed"
     assert view.counts == "5 / 5 · 100%"               # every chapter was fetched; the run failed
     assert view.severity == "error"
+
+
+def test_a_failure_while_an_incremental_chunk_is_built_aborts_acquisition(tmp_path, monkeypatch):
+    from webnovel_scraper.run_journal import JOURNAL_FILENAME, replay_journal
+
+    def broken(*_a, **_k):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(pipeline.pdf_builder, "create_pdf", broken)
+    adapter = _Adapter(5)
+    run = _Run().run(_job(tmp_path, OutputMode.CHUNKED), adapter=adapter)
+    assert isinstance(run.error, OSError) and run.report is None
+    assert adapter.fetched == [1, 2]  # no further acquisition after a fatal publication failure
+    assert not list(tmp_path.rglob("*.pdf"))
+    replay = replay_journal(tmp_path / JOURNAL_FILENAME)
+    assert replay.last_end == "failed" and not replay.publishes
+    assert set(replay.contents) == {0, 1}  # accepted content remains available for recovery
+    view = run.finish()
+    assert view.state == rpg.FAILED and view.status == "Run failed" and view.severity == "error"
 
 
 # ── the browser/rescue conductor ──────────────────────────────────────────────

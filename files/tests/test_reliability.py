@@ -99,13 +99,17 @@ def test_stop_during_the_grouped_build_keeps_finished_files_and_resume_builds_th
 
     monkeypatch.setattr(pipeline, "render_output", render_then_stop)
     logs: list[str] = []
-    report = run(store, job(tmp_path / "out"), Site(6), cancel=cancel, logs=logs)
+    initial_site = Site(6)
+    report = run(store, job(tmp_path / "out"), initial_site, cancel=cancel, logs=logs)
     assert report.cancelled and built == ["Shadow_Slave_Chapters_1-2.pdf"]
     folder = report.output_dir
     assert sorted(p.name for p in (folder / "PDF").glob("*.pdf")) == ["Shadow_Slave_Chapters_1-2.pdf"]
     replay = replay_journal(folder / JOURNAL_FILENAME)
     assert replay.last_end == "cancelled" and list(replay.publishes) == [("chunk-00001", "pdf")]
-    assert any("stopped while the output files were being built" in line for line in logs)
+    # The first complete chunk publishes during acquisition, so Stop prevents fetching chapter 3.
+    assert initial_site.fetched == [1, 2]
+    assert report.accounting["attempted"] == 2 and report.accounting["not_attempted"] == 4
+    assert replay.failures == []
 
     monkeypatch.setattr(pipeline, "render_output", real)
     site = Site(6)
@@ -119,11 +123,16 @@ def replace_job(the_job, **kw):
     return replace(the_job, allocate_run=False, **kw)
 
 
-def test_a_resume_that_fetches_fewer_chapters_never_shrinks_a_saved_file(tmp_path, store):
+def test_a_resume_that_fetches_fewer_chapters_never_shrinks_a_saved_file(tmp_path, store, monkeypatch):
     """Session 1 saves chapters 1-10 without 3; the resume can fetch only 1-2. The 9-chapter file
     must stay as it was (not be replaced by a 2-chapter one), and only chapter 3 is a failure."""
     import json
     from dataclasses import replace
+    from webnovel_scraper import run_output
+
+    # Historical semantic runs have no durable bodies and must still preserve fuller files
+    # when refetching fails. Current saved-body reuse has separate integration coverage.
+    monkeypatch.setattr(run_output, "save_body", lambda *_: None)
 
     first_job = replace(job(tmp_path / "out", 1, 10, formats=("txt",)), chunk_size=10)
     first = run(store, first_job, Site(10, fail_always={3}))
@@ -186,7 +195,10 @@ def test_an_open_ended_run_without_the_network_uses_the_saved_list_and_says_so(t
     site = Site(10, toc_error=RuntimeError("could not reach freewebnovel.com"))
     report = run(store, job(tmp_path / "out", 3, 10**9, mode=OutputMode.SEPARATE), site, logs=logs)
     assert site.built == 1 and report.effective_range == (3, 10) and len(report.written) == 8
-    assert any(line.startswith("WARNING: newer chapters could not be looked for") for line in logs)
+    assert report.saved_list_used
+    assert any(line.startswith("WARNING: Loaded saved chapter list through chapter 10")
+               and "newer chapters were not checked" in line
+               and "Enable Refresh chapter list" in line for line in logs)
     assert any("the saved chapter list was used" in note for note in report.range_notes)
 
 

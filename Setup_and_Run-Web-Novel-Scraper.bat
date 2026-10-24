@@ -94,6 +94,7 @@ if errorlevel 1 goto :fail_venv
 :: ============================================================================
 :deps
 set "NEED_DEPS=1"
+set "REPAIR_DEPS="
 if exist "%LOCK%" (
     fc /b "%REQUIREMENTS%" "%LOCK%" >nul 2>&1
     if not errorlevel 1 set "NEED_DEPS="
@@ -101,13 +102,15 @@ if exist "%LOCK%" (
 if not defined NEED_DEPS (
     "%VENV_PY%" "%CHECK%" deps >nul 2>&1
     if errorlevel 1 set "NEED_DEPS=1"
+    if errorlevel 1 set "REPAIR_DEPS=--force-reinstall"
 )
 if not defined NEED_DEPS (
     echo [Step 2 of 4] Packages are installed and up to date.
     goto :browsers
 )
 echo [Step 2 of 4] Installing the program's packages into this folder ^(a few minutes the first time^)...
-"%VENV_PY%" -m pip install --disable-pip-version-check -r "%REQUIREMENTS%"
+:: A damaged package may still have valid pip metadata, so a failed import requires reinstalling.
+"%VENV_PY%" -m pip install --disable-pip-version-check %REPAIR_DEPS% -r "%REQUIREMENTS%"
 if errorlevel 1 goto :fail_deps
 "%VENV_PY%" "%CHECK%" deps
 if errorlevel 1 goto :fail_deps

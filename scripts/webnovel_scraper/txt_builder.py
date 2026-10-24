@@ -27,7 +27,7 @@ def create_txt(chapters: list[ChapterContent], output_path: Path) -> Path:
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     data = chapters_to_txt(chapters).encode("utf-8")
-    fd, tmp_name = tempfile.mkstemp(dir=str(output_path.parent), prefix=output_path.name + ".",
+    fd, tmp_name = tempfile.mkstemp(dir=str(output_path.parent), prefix=".wns-output-",
                                     suffix=".part")
     try:
         with os.fdopen(fd, "wb") as handle:

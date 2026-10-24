@@ -54,6 +54,8 @@ DIRECTORIES = ("baseline", "runtime", "cache", "spool", "outputs", "logs", "audi
 MARKER = "option-b-workspace.json"
 WORKSPACE_ID = {"kind": "supreme-magus-option-b", "version": 1, "source": SOURCE.to_json()}
 MAX_BODY = 8 * 1024 * 1024
+MAX_INDEX_HREFS = 20_000
+MAX_INDEX_HREF_LENGTH = 2048
 
 
 class Stop(ScrapeCancelled):
@@ -119,7 +121,7 @@ def inspect(cfg):
         if not cfg.resume:
             raise ValueError("existing root refused; explicit compatible resume required")
         Workspace(root).check()
-    if cfg.mode not in ("dry-run", "probe", "discovery", "sample", "audit"):
+    if cfg.mode not in ("dry-run", "index", "probe", "discovery", "sample", "full", "audit"):
         raise ValueError("unknown stage")
     if type(cfg.cap) is not int or cfg.cap < 0:
         raise ValueError("request cap must be a nonnegative integer")
@@ -127,6 +129,10 @@ def inspect(cfg):
         raise ValueError("resume and network permission must be explicit booleans")
     if not math.isfinite(cfg.interval) or cfg.interval < 3 or not math.isfinite(cfg.timeout) or not 0 < cfg.timeout <= 60:
         raise ValueError("pacing must be >=3 seconds and timeout in (0,60]")
+    if cfg.mode == "index" and (cfg.cap != 1 or cfg.bound is not None or cfg.slugs or cfg.resume
+            or cfg.start is not None or cfg.end is not None or cfg.formats
+            or cfg.grouping is not None or cfg.run is not None):
+        raise ValueError("index requires cap=1, a fresh workspace, and no bound, slugs, range or outputs")
     if cfg.mode in ("probe", "discovery"):
         if type(cfg.bound) is not int or cfg.bound < 1:
             raise ValueError("explicit approved source bound required")
@@ -147,6 +153,9 @@ def inspect(cfg):
                 or any(f not in ("pdf", "txt") for f in cfg.formats)
                 or cfg.grouping not in ("separate", "chunked", "single") or cfg.chunk_size < 1):
             raise ValueError("explicit formats and grouping required")
+    if cfg.mode == "full":
+        from full_publication import validate_config
+        validate_config(cfg)
     if cfg.run is not None and not re.fullmatch(r"supreme-magus-[1-9][0-9]*", cfg.run):
         raise ValueError("run must name a newly allocated isolated run")
     if cfg.mode == "audit" and not cfg.run:
@@ -158,9 +167,11 @@ def inspect(cfg):
         request_cap=cfg.cap, browser_policy="prohibited, including startup and warm-up",
         pacing_seconds=cfg.interval, timeout_seconds=cfg.timeout, concurrency=1,
         slugs=list(cfg.slugs), approved_bound=cfg.bound,
-        expected_artifacts={"dry-run": [], "probe": ["logs: attempts and diagnostic observations; no manifest"],
+        expected_artifacts={"dry-run": [], "index": ["logs: one index attempt and bounded structural evidence; no raw HTML"],
+            "probe": ["logs: attempts and diagnostic observations; no manifest"],
             "discovery": ["runtime: schema-2 checkpoints; no publications"],
             "sample": ["outputs: allocated selection, journal, explicit PDF/TXT; logs: run receipt"],
+            "full": ["outputs: new full publication run, durable bodies, transport ledger and audit"],
             "audit": ["audits: read-only artifact examination report"]}[cfg.mode],
         stop_conditions=["cap", "cancel", "redirect", "access/challenge/rate limit", "transport failure",
                          "source bound differs from explicit approval", "filesystem incompatibility"],
@@ -228,9 +239,10 @@ class Workspace:
         # Exclusive files, never replace a prior run's evidence.
         self.check()
         import uuid
-        path = self.path(folder) / f"{prefix}-{uuid.uuid4().hex}.json"
+        path = self.path(f"{folder}/{prefix}-{uuid.uuid4().hex}.json")
+        payload = json.dumps(value, ensure_ascii=False, indent=2)
         with path.open("x", encoding="utf-8") as f:
-            json.dump(value, f, ensure_ascii=False, indent=2)
+            f.write(payload)
             f.flush()
             os.fsync(f.fileno())
         return path
@@ -248,7 +260,8 @@ class RestrictedManager(RequestManager):
     Budget is consumed immediately BEFORE request(); exceptions never refund it.
     """
     def __init__(self, ws, *, cap, allowed, connection_factory=None,
-                 interval=3.0, timeout=30.0, sleep=time.sleep, monotonic=time.monotonic):
+                 interval=3.0, timeout=30.0, sleep=time.sleep, monotonic=time.monotonic,
+                 event_sink=None):
         super().__init__(SPEC.novel_slug, use_cache=False, cache_root=ws.path("cache"),
                          site_key=SOURCE.site_key, max_retries=0, http_timeout=timeout,
                          host_limiter=HostRateLimiter(interval, sleep=sleep, monotonic=monotonic))
@@ -257,6 +270,7 @@ class RestrictedManager(RequestManager):
         self.stopped = None
         self._connection = connection_factory or http.client.HTTPSConnection
         self._serial = threading.Lock()
+        self._event_sink = event_sink
 
     def start(self):
         return self  # Explicitly no inherited startup or warm-up.
@@ -297,16 +311,25 @@ class RestrictedManager(RequestManager):
                 self.attempts += 1
                 self.counts[url] = self.counts.get(url, 0) + 1
                 self.events.append(event)
-                conn.request("GET", parts.path, headers={"User-Agent": "Web-Novel-Scraper isolated acceptance",
-                    "Accept": "text/html", "Accept-Encoding": "identity", "Connection": "close"})
+                if self._event_sink:
+                    self._event_sink("attempt", event)
+                try:
+                    conn.request("GET", parts.path, headers={"User-Agent": "Web-Novel-Scraper isolated acceptance",
+                        "Accept": "text/html", "Accept-Encoding": "identity", "Connection": "close"})
+                finally:
+                    # Reservation precedes connection setup and durable attempt evidence;
+                    # anchor the next deadline after actual dispatch, not before that work.
+                    self.host_limiter.navigation_dispatched(url)
                 response = conn.getresponse()
                 event["status"] = response.status
                 raw = response.read(MAX_BODY + 1)
+                event["response_bytes"] = len(raw)
                 event["sha256"] = hashlib.sha256(raw).hexdigest()
+                event["sha256_complete_response"] = len(raw) <= MAX_BODY
                 if len(raw) > MAX_BODY:
                     self.stop("response exceeds finite size cap")
                 if 300 <= response.status < 400:
-                    event["redirect"] = response.getheader("Location")
+                    event["redirect"] = True  # Never retain untrusted Location credentials/query values.
                     self.stop("redirect refused before following it")
                 if response.status != 200:
                     self.stop(f"inaccessible HTTP {response.status}")
@@ -328,27 +351,103 @@ class RestrictedManager(RequestManager):
                 event["outcome"] = f"transport exception: {type(exc).__name__}"
                 self.stop(event["outcome"])
             finally:
-                if conn is not None:
-                    try:
-                        conn.close()
-                    except Exception:
-                        self.stop("transport close failure")
+                try:
+                    if self._event_sink and event["attempt"] <= self.attempts:
+                        self._event_sink("result", event)
+                finally:
+                    if conn is not None:
+                        try:
+                            conn.close()
+                        except Exception:
+                            self.stop("transport close failure")
 
 
-def _fresh_bound(rm, cfg):
+def _index_chapter_slug(href):
+    """Parse link evidence only; never add a URL to the navigation allowlist."""
+    if (not isinstance(href, str) or not href or len(href) > MAX_INDEX_HREF_LENGTH
+            or any(ord(c) <= 32 or c == "\\" for c in href)):
+        return None, "invalid_href"
+    try:
+        original = urlsplit(href)
+        if original.scheme and (original.scheme != "https" or not original.netloc):
+            return None, "source_mismatch"
+        # The adapter resolves origin-relative links against the catalog base.
+        parts = urlsplit(urljoin(SPEC.base_url or SPEC.url, href))
+    except ValueError:
+        return None, "invalid_url"
+    source = urlsplit(SPEC.url)
+    if parts.scheme != "https" or parts.netloc != source.netloc:
+        return None, "source_mismatch"
+    novel_path = source.path.rstrip("/")
+    if not parts.path.startswith(novel_path + "/"):
+        return None, "novel_path_mismatch"
+    # Query/fragment values are never slug evidence. Reject extra path suffixes,
+    # encoded delimiters, fractions, signs, leading zeroes and oversized integers.
+    match = re.fullmatch(re.escape(novel_path) + r"/chapter-([1-9][0-9]{0,9})/?", parts.path)
+    return (int(match[1]), None) if match else (None, "chapter_path_mismatch")
+
+
+def _index_bound_evidence(html, expected_bound):
+    """Bounded structural facts, never a certificate of full-novel coverage."""
+    soup = BeautifulSoup(html, "html.parser")
+    anchors = soup.find_all("a", href=True, limit=MAX_INDEX_HREFS + 1)
+    truncated = len(anchors) > MAX_INDEX_HREFS
+    pagination = soup.select_one(".pagination, .pager, [aria-label='Pagination' i], "
+        "a[rel~='next'], a[rel~='prev'], link[rel~='next'], link[rel~='prev']") is not None
+    rejected = dict.fromkeys(("invalid_href", "invalid_url", "source_mismatch",
+        "novel_path_mismatch", "chapter_path_mismatch"), 0)
+    slugs = set()
+    accepted = 0
+    for anchor in anchors[:MAX_INDEX_HREFS]:
+        slug, reason = _index_chapter_slug(anchor["href"])
+        if slug is None:
+            rejected[reason] += 1
+        else:
+            accepted += 1
+            slugs.add(slug)
+    maximum = max(slugs, default=None)
+    if truncated or pagination:
+        outcome = "insufficient_structure"
+    elif maximum is None:
+        outcome = "no_candidates"
+    elif expected_bound is None:
+        outcome = "observed_maximum"
+    elif maximum != expected_bound:
+        outcome = "mismatch"
+    else:
+        outcome = "matches_approval"
+    return dict(source=SOURCE.to_json(), provenance="current-index-response",
+        anchor_hrefs_examined=min(len(anchors), MAX_INDEX_HREFS),
+        accepted_chapter_links=accepted, distinct_chapter_slugs=len(slugs),
+        maximum_candidate_slug=maximum, expected_bound=expected_bound,
+        no_recognized_candidates=maximum is None,
+        maximum_differs_from_approval=None if maximum is None or expected_bound is None else maximum != expected_bound,
+        rejection_counts=rejected, analysis_truncated=truncated,
+        pagination_marker_present=pagination, source_bound_validation=outcome,
+        full_novel_coverage_established=False, raw_response_retained=False,
+        href_scan_limit=MAX_INDEX_HREFS, href_length_limit=MAX_INDEX_HREF_LENGTH,
+        slug_digit_limit=10)
+
+
+def _fresh_bound(rm, cfg, result):
+    # Keep a transport failure distinct from a successfully parsed empty index.
+    result["index_bound"] = dict(source=SOURCE.to_json(), expected_bound=cfg.bound,
+        source_bound_validation="not_evaluated", full_novel_coverage_established=False,
+        raw_response_retained=False)
     html = rm.fetch(SPEC.url, use_cache=False)
-    slugs = []
-    for anchor in BeautifulSoup(html, "html.parser").find_all("a", href=True):
-        match = re.fullmatch(re.escape(SPEC.url) + r"/chapter-([1-9][0-9]*)", urljoin(SPEC.url, anchor["href"]))
-        if match:
-            slugs.append(int(match[1]))
-    if not slugs or max(slugs) != cfg.bound:
-        rm.stop("fresh source bound differs from explicit approval or is unknown")
-    return max(slugs)
+    facts = _index_bound_evidence(html, cfg.bound)
+    facts["response_sha256"] = rm.events[-1]["sha256"]
+    result["index_bound"] = facts  # The stage's exclusive/fsynced receipt survives Stop.
+    outcome = facts["source_bound_validation"]
+    if outcome != ("observed_maximum" if cfg.mode == "index" else "matches_approval"):
+        rm.stop({"no_candidates": "fresh source bound unknown: no qualifying chapter links",
+            "mismatch": "fresh source bound differs from explicit approval",
+            "insufficient_structure": "fresh source bound uncertain: pagination or analysis limit"}[outcome])
+    return facts["maximum_candidate_slug"]
 
 
 def _probe(cfg, rm, adapter, result):
-    _fresh_bound(rm, cfg)
+    _fresh_bound(rm, cfg, result)
     known = {}
     for slug in cfg.slugs:
         url = chapter_url_for(SPEC, slug)
@@ -385,7 +484,7 @@ def _discovery(cfg, rm, adapter, ws, result):
         saved = store.load_effective(SOURCE, quarantine=False).runtime.manifest
         if saved and saved.verification.complete_for(SOURCE):
             rm.stop("discovery already complete; revalidation requires a new workspace")
-        _fresh_bound(rm, cfg)
+        _fresh_bound(rm, cfg, result)
         if saved and saved.verification.bound != cfg.bound:
             rm.stop("saved source bound changed; separate disposition required")
         if saved and any(p.status == "conflict" for p in saved.verification.pages):
@@ -516,7 +615,7 @@ def execute(cfg, *, connection_factory=None, sleep=time.sleep, monotonic=time.mo
         raise ValueError("separate owner approval/configuration required for this live stage")
     if connection_factory is not None and cfg.permit_network:
         raise ValueError("offline simulation and network permission are mutually exclusive")
-    if cfg.mode in ("sample", "audit") and not cfg.resume:
+    if cfg.mode in ("sample", "full", "audit") and not cfg.resume:
         raise ValueError("this stage requires explicit resume of the compatible isolated workspace")
     ws = Workspace.open(cfg, simulation=None if cfg.mode == "audit" else connection_factory is not None)
     with FileLock(ws.path("logs/.stage.lock")):
@@ -524,6 +623,9 @@ def execute(cfg, *, connection_factory=None, sleep=time.sleep, monotonic=time.mo
 
 
 def _execute_stage(cfg, ws, report, connection_factory, sleep, monotonic):
+    if cfg.mode == "full":
+        from full_publication import publish
+        return publish(cfg, ws, connection_factory=connection_factory, sleep=sleep, monotonic=monotonic)
     if cfg.mode == "audit":
         return audit_isolated(cfg, ws)
     allowed = {SPEC.url: 1}
@@ -531,7 +633,7 @@ def _execute_stage(cfg, ws, report, connection_factory, sleep, monotonic):
     if cfg.mode == "sample":
         store, selection = _sample_selection(cfg, ws)
         allowed = {m.url: 2 for m in selection.chapters}  # Existing pipeline's one sweep is also capped.
-    else:
+    elif cfg.mode != "index":
         slugs = cfg.slugs if cfg.mode == "probe" else range(1, cfg.bound + 1)
         allowed.update({chapter_url_for(SPEC, s): 1 for s in slugs})
     rm = RestrictedManager(ws, cap=cfg.cap, allowed=allowed, connection_factory=connection_factory,
@@ -544,10 +646,14 @@ def _execute_stage(cfg, ws, report, connection_factory, sleep, monotonic):
             value = _PageSpool(ws.path("spool"))
             cleanup.callback(value.file.close)
             return value
-        cls = SampleAdapter if cfg.mode == "sample" else AcceptanceAdapter
-        adapter = cls(request_manager=rm, log=result["messages"].append, spool_factory=spool)
+        if cfg.mode != "index":
+            cls = SampleAdapter if cfg.mode == "sample" else AcceptanceAdapter
+            adapter = cls(request_manager=rm, log=result["messages"].append, spool_factory=spool)
         try:
-            if cfg.mode == "probe":
+            if cfg.mode == "index":
+                _fresh_bound(rm, cfg, result)
+                result["complete"] = True  # Index inspection only; never a coverage certificate.
+            elif cfg.mode == "probe":
                 _probe(cfg, rm, adapter, result)
             elif cfg.mode == "discovery":
                 _discovery(cfg, rm, adapter, ws, result)
@@ -568,7 +674,7 @@ def _execute_stage(cfg, ws, report, connection_factory, sleep, monotonic):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", required=True, type=Path)
-    parser.add_argument("--mode", choices=("dry-run", "probe", "discovery", "sample", "audit"), default="dry-run")
+    parser.add_argument("--mode", choices=("dry-run", "index", "probe", "discovery", "sample", "full", "audit"), default="dry-run")
     parser.add_argument("--cap", type=int, default=0)
     parser.add_argument("--bound", type=int)
     parser.add_argument("--slugs", nargs="+", type=int, default=[])
@@ -596,6 +702,12 @@ def main(argv=None):
     except (ValueError, OSError, ChapterListRefused, ManifestStoreError, JournalError) as exc:
         print(f"REFUSED: {exc}", file=sys.stderr)
         return 2
+    if cfg.mode == "full" and args.execute:
+        result = {key: result[key] for key in ("run", "evidence", "attempts", "accepted_chapters",
+            "published_chapters", "file_counts", "output_location", "stop_reason", "audit_failures",
+            "content_concerns", "missing_original_titles", "preservation_failures", "complete_publication_verified")}
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0 if result["complete_publication_verified"] else 1
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
 

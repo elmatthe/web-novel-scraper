@@ -11,13 +11,14 @@ registry/disabled-adapter consistency for The Noble Queen.
 from __future__ import annotations
 
 from pathlib import Path
+import json
 
 import pytest
 
 from webnovel_scraper import catalog
 from webnovel_scraper.adapters import webnovel_dynamic as wnd
 from webnovel_scraper.adapters.webnovel_dynamic import WebNovelDynamicAdapter
-from webnovel_scraper.models import ChapterMeta
+from webnovel_scraper.models import ChapterMeta, ChapterMismatchError
 from webnovel_scraper.registry import (
     AdapterDisabledError,
     get_adapter,
@@ -56,6 +57,53 @@ class FakeRM:
 
 
 NQ_SPEC = catalog.get_spec("the-noble-queen", "webnovel_dynamic")
+
+
+@pytest.mark.parametrize("payload", ["next", "g_data"])
+@pytest.mark.parametrize("field,value", [("chapterIndex", 2), ("chapterId", "999"),
+                                          ("bookId", "456"), ("chapterName", "Chapter 2: Other")])
+def test_wrong_chapter_identity_is_refused(payload, field, value):
+    meta = ChapterMeta(1, "https://dynamic.webnovel.com/story/123/111", source_id="111")
+    ci = {"chapterIndex": 1, "chapterId": "111", "chapterName": "Chapter 1: Right",
+          "contents": [{"content": "A complete paragraph of the story."}]}
+    ci[field] = value
+    if payload == "next":
+        page = '<script id="__NEXT_DATA__" type="application/json">' + json.dumps(
+            {"props": {"pageProps": {"data": {"chapterInfo": ci}}}}) + '</script>'
+    else:
+        page = '<script>g_data.chapInfo=' + json.dumps(ci) + ';</script>'
+    with pytest.raises(ChapterMismatchError):
+        WebNovelDynamicAdapter()._extract_chapter(page, meta)
+
+
+def test_dom_chapter_heading_must_match_requested_identity():
+    page = '<h1>Chapter 2: Other</h1><div class="cha-words"><p>Other body.</p></div>'
+    with pytest.raises(ChapterMismatchError):
+        WebNovelDynamicAdapter()._extract_chapter(page, ChapterMeta(1, "https://example.org/123/111"))
+
+
+def test_wrong_cached_webnovel_page_is_invalidated_and_fetched_once_more():
+    from types import SimpleNamespace
+
+    class CachedRM:
+        last_fetch_info = SimpleNamespace(from_cache=True)
+
+        def __init__(self):
+            self.calls, self.invalidated = 0, []
+
+        def fetch(self, url, **kw):
+            self.calls += 1
+            n = 2 if self.calls == 1 else 1
+            return f'<h1>Chapter {n}: Title</h1><div class="cha-words"><p>Body {n}.</p></div>'
+
+        def invalidate_cache(self, url, reason):
+            self.invalidated.append((url, reason))
+
+    rm = CachedRM()
+    meta = ChapterMeta(1, "https://dynamic.webnovel.com/story/123/111")
+    content = WebNovelDynamicAdapter(request_manager=rm).fetch_chapter(meta, NQ_SPEC)
+    assert rm.calls == 2 and len(rm.invalidated) == 1
+    assert content.paragraphs == ["Body 1."]
 
 
 # ── build_chapter_index: __NEXT_DATA__ TOC parse ─────────────────────────────

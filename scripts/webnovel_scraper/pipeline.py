@@ -45,6 +45,7 @@ from typing import Callable, Iterable, Optional
 
 from . import catalog
 from . import chapter_preflight
+from .run_performance import measure_stage
 from .atomic_io import write_json_atomic
 from . import pdf_builder
 from . import rescue_pool as rp
@@ -73,6 +74,7 @@ from .run_journal import (
     load_selection,
     replay_journal,
     selection_sha256,
+    source_list_gaps,
 )
 from .run_output import (
     RunOutputs,
@@ -81,7 +83,7 @@ from .run_output import (
     remove_orphan_temps,
     separate_stem,
 )
-from .run_storage import RunStorageError, allocate_run_dir, open_existing_run
+from .run_storage import RunStorageError, allocate_run_dir, open_existing_run, checked_output_path
 from .source_identity import SourceIdentity, SourceIdentityError
 from .semantic_resume import RESUME_POLICY, EXTRACTION_POLICY
 from .request_manager import (
@@ -181,6 +183,7 @@ class _Pacer:
         floor: float = AUTO_SLOWDOWN_FLOOR,
         log: Optional[LogFn] = None,
         sleep_fn: Callable[[float], None] = time.sleep,
+        performance=None,
     ) -> None:
         self.base = max(0.0, float(base_delay))
         self.multiplier = float(multiplier)
@@ -192,6 +195,7 @@ class _Pacer:
         self.floor = float(floor)
         self._log = log if log is not None else logger.info
         self._sleep = sleep_fn
+        self.performance = performance
         self.slowdowns = 0
 
     def register_block(self) -> None:
@@ -214,7 +218,11 @@ class _Pacer:
     def sleep(self) -> None:
         """Sleep the current effective inter-fetch delay (no-op when it is 0)."""
         if self.current > 0:
-            self._sleep(self.current)
+            if self.performance is None:
+                self._sleep(self.current)
+            else:
+                with self.performance.measure("fetching_seconds"):
+                    self._sleep(self.current)
 
 
 # ── Run report ───────────────────────────────────────────────────────────────
@@ -233,6 +241,7 @@ class RunReport:
     extraction_failed: list[int] = field(default_factory=list)  # fetched OK but no body — not swept, not a block
     toc_gaps: list[int] = field(default_factory=list)          # whole numbers the site's list skips inside the range
     range_notes: list[str] = field(default_factory=list)       # how the requested range was adjusted (End clamp, Start raise)
+    saved_list_used: bool = False
     absent_skipped: list[tuple[str, str]] = field(default_factory=list)  # (label, evidence): source-confirmed absent, skipped
     rescued: list[int] = field(default_factory=list)         # ch. saved by rescue (or 2nd-pass sweep)
     warnings: list[str] = field(default_factory=list)        # adapter + pipeline warnings
@@ -240,7 +249,9 @@ class RunReport:
     accounting: dict = field(default_factory=dict)          # page positions, requested formats, actual artifacts
     cancelled: bool = False
     resumed: bool = False            # this session continued an earlier run folder (v0.3.0 03.3)
+    performance: dict = field(default_factory=dict)
     from_cache: int = 0              # chapter pages served by the saved-page cache (no request made)
+    from_bodies: int = 0             # accepted saved bodies reused to rebuild pending output
     auto_slowdowns: int = 0          # how many times auto-slowdown raised the delay
     effective_delay: float = 0.0     # final inter-fetch delay; never exceeds the ceiling
     # ── 0.2.0 rescue-lane metrics (§3.16) ─────────────────────────────────────
@@ -276,6 +287,8 @@ class RunReport:
         if self.from_cache:
             lines.append(f"  From the saved-page cache: {self.from_cache} chapter page(s), no request "
                          "to the site")
+        if self.from_bodies:
+            lines.append(f"  Verified saved bodies reused: {self.from_bodies}; no page request needed.")
         if self.rescued:
             lines.append(
                 f"  Rescued (hard chapters cleared by the rescue lane / sweep): "
@@ -302,6 +315,7 @@ class RunReport:
             lines.append(f"  Pages: {self.accounting['selected']} selected, {self.accounting['attempted']} attempted, "
                          f"{self.accounting['not_attempted']} not attempted; "
                          f"{self.accounting['requested_success']} requested-format successes, "
+                         f"{self.accounting.get('pending', 0)} pending; "
                          f"{self.accounting['fallback_preserved']} with fallback artifacts preserved.")
         if self.toc_gaps:
             preview = ", ".join(str(i) for i in self.toc_gaps[:20])
@@ -425,6 +439,7 @@ def _record_selection(
     """Copy what the preflight learned onto the run report, with the existing TOC-gap wording."""
     report.effective_range = selection.effective_range
     report.range_notes = list(selection.range_notes)
+    report.saved_list_used = selection.saved_only
     report.absent_skipped = list(selection.absent)
     for label, evidence in selection.absent:
         log(f"NOTE: chapter {label} was skipped: confirmed absent at the source ({evidence}).")
@@ -743,7 +758,8 @@ class _RescueConductor:
         is allowed to propagate so the run ends cleanly."""
         self.outputs.attempt(meta)
         try:
-            content = self.primary.fetch(meta)
+            with measure_stage(self.report, "fetching_seconds"):
+                content = self.primary.fetch(meta)
         except ScrapeCancelled:
             raise
         except NotFoundFetchError as exc:
@@ -909,7 +925,7 @@ class _RescueConductor:
         self._failed_pages.pop(meta.url, None)
         if index in self.report.failed and index not in self._failed_pages.values():
             self.report.failed.remove(index)  # a prior transient now cleared
-        self.outputs.add(meta, content)  # individual chapters are published at once
+        self.outputs.add(meta, content)  # individual chapters and complete chunks publish now
         self.state.tick()
 
     def _mark_failed(self, meta: ChapterMeta, reason: str) -> None:
@@ -1050,78 +1066,90 @@ def run_scrape(
         formats=tuple(job.formats),
     )
 
-    # 2a. FWN-browser scope gate (§3.14): the fast-primary + single-lane rescue
-    #     conductor. Only when no adapter was injected (an injected adapter keeps the
-    #     legacy flow for back-compat / tests). The pipeline OWNS the primary manager
-    #     here, building it via the factory so it can replace it on a TOC fallback or
-    #     a breaker switch (§3.10/§3.15).
-    if _rescue_enabled(job) and adapter is None:
-        return _run_with_rescue(
-            job, spec, report, log, cancel_event, progress_cb,
-            phase_cb=phase_cb, sleep_fn=sleep_fn, monotonic_fn=monotonic_fn, host_limiter=host_limiter,
-            store=store,
-            request_manager_factory=request_manager_factory,
-            primary_adapter_factory=primary_adapter_factory,
-            rescue_pool_factory=rescue_pool_factory,
-        )
-
-    # 2b. Legacy path (WND HTTP, opt-in HTTP, injected-adapter tests): build (or
-    #     accept) the adapter + request manager, drive with the synchronous sweep.
-    owns_rm = False
-    rm: Optional[RequestManager] = None
-    drive_spec = spec
-    if adapter is None:
-        # The job — not a mutated catalog row — drives ``use_browser`` for this run.
-        # Since the Phase-4 GUI no longer mutates ``SiteSpec`` or pre-builds the
-        # manager, derive a per-run spec here and thread the job's timeout/headless
-        # into the manager we own (§3.14/§3.15), so an FWN run with the browser
-        # box unchecked correctly fetches over plain HTTP.
-        drive_spec = runtime_site_spec(spec, job)
-        rm = request_manager
-        if rm is None:
-            rm = RequestManager(
-                slug=spec.novel_slug,
-                use_cache=job.use_cache,
-                headless=job.headless,
-                try_http_first=job.http_first,
-                log_fn=log,
-                max_retries=job.max_retries,
-                retry_base_delay=job.retry_base_delay,
-                http_timeout=job.request_timeout,
-                # Thread the run's injected timing source into the legacy ladder so
-                # its cancel-aware sliced backoff (BUG-2) is driven by the same
-                # (fake-in-tests) clock the rescue path already uses — instead of
-                # falling through to real time.sleep.
-                sleep_fn=sleep_fn,
-                site_key=_site_key(spec),
-                refresh_cache=job.refresh_html_cache,
-                host_limiter=host_limiter or _legacy_limiter(job, monotonic_fn, sleep_fn),
-            )
-            owns_rm = True
-        if cancel_event is not None:
-            rm.cancel_event = cancel_event
-        rm.start()
-        cls = REGISTRY[spec.adapter_key]
-        adapter = cls(request_manager=rm, log=log)
-    elif request_manager is not None and cancel_event is not None:
-        # Injected adapter + manager: still wire the Stop event.
-        request_manager.cancel_event = cancel_event
-
-    pacer = _Pacer(job.delay, log=log, sleep_fn=sleep_fn)
+    from .run_performance import RunPerformance, performance_summary
+    report._performance = RunPerformance(monotonic_fn)
     try:
-        return _drive(
-            job, drive_spec, adapter, report, log, cancel_event,
-            progress_cb, pacer, phase_cb, store=store,
-        )
-    except ScrapeCancelled as exc:
-        # Cancelled while the chapter list was being settled (nothing was started yet).
-        log(f"Run cancelled: {exc}")
-        report.cancelled = True
-        _collect_warnings(adapter, report)
-        return report
+        # 2a. FWN-browser scope gate (§3.14): the fast-primary + single-lane rescue
+        #     conductor. Only when no adapter was injected (an injected adapter keeps the
+        #     legacy flow for back-compat / tests). The pipeline OWNS the primary manager
+        #     here, building it via the factory so it can replace it on a TOC fallback or
+        #     a breaker switch (§3.10/§3.15).
+        if _rescue_enabled(job) and adapter is None:
+            return _run_with_rescue(
+                job, spec, report, log, cancel_event, progress_cb,
+                phase_cb=phase_cb, sleep_fn=sleep_fn, monotonic_fn=monotonic_fn, host_limiter=host_limiter,
+                store=store,
+                request_manager_factory=request_manager_factory,
+                primary_adapter_factory=primary_adapter_factory,
+                rescue_pool_factory=rescue_pool_factory,
+            )
+
+        # 2b. Legacy path (WND HTTP, opt-in HTTP, injected-adapter tests): build (or
+        #     accept) the adapter + request manager, drive with the synchronous sweep.
+        owns_rm = False
+        rm: Optional[RequestManager] = None
+        drive_spec = spec
+        if adapter is None:
+            # The job — not a mutated catalog row — drives ``use_browser`` for this run.
+            # Since the Phase-4 GUI no longer mutates ``SiteSpec`` or pre-builds the
+            # manager, derive a per-run spec here and thread the job's timeout/headless
+            # into the manager we own (§3.14/§3.15), so an FWN run with the browser
+            # box unchecked correctly fetches over plain HTTP.
+            drive_spec = runtime_site_spec(spec, job)
+            rm = request_manager
+            if rm is None:
+                rm = RequestManager(
+                    slug=spec.novel_slug,
+                    use_cache=job.use_cache,
+                    headless=job.headless,
+                    try_http_first=job.http_first,
+                    log_fn=log,
+                    max_retries=job.max_retries,
+                    retry_base_delay=job.retry_base_delay,
+                    http_timeout=job.request_timeout,
+                    # Thread the run's injected timing source into the legacy ladder so
+                    # its cancel-aware sliced backoff (BUG-2) is driven by the same
+                    # (fake-in-tests) clock the rescue path already uses — instead of
+                    # falling through to real time.sleep.
+                    sleep_fn=sleep_fn,
+                    site_key=_site_key(spec),
+                    refresh_cache=job.refresh_html_cache,
+                    performance=report._performance,
+                    host_limiter=host_limiter or _legacy_limiter(job, monotonic_fn, sleep_fn),
+                )
+                owns_rm = True
+            if cancel_event is not None:
+                rm.cancel_event = cancel_event
+            rm.performance = report._performance
+            rm.start()
+            cls = REGISTRY[spec.adapter_key]
+            adapter = cls(request_manager=rm, log=log)
+        elif request_manager is not None and cancel_event is not None:
+            # Injected adapter + manager: still wire the Stop event.
+            request_manager.cancel_event = cancel_event
+
+        injected_rm = getattr(adapter, "_rm", None)
+        if isinstance(injected_rm, RequestManager):
+            injected_rm.performance = report._performance
+
+        pacer = _Pacer(job.delay, log=log, sleep_fn=sleep_fn, performance=report._performance)
+        try:
+            return _drive(
+                job, drive_spec, adapter, report, log, cancel_event,
+                progress_cb, pacer, phase_cb, store=store,
+            )
+        except ScrapeCancelled as exc:
+            # Cancelled while the chapter list was being settled (nothing was started yet).
+            log(f"Run cancelled: {exc}")
+            report.cancelled = True
+            _collect_warnings(adapter, report)
+            return report
+        finally:
+            if owns_rm and rm is not None:
+                rm.close()
     finally:
-        if owns_rm and rm is not None:
-            rm.close()
+        report._performance.finish(report)
+        log(performance_summary(report.performance))
 
 
 def _run_with_rescue(
@@ -1168,8 +1196,10 @@ def _run_with_rescue(
             host_limiter=limiter,
             site_key=_site_key(spec),
             refresh_cache=job.refresh_html_cache,
+            performance=report._performance,
         )
         rm.cancel_event = run_cancel
+        rm.performance = report._performance
         rm.start()
         return rm
 
@@ -1186,6 +1216,7 @@ def _run_with_rescue(
             # Rescue always fetches from the site; a rescued page that extracts as the right
             # chapter is saved to the validated cache like any other (v0.3.0 03.2b).
             use_cache=job.use_cache,
+            performance=report._performance,
             site_key=_site_key(spec),
             request_timeout=job.request_timeout,
             log=log,
@@ -1197,7 +1228,7 @@ def _run_with_rescue(
     primary_adapter_factory = primary_adapter_factory or _default_primary_adapter_factory
     pool_factory = rescue_pool_factory or _default_pool_factory
 
-    pacer = _Pacer(job.delay, log=log, sleep_fn=sleep_fn)
+    pacer = _Pacer(job.delay, log=log, sleep_fn=sleep_fn, performance=report._performance)
     primary = _PrimaryEngine(
         headless=job.headless,
         runtime_spec=runtime_spec,
@@ -1399,6 +1430,9 @@ def _open_resume(job: ScrapeJob, spec: SiteSpec, store: ChapterManifestStore, lo
         header = replay.header
         from .semantic_resume import validate_admission
         validate_admission(replay)
+        from .chapter_bodies import load_body
+        for record in replay.contents.values():
+            load_body(found.path, record)
         if header.novel_slug != found.novel_slug or header.run_number != found.number:
             raise JournalError("The run journal describes another run folder.")
         current = SourceIdentity.from_site_spec(spec)
@@ -1456,6 +1490,8 @@ def _prepare_run(
     cancel_event: Optional[threading.Event],
     progress_cb: Optional[ProgressFn],
     phase_cb: Optional[PhaseFn],
+    *,
+    preserve_manifest_metadata: bool = True,
 ) -> Optional[_Run]:
     """The one start-of-run step both execution paths share (v0.3.0 03.2a + 03.3).
 
@@ -1476,23 +1512,33 @@ def _prepare_run(
         report.requested_range = header.requested
         report.effective_range = header.effective
         report.range_notes = list(header.notes)
+        report.saved_list_used = any("newer chapters were not checked" in note or
+                                    "saved chapter list was used" in note for note in header.notes)
+        report.toc_gaps = source_list_gaps(header, chapters)
+        if report.toc_gaps:
+            warning = "The source chapter list skips chapter number(s): " + ", ".join(
+                str(n) for n in report.toc_gaps[:20]) + ". This warning remains on Resume."
+            report.warnings.append(warning)
+            log(f"WARNING: {warning}")
         report.resumed = True
         log(
             f"Resuming {run_dir.name}: {len(chapters)} chapters ({header.first_label} to "
             f"{header.last_label}) exactly as the run selected them; no chapter-list request."
         )
     else:
-        selection = chapter_preflight.resolve_chapters(
-            spec,
-            start=job.start,
-            end=_end_hint_for(job),
-            store=store,
-            discover=discover,
-            log=log,
-            legacy_index=None if job.allocate_run else Path(job.output_dir) / INDEX_FILENAME,
-            refresh=job.refresh_chapter_list,
-            cancel_event=cancel_event,
-        )
+        with measure_stage(report, "discovery_seconds"):
+            selection = chapter_preflight.resolve_chapters(
+                spec,
+                start=job.start,
+                end=_end_hint_for(job),
+                store=store,
+                discover=discover,
+                log=log,
+                legacy_index=None if job.allocate_run else Path(job.output_dir) / INDEX_FILENAME,
+                refresh=job.refresh_chapter_list,
+                list_mode=job.chapter_list_mode,
+                cancel_event=cancel_event,
+            )
         if selection.empty_index:
             report.warnings.append("The chapter index came back empty; nothing to do.")
             return None
@@ -1503,7 +1549,14 @@ def _prepare_run(
             return None
         source = SourceIdentity.from_site_spec(spec)
         chapters = [chapter_preflight.identity_from_meta(source, m) for m in metas]
+        if preserve_manifest_metadata:
+            # Certified publication retains empty titles and exact spelling from
+            # the validated manifest, bypassing the legacy metadata cleaner.
+            chapters = [source.chapter_identity(m.url, chapter_preflight.meta_label(m),
+                slug=m.slug, source_id=m.source_id, title=m.title) for m in metas]
         run_dir, number = _new_run_folder(job, spec)
+        for folder in ("PDF", "TXT"):
+            checked_output_path(run_dir, folder)
         lock = _lock_run(run_dir)
         try:
             effective = store.load_effective(source, quarantine=False).effective
@@ -1521,6 +1574,7 @@ def _prepare_run(
                 notes=tuple(notes), created_utc=store.now_utc(),
                 outcome_policy=OUTCOME_POLICY,
                 resume_policy=RESUME_POLICY, extraction_policy=EXTRACTION_POLICY,
+                toc_gaps=tuple(selection.toc_gaps),
             )
             journal = RunJournal.create(run_dir, header, chapters)
         except BaseException:
@@ -1530,14 +1584,14 @@ def _prepare_run(
     report.output_dir = run_dir
     labels = [c.label.text for c in chapters]
     resume_started = not resumed
-    outputs = RunOutputs(
-        run_dir=run_dir, journal=journal, metas=metas, labels=labels, mode=job.output_mode,
-        chunk_size=job.chunk_size, formats=tuple(job.formats), title=spec.novel_title,
-        stem=_stem_for(spec), report=report, log=log,
-        render=render_output,
-        replay=replay if resumed else None, cancel_event=cancel_event,
-    )
     try:
+        outputs = RunOutputs(
+            run_dir=run_dir, journal=journal, metas=metas, labels=labels, mode=job.output_mode,
+            chunk_size=job.chunk_size, formats=tuple(job.formats), title=spec.novel_title,
+            stem=_stem_for(spec), report=report, log=log,
+            render=render_output,
+            replay=replay if resumed else None, cancel_event=cancel_event,
+        )
         if job.output_mode is OutputMode.SEPARATE:
             _record_duplicate_output_numbers(metas, report, log)
         fetch_list = outputs.plan_fetch()
@@ -1556,6 +1610,15 @@ def _prepare_run(
             report.skipped_existing.extend(metas[p].index for p in done)
             state.tick(len(done), skipped=True)
             log(f"  {len(done)} chapter(s) already saved with compatible semantic certificates and intact bytes; skipping them.")
+        if resumed:
+            restored = [meta for meta in fetch_list if outputs.restore_body(meta)]
+            if restored:
+                restored_urls = {meta.url for meta in restored}
+                fetch_list = [meta for meta in fetch_list if meta.url not in restored_urls]
+                report.from_bodies += len(restored)
+                state.tick(len(restored), skipped=True)
+                log(f"  {len(restored)} chapter(s) restored from verified saved bodies; no page request needed.")
+                outputs.publish_ready()
     except BaseException:
         if resume_started:
             _end_journal(journal, "failed", log)
@@ -1604,16 +1667,21 @@ def _finish_run(run: _Run, report: RunReport, log: LogFn) -> None:
         report.failed = list(dict.fromkeys(outputs.metas[p].index for p in sorted(outputs.failed)))
         if report.cancelled:
             state = "cancelled"
-        elif outputs.failed or outputs.pending or report.accounting.get("integrity_suspicions"):
+        elif (outputs.failed or outputs.pending or report.toc_gaps
+              or report.accounting.get("pending") or report.accounting.get("integrity_suspicions")):
             state = "complete_with_problems"
         else:
             state = "complete"
+        incomplete_positions = {row["position"] for row in audit["chapters"]
+                                if any(outcome != "success" for outcome in row["requested_format_outcomes"].values())}
+        incomplete_groups = sum(any(p in incomplete_positions for p in group.positions)
+                                for group in outputs.groups)
         _end_journal(run.journal, state, log, files=len(report.written),
                      failed=report.accounting["requested_failure"],
                      attempted=report.accounting["attempted"], processed=report.accounting["processed"],
                      fallback_preserved=report.accounting["fallback_preserved"],
                      not_attempted=report.accounting["not_attempted"],
-                     fetch_failures=report.accounting["fetch_failures"], incomplete_groups=len(outputs.pending))
+                     fetch_failures=report.accounting["fetch_failures"], incomplete_groups=incomplete_groups)
         try:
             write_json_atomic(run.run_dir / AUDIT_FILENAME, audit)
         except OSError as exc:
@@ -1672,7 +1740,7 @@ def _drive(
         try:
             # 4. One pass over the pages still needed, then ONE second-pass sweep over the
             #    non-permanent failures (Phase 9C): a chapter that clears minutes later is still
-            #    saved, into its own group, before any grouped file is written.
+            #    saved into its own group; complete chunks publish as they fill.
             for meta in run.fetch_list:
                 if _cancelled(cancel_event):
                     report.cancelled = True
@@ -1809,7 +1877,8 @@ def _fetch_one(
     if rm is not None and hasattr(rm, "last_fetch_info"):
         rm.last_fetch_info = None
     try:
-        content = adapter.fetch_chapter(meta, spec)  # type: ignore[attr-defined]
+        with measure_stage(report, "fetching_seconds"):
+            content = adapter.fetch_chapter(meta, spec)  # type: ignore[attr-defined]
     except ScrapeCancelled:
         raise
     except EmptyExtractionError as exc:
@@ -1862,7 +1931,8 @@ def _fetch_one(
     served = getattr(getattr(adapter, "_rm", None), "last_fetch_info", None)  # looked up again: built lazily
     if getattr(served, "from_cache", False):
         report.from_cache += 1
-    elif sleep_after and not _cancelled(cancel_event):
+    elif (getattr(served, "classification", None) != "prefetched"
+          and sleep_after and not _cancelled(cancel_event)):
         pacer.sleep()
     return content
 

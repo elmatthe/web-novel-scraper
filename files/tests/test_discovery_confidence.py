@@ -221,7 +221,8 @@ def test_inferred_or_unknown_progress_cannot_create_verified_coverage(tmp_path, 
     from webnovel_scraper.chapter_preflight import _Preflight
     store = ChapterManifestStore(tmp_path / "b", tmp_path / "r")
     preflight = _Preflight(SOURCE, start=1, end=4, store=store, discover=None,
-                          log=lambda _: None, legacy_index=None, refresh=False, cancel_event=None)
+                          log=lambda _: None, legacy_index=None, refresh=False, list_mode="auto",
+                          cancel_event=None)
     meta = ChapterMeta(1, fwn.chapter_url_for(SPEC, 3), slug=3,
                        extra={"discovery_evidence": DiscoveryEvidence(status, "offset-arithmetic", ("1",))})
     assert preflight._identities([meta], report=True) == []

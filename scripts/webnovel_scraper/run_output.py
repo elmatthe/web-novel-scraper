@@ -17,12 +17,11 @@ Both pipeline paths hand every chapter they obtain to one :class:`RunOutputs`. I
 * **Resume.** A group/format is complete only with current semantic policy, accepted content-event
   references, immutable group membership and intact recorded bytes. Legacy outputs refuse Resume.
   The latest record must lack no page. Complete
-  groups are skipped without any network or cache read; everything else is fetched (the HTML cache
-  makes repeats cheap) and rendered again. A group that was published with pages missing is
+  groups are skipped without any network or cache read; accepted durable bodies are reused for
+  everything else before fetching missing pages. A group that was published with pages missing is
   re-rendered once they are obtained.
-* **Cancel.** Individual chapters are published as they arrive (the chapter in progress when Stop
-  is pressed is finished). Grouped files are built at the end; after Stop none are built (their
-  pages are in the HTML cache, so Resume builds them), and Stop pressed while they are being built
+* **Cancel.** Individual chapters and complete chunks are published as they arrive. After Stop no
+  further grouped files are built; accepted bodies remain durable for Resume. Stop during a build
   ends the build at the next chapter of the file in progress (v0.3.0 06). Nothing partial is ever
   published by a Stop.
 """
@@ -31,6 +30,7 @@ from __future__ import annotations
 
 import re
 import hashlib
+from contextlib import nullcontext
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -42,10 +42,12 @@ from .run_journal import FORMATS, Replay, RunJournal, JournalError, file_sha256
 from .semantic_resume import EXTRACTION_POLICY, content_reference, observed_label
 from .content_integrity import BodyFingerprints, FailureInfo, OUTCOME_POLICY, body_fingerprint, classify_failure
 from .run_accounting import page_accounting
+from .run_storage import checked_output_path
 from .pdf_builder import UnsupportedGlyphError, require_glyph_coverage
+from .chapter_bodies import load_body, save_body
 
 FORMAT_DIRS = {"pdf": "PDF", "txt": "TXT"}
-_TEMP_SUFFIXES = (".part", ".tmp")
+_OWNED_TEMP = re.compile(r"\.wns-output-[a-z0-9_]{8}\.part")
 
 Renderer = Callable[..., None]   # (format, contents, path, title, *, cancel_event=None)
 
@@ -91,14 +93,20 @@ def separate_stem(content: ChapterContent) -> str:
 
 
 def remove_orphan_temps(run_dir: Path) -> list[Path]:
-    """Delete our own interrupted temp files (``*.part``/``*.tmp`` in ``PDF/``/``TXT/``)."""
+    """Delete only our uniquely prefixed interrupted renders in unlinked format folders.
+
+    Legacy ambiguous .part/.tmp files are deliberately preserved.
+    """
     removed = []
     for folder in FORMAT_DIRS.values():
-        directory = Path(run_dir) / folder
+        directory = checked_output_path(run_dir, folder)
         if not directory.is_dir():
             continue
         for path in directory.iterdir():
-            if path.is_file() and path.name.endswith(_TEMP_SUFFIXES):
+            if _OWNED_TEMP.fullmatch(path.name):
+                path = checked_output_path(run_dir, f"{folder}/{path.name}")
+                if not path.is_file():
+                    continue
                 try:
                     path.unlink()
                     removed.append(path)
@@ -131,6 +139,8 @@ class RunOutputs:
         if not formats or any(f not in FORMATS for f in formats):
             raise ValueError(f"unsupported output formats: {formats!r}")
         self.run_dir = Path(run_dir)
+        for folder in FORMAT_DIRS.values():
+            checked_output_path(self.run_dir, folder)
         self.journal = journal
         self._semantic = bool(journal and journal.header and journal.header.resume_policy)
         self._conflicted: set[int] = set()
@@ -190,7 +200,7 @@ class RunOutputs:
         record = self._records.get((key, fmt))
         if record is None:
             return None
-        path = self.run_dir / record["path"]
+        path = checked_output_path(self.run_dir, record["path"])
         try:
             if not path.is_file() or path.is_symlink():
                 return None
@@ -221,6 +231,18 @@ class RunOutputs:
     def position_of(self, meta: ChapterMeta) -> int:
         return self._position[meta.url]
 
+    def restore_body(self, meta: ChapterMeta) -> bool:
+        """Reuse only canonical content bound to the admitted run's journal."""
+        position = self.position_of(meta)
+        record = self._content_records.get(position)
+        content = load_body(self.run_dir, record) if record else None
+        if content is None:
+            return False
+        self.contents[position] = content
+        self.obtained.add(position)
+        self.titles[position] = content.title
+        return True
+
     def attempt(self, meta: ChapterMeta) -> None:
         position = self.position_of(meta)
         if position not in self._session_attempted:
@@ -250,9 +272,11 @@ class RunOutputs:
             return
         fingerprint = self._fingerprints.observe(position, content.paragraphs)
         if position not in self._session_contents or previous is None or previous["body_sha256"] != fingerprint["body_sha256"]:
+            artifact = save_body(self.run_dir, position, meta, content) if self._semantic else None
             self._content_records[position] = self.journal.content(
                 position=position, page_url=meta.url, label=self.labels[position], **fingerprint,
-                **({"extraction_policy": EXTRACTION_POLICY, "observed_label": observed} if self._semantic else {}))
+                **({"extraction_policy": EXTRACTION_POLICY, "observed_label": observed,
+                    "body_artifact": artifact} if self._semantic else {}))
             other = fingerprint["duplicate_of"]
             if other is not None:
                 same_label = self.labels[other] == self.labels[position]
@@ -270,6 +294,10 @@ class RunOutputs:
         self.failed.pop(position, None)
         group = self._group_of[position]
         if self.mode is OutputMode.SEPARATE and group.key in self.pending:
+            self._publish(group)
+        elif (self.mode is OutputMode.CHUNKED and group.key in self.pending
+              and not (self.cancel_event is not None and self.cancel_event.is_set())
+              and all(p in self.contents for p in group.positions)):
             self._publish(group)
 
     def fail(self, meta: ChapterMeta, reason) -> None:
@@ -298,6 +326,14 @@ class RunOutputs:
     def flush_deferred_failures(self) -> None:
         for position, info in list(self._deferred_failures.items()):
             self.fail(self.metas[position], info)
+
+    def publish_ready(self) -> None:
+        """Publish complete groups, including groups restored from durable bodies."""
+        for group in self.groups:
+            if self.cancel_event is not None and self.cancel_event.is_set():
+                return
+            if group.key in self.pending and all(p in self.contents for p in group.positions):
+                self._publish(group)
 
     def finish(self, *, cancelled: bool) -> None:
         """Build the grouped files still pending (none after a Stop: Resume builds them), then
@@ -396,13 +432,26 @@ class RunOutputs:
                          "that could not be fetched again; Resume Existing Run tries again later")
                 continue
             relative = self._name(group, fmt, contents)
-            path = self.run_dir / relative
+            path = checked_output_path(self.run_dir, relative)
             path.parent.mkdir(parents=True, exist_ok=True)
+            checked_output_path(self.run_dir, relative)
             # A multi-chapter build can take minutes, so it stops at the next chapter on Stop; a
             # single chapter's file is always finished.
             try:
-                self._render(fmt, contents, path, self.title,
-                             cancel_event=self.cancel_event if len(group.positions) > 1 else None)
+                metrics = getattr(self.report, "_performance", None)
+                with metrics.measure("rendering_seconds") if metrics else nullcontext():
+                    started = metrics.clock() if metrics else None
+                    self._render(fmt, contents, path, self.title,
+                                 cancel_event=self.cancel_event if len(group.positions) > 1 else None)
+                if metrics:
+                    self.log(f"  {fmt.upper()} rendering time: {metrics.clock() - started:.3f}s ({path.name})")
+                if self._semantic and fmt == "pdf":
+                    from pypdf import PdfReader
+                    texts = [page.extract_text() or "" for page in PdfReader(path, strict=True).pages]
+                    expected = "".join("".join((c.heading, *c.paragraphs)) for c in contents)
+                    if (not texts or any(not text.strip() for text in texts)
+                            or "".join("".join(texts).split()) != "".join(expected.split())):
+                        raise ValueError("PDF canonical text/sections/order mismatch or blank page; no certificate issued")
             except Exception as exc:
                 from .request_manager import ScrapeCancelled
                 if isinstance(exc, ScrapeCancelled):
@@ -415,6 +464,7 @@ class RunOutputs:
                         formats.append("txt")
                     self.pending[group.key].add("txt")
                 continue
+            checked_output_path(self.run_dir, relative)
             size, digest = file_sha256(path)
             if self._semantic:
                 if len(contents) != len(present) or any(

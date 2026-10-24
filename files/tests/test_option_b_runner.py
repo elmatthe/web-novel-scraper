@@ -138,6 +138,90 @@ def manager(tmp_path, replies, cap=2, urls=None):
     return rm, wire
 
 
+def test_index_only_observes_bound_with_one_get_and_no_chapter_work(tmp_path, monkeypatch):
+    import hashlib
+
+    def denied(*args, **kwargs):
+        raise AssertionError("index inspection entered chapter/discovery/output machinery")
+
+    for name in ("AcceptanceAdapter", "SampleAdapter", "_probe", "_discovery", "_sample", "run_scrape"):
+        monkeypatch.setattr(runner, name, denied)
+    html = index(7) + index(2) + index(7) + "<a href='https://other.invalid/chapter-99'>private text</a>"
+    cfg = config(tmp_path, mode="index", cap=1)
+    report = runner.inspect(cfg)
+    assert report["approved_bound"] is None and not cfg.root.exists()
+    wire = Wire([Reply(html)])
+    result = execute(cfg, wire)
+    facts = result["index_bound"]
+    assert result["complete"] and not result["manifest_created"]
+    assert result["attempts"] == len(wire.calls) == wire.connections == 1
+    assert wire.calls[0][:3] == ("freewebnovel.com", "GET", "/novel/supreme-magus-novel")
+    assert facts["maximum_candidate_slug"] == 7
+    assert facts["accepted_chapter_links"] == 3 and facts["distinct_chapter_slugs"] == 2
+    assert facts["source_bound_validation"] == "observed_maximum"
+    assert facts["expected_bound"] is None and facts["maximum_differs_from_approval"] is None
+    assert facts["rejection_counts"]["source_mismatch"] == 1
+    assert facts["response_sha256"] == hashlib.sha256(html.encode()).hexdigest()
+    assert facts["source"] == runner.SOURCE.to_json()
+    assert not facts["full_novel_coverage_established"] and not facts["raw_response_retained"]
+    receipt_path, = (cfg.root / "logs").glob("index-*.json")
+    saved = receipt_path.read_text(encoding="utf-8")
+    assert json.loads(saved) == result and len(saved.encode()) < 16384
+    assert "private text" not in saved and html not in saved
+    assert result["observations"] == []
+    assert all(not any((cfg.root / name).iterdir()) for name in runner.DIRECTORIES if name != "logs")
+
+
+@pytest.mark.parametrize("overrides", [dict(cap=0), dict(cap=2), dict(bound=4557),
+    dict(slugs=(1,)), dict(resume=True), dict(start=1, end=2), dict(formats=("txt",)),
+    dict(grouping="single"), dict(run="supreme-magus-1")])
+def test_index_only_refuses_expanded_or_bound_dependent_configuration(tmp_path, overrides):
+    with pytest.raises(ValueError):
+        runner.inspect(config(tmp_path, **{**dict(mode="index", cap=1), **overrides}))
+    assert not (tmp_path / "acceptance").exists()
+
+
+@pytest.mark.parametrize("html,outcome,maximum", [
+    ("<p>No chapter anchors</p>", "no_candidates", None),
+    (index(8) + "<div class='pagination'></div>", "insufficient_structure", 8),
+    (index(8) * 3, "insufficient_structure", 8),
+])
+def test_index_only_structural_failure_keeps_evidence_without_followup(tmp_path, monkeypatch, html, outcome, maximum):
+    monkeypatch.setattr(runner, "MAX_INDEX_HREFS", 2)
+    cfg = config(tmp_path, mode="index", cap=1)
+    wire = Wire([Reply(html)])
+    with pytest.raises(runner.Stop):
+        execute(cfg, wire)
+    receipt_path, = (cfg.root / "logs").glob("index-*.json")
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt["index_bound"]["source_bound_validation"] == outcome
+    assert receipt["index_bound"]["maximum_candidate_slug"] == maximum
+    assert receipt["attempts"] == len(wire.calls) == 1
+    assert not receipt["complete"] and not receipt["manifest_created"]
+
+
+@pytest.mark.parametrize("reply", [Reply(status=302), Reply(status=429), Reply(status=403),
+    Reply("<title>Access denied</title>"), OSError("synthetic failure")])
+def test_index_only_transport_failure_keeps_receipt_and_never_retries(tmp_path, reply):
+    cfg = config(tmp_path, mode="index", cap=1)
+    wire = Wire([reply])
+    with pytest.raises(runner.Stop):
+        execute(cfg, wire)
+    receipt_path, = (cfg.root / "logs").glob("index-*.json")
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt["attempts"] == len(wire.calls) == wire.connections == 1
+    assert receipt["index_bound"]["source_bound_validation"] == "not_evaluated"
+    assert "maximum_candidate_slug" not in receipt["index_bound"]
+    assert receipt["stop_reason"] and not receipt["complete"]
+
+
+def test_index_only_cli_inspection_is_read_only(tmp_path, capsys):
+    cfg = config(tmp_path)
+    assert runner.main(["--root", str(cfg.root), "--mode", "index", "--cap", "1"]) == 0
+    assert json.loads(capsys.readouterr().out)["request_cap"] == 1
+    assert not cfg.root.exists()
+
+
 def test_hard_budget_counts_actual_attempt_and_latches_exhaustion(tmp_path):
     url = runner.chapter_url_for(runner.SPEC, 1)
     rm, wire = manager(tmp_path, [Reply(page(1)), Reply(page(1))], cap=1, urls={url: 5})
@@ -526,3 +610,246 @@ def test_default_output_root_also_refused_when_downloads_fallback_is_used(tmp_pa
     monkeypatch.setattr(runner, "default_output_root", lambda: fallback)
     with pytest.raises(ValueError, match="protected"):
         runner.inspect(runner.Config(root=fallback / "new"))
+
+
+@pytest.mark.parametrize("href", [
+    "https://freewebnovel.com/novel/supreme-magus-novel/chapter-3",
+    "/novel/supreme-magus-novel/chapter-3",
+    "novel/supreme-magus-novel/chapter-3",
+    "//freewebnovel.com/novel/supreme-magus-novel/chapter-3",
+    "/novel/supreme-magus-novel/chapter-3/",
+    "/novel/supreme-magus-novel/chapter-3#chapter-999",
+    "/novel/supreme-magus-novel/chapter-3?chapter=999",
+    "/novel/supreme-magus-novel/chapter-3/?token=secret#chapter-999",
+])
+def test_index_url_variants_preserve_exact_probe_allowlist(tmp_path, href):
+    cfg = config(tmp_path, mode="probe", bound=3, cap=2, slugs=(1,))
+    wire = Wire([Reply(f"<a href='{href}'>Chapter 999</a>"), Reply(page(1))])
+    result = execute(cfg, wire)
+    assert result["attempts"] == len(wire.calls) == 2
+    assert [call[2] for call in wire.calls] == [
+        runner.urlsplit(runner.SPEC.url).path,
+        runner.urlsplit(runner.chapter_url_for(runner.SPEC, 1)).path,
+    ]
+    assert cfg.slugs == (1,) and not result["manifest_created"] and not result["complete"]
+    for folder in ("runtime", "baseline", "cache", "spool", "outputs"):
+        assert not list((cfg.root / folder).iterdir())
+
+
+@pytest.mark.parametrize("html,outcome,maximum", [
+    ("<a href='/unrelated'>Chapter 3</a><a>Chapter 999</a>", "no_candidates", None),
+    (index(2), "mismatch", 2),
+    (index(4), "mismatch", 4),
+    (index(3) + "<nav class='pagination'><a href='?page=2'>More</a></nav>", "insufficient_structure", 3),
+    (index(3) + "<a rel='next' href='?page=2'>Next</a>", "insufficient_structure", 3),
+    (index(3) + "<link rel='prev' href='?page=1'>", "insufficient_structure", 3),
+])
+def test_index_bound_diagnostics_are_durable_before_stop(tmp_path, html, outcome, maximum):
+    import hashlib
+    cfg = config(tmp_path, mode="probe", bound=3, cap=2, slugs=(1,))
+    wire = Wire([Reply(html), Reply(page(1))])
+    with pytest.raises(runner.Stop, match="bound"):
+        execute(cfg, wire)
+    receipt_path, = (cfg.root / "logs").glob("probe-*.json")
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    facts = receipt["index_bound"]
+    assert facts["source_bound_validation"] == outcome
+    assert facts["maximum_candidate_slug"] == maximum
+    assert facts["expected_bound"] == 3
+    assert facts["no_recognized_candidates"] == (maximum is None)
+    assert facts["maximum_differs_from_approval"] == (None if maximum is None else maximum != 3)
+    assert facts["full_novel_coverage_established"] is False
+    assert receipt["transport"][0]["sha256"] == hashlib.sha256(html.encode()).hexdigest()
+    assert receipt["transport"][0]["outcome"] == "ok"
+    assert receipt["attempts"] == len(wire.calls) == 1
+    assert not receipt["manifest_created"] and not receipt["complete"]
+    assert receipt["observations"] == []
+    assert receipt_path.stat().st_size < 16384
+    for folder in ("runtime", "baseline", "cache", "spool", "outputs"):
+        assert not list((cfg.root / folder).iterdir())
+
+
+def test_index_candidate_counts_provenance_and_privacy(tmp_path):
+    import hashlib
+    html = (index(3) + index(3).replace("chapter-3", "chapter-3?token=cp6d-secret")
+        + "<a href='novel/supreme-magus-novel/chapter-2/'>Hidden text 999</a>"
+        + "<a href='https://evil.invalid/novel/supreme-magus-novel/chapter-999'>x</a>"
+        + "<a href='/novel/another-novel/chapter-999'>x</a>"
+        + "<a href='/novel/supreme-magus-novel/chapter-3-extra'>x</a>"
+        + "<a href=''>Chapter 999</a><a>Chapter 999</a>"
+        + "<script>cookie='cp6d-private-cookie';</script>")
+    cfg = config(tmp_path, mode="probe", bound=3, cap=2, slugs=(1,))
+    result = execute(cfg, Wire([Reply(html), Reply(page(1))]))
+    facts = result["index_bound"]
+    assert facts["anchor_hrefs_examined"] == 7
+    assert facts["accepted_chapter_links"] == 3
+    assert facts["distinct_chapter_slugs"] == 2
+    assert facts["maximum_candidate_slug"] == facts["expected_bound"] == 3
+    assert facts["source_bound_validation"] == "matches_approval"
+    assert facts["maximum_differs_from_approval"] is False
+    assert facts["no_recognized_candidates"] is False
+    assert facts["full_novel_coverage_established"] is False
+    assert facts["source"] == runner.SOURCE.to_json()
+    assert facts["provenance"] == "current-index-response"
+    assert facts["response_sha256"] == hashlib.sha256(html.encode()).hexdigest()
+    assert facts["rejection_counts"] == dict(invalid_href=1, invalid_url=0,
+        source_mismatch=1, novel_path_mismatch=1, chapter_path_mismatch=1)
+    receipt_path, = (cfg.root / "logs").glob("probe-*.json")
+    saved = receipt_path.read_text(encoding="utf-8")
+    assert "cp6d-secret" not in saved and "cp6d-private-cookie" not in saved
+    assert facts["raw_response_retained"] is False
+    assert not list(cfg.root.rglob("*.html"))
+
+
+@pytest.mark.parametrize("extra,truncated", [(0, False), (1, True)])
+def test_index_analysis_limit_never_validates_an_incomplete_scan(monkeypatch, extra, truncated):
+    monkeypatch.setattr(runner, "MAX_INDEX_HREFS", 3)
+    facts = runner._index_bound_evidence(index(1) + index(2) + index(3) + index(999) * extra, 3)
+    assert facts["anchor_hrefs_examined"] == facts["accepted_chapter_links"] == 3
+    assert facts["distinct_chapter_slugs"] == facts["maximum_candidate_slug"] == 3
+    assert facts["analysis_truncated"] is truncated
+    assert facts["source_bound_validation"] == ("insufficient_structure" if truncated else "matches_approval")
+
+
+@pytest.mark.parametrize("href", [
+    "https://evil.invalid/novel/supreme-magus-novel/chapter-3",
+    "https://freewebnovel.com.evil.invalid/novel/supreme-magus-novel/chapter-3",
+    "https://www.freewebnovel.com/novel/supreme-magus-novel/chapter-3",
+    "https://freewebnovel-com.invalid/novel/supreme-magus-novel/chapter-3",
+    "https://freewebnovel.com@evil.invalid/novel/supreme-magus-novel/chapter-3",
+    "https://user:password@freewebnovel.com/novel/supreme-magus-novel/chapter-3",
+    "https://freewebnovel.com:443/novel/supreme-magus-novel/chapter-3",
+    "https://freewebnovel.com./novel/supreme-magus-novel/chapter-3",
+    "http://freewebnovel.com/novel/supreme-magus-novel/chapter-3",
+    "https:/novel/supreme-magus-novel/chapter-3",
+    "javascript:chapter-3", "https://[broken/chapter-3",
+    "/novel/another-novel/chapter-3",
+    "/prefix/novel/supreme-magus-novel/chapter-3",
+    "/novel/supreme-magus-novel-other/chapter-3",
+    "?next=/novel/supreme-magus-novel/chapter-3",
+    "#chapter-3", "", None,
+    "/novel/supreme-magus-novel/chapter-0",
+    "/novel/supreme-magus-novel/chapter-03",
+    "/novel/supreme-magus-novel/chapter--3",
+    "/novel/supreme-magus-novel/chapter-3.1",
+    "/novel/supreme-magus-novel/chapter-3e4",
+    "/novel/supreme-magus-novel/chapter-NaN",
+    "/novel/supreme-magus-novel/chapter-\u0663",
+    "/novel/supreme-magus-novel/chapter-99999999999",
+    "/novel/supreme-magus-novel/chapter-3-extra",
+    "/novel/supreme-magus-novel/chapter-3.html",
+    "/novel/supreme-magus-novel/chapter-3/extra",
+    "/novel/supreme-magus-novel/chapter-3//",
+    "/novel/supreme-magus-novel/chapter-3%2f",
+    "/novel/supreme-magus-novel/chapter-%33",
+    "/novel/supreme-magus-novel/chapter-3\\extra",
+    "/novel/supreme-magus-novel/chapter-3\n",
+    "https://freewebnovel.com/novel/supreme-magus-novel/chapter-3?x=" + "s" * 2048,
+])
+def test_index_rejects_foreign_deceptive_and_malformed_links(href):
+    slug, reason = runner._index_chapter_slug(href)
+    assert slug is None and reason in {"invalid_href", "invalid_url", "source_mismatch",
+        "novel_path_mismatch", "chapter_path_mismatch"}
+
+
+def test_large_index_retains_only_bounded_structural_evidence(tmp_path):
+    secret_link = "<a href='?token=cp6d-sensitive-query'>cp6d-private-text</a>"
+    html = index(3) + secret_link * runner.MAX_INDEX_HREFS
+    cfg = config(tmp_path, mode="probe", bound=3, cap=2, slugs=(1,))
+    wire = Wire([Reply(html), Reply(page(1))])
+    with pytest.raises(runner.Stop, match="bound uncertain"):
+        execute(cfg, wire)
+    receipt_path, = (cfg.root / "logs").glob("probe-*.json")
+    saved = receipt_path.read_text(encoding="utf-8")
+    receipt = json.loads(saved)
+    facts = receipt["index_bound"]
+    assert facts["anchor_hrefs_examined"] == runner.MAX_INDEX_HREFS
+    assert facts["accepted_chapter_links"] == facts["distinct_chapter_slugs"] == 1
+    assert facts["maximum_candidate_slug"] == 3 and facts["analysis_truncated"]
+    assert sum(facts["rejection_counts"].values()) == runner.MAX_INDEX_HREFS - 1
+    assert len(json.dumps(facts).encode()) < 4096 and receipt_path.stat().st_size < 16384
+    assert "cp6d-sensitive-query" not in saved and "cp6d-private-text" not in saved
+    assert receipt["transport"][0]["response_bytes"] == len(html.encode())
+    assert len(wire.calls) == 1 and not list(cfg.root.rglob("*.html"))
+
+
+def test_redirect_evidence_never_retains_sensitive_location(tmp_path):
+    cfg = config(tmp_path, mode="probe", bound=3, cap=2, slugs=(1,))
+    location = "https://user:cp6d-password@evil.invalid/private?token=cp6d-token#private"
+    wire = Wire([Reply(status=302, headers={"Location": location})])
+    with pytest.raises(runner.Stop, match="redirect"):
+        execute(cfg, wire)
+    receipt_path, = (cfg.root / "logs").glob("probe-*.json")
+    saved = receipt_path.read_text(encoding="utf-8")
+    receipt = json.loads(saved)
+    assert "cp6d-password" not in saved and "cp6d-token" not in saved and location not in saved
+    assert receipt["transport"][0]["redirect"] is True
+    assert receipt["index_bound"]["source_bound_validation"] == "not_evaluated"
+    assert len(wire.calls) == receipt["attempts"] == 1
+
+
+def test_failed_transport_never_claims_index_observations(tmp_path):
+    cfg = config(tmp_path, mode="probe", bound=3, cap=2, slugs=(1,))
+    with pytest.raises(runner.Stop):
+        execute(cfg, Wire([OSError("offline synthetic failure")]))
+    receipt_path, = (cfg.root / "logs").glob("probe-*.json")
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt["index_bound"]["source_bound_validation"] == "not_evaluated"
+    assert "maximum_candidate_slug" not in receipt["index_bound"]
+    assert receipt["attempts"] == 1
+
+
+def test_receipt_collision_never_overwrites_prior_evidence(tmp_path, monkeypatch):
+    import uuid
+    from types import SimpleNamespace
+    ws = runner.Workspace.open(config(tmp_path))
+    monkeypatch.setattr(uuid, "uuid4", lambda: SimpleNamespace(hex="fixed"))
+    path = ws.record("logs", "synthetic", {"original": True})
+    before = path.read_bytes()
+    with pytest.raises(FileExistsError):
+        ws.record("logs", "synthetic", {"original": False})
+    assert path.read_bytes() == before
+
+
+def test_receipt_path_cannot_escape_workspace(tmp_path):
+    ws = runner.Workspace.open(config(tmp_path))
+    with pytest.raises(ValueError, match="escape"):
+        ws.record("logs", "../../outside", {})
+
+
+def test_receipt_serialization_failure_does_not_leave_partial_json(tmp_path):
+    ws = runner.Workspace.open(config(tmp_path))
+    with pytest.raises(TypeError):
+        ws.record("logs", "synthetic", {"unserializable": object()})
+    assert not list(ws.path("logs").iterdir())
+
+
+def test_new_bound_failure_preserves_existing_synthetic_workspace(tmp_path):
+    old_cfg = runner.Config(root=tmp_path / "prior-probe")
+    old_ws = runner.Workspace.open(old_cfg, simulation=True)
+    old_ws.record("logs", "probe", {"prior": "unchanged"})
+    before = {p.relative_to(old_ws.root): (p.read_bytes(), p.stat().st_mtime_ns)
+        for p in old_ws.root.rglob("*") if p.is_file()}
+    with pytest.raises(ValueError, match="existing"):
+        execute(runner.replace(old_cfg, mode="probe", bound=3, cap=2, slugs=(1,)), Wire([]))
+    with pytest.raises(runner.Stop):
+        execute(config(tmp_path, mode="probe", bound=3, cap=2, slugs=(1,)), Wire([Reply(index(2))]))
+    assert before == {p.relative_to(old_ws.root): (p.read_bytes(), p.stat().st_mtime_ns)
+        for p in old_ws.root.rglob("*") if p.is_file()}
+
+
+def test_oversized_index_hash_is_identified_as_a_prefix(tmp_path, monkeypatch):
+    import hashlib
+    monkeypatch.setattr(runner, "MAX_BODY", 32)
+    cfg = config(tmp_path, mode="probe", bound=3, cap=2, slugs=(1,))
+    wire = Wire([Reply("s" * 100)])
+    with pytest.raises(runner.Stop, match="size cap"):
+        execute(cfg, wire)
+    receipt_path, = (cfg.root / "logs").glob("probe-*.json")
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    transport, = receipt["transport"]
+    assert transport["response_bytes"] == 33
+    assert transport["sha256_complete_response"] is False
+    assert transport["sha256"] == hashlib.sha256(b"s" * 33).hexdigest()
+    assert receipt["index_bound"]["source_bound_validation"] == "not_evaluated"
+    assert len(wire.calls) == 1

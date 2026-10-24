@@ -3,11 +3,85 @@
 All notable changes to this project are recorded here. Versions follow semantic
 versioning.
 
-## [0.3.0] — Unreleased (Windows release candidate on `feature/v0.3.0-modernization`; awaiting owner acceptance)
+## [0.3.0] — Unreleased (owner-accepted Windows implementation; main integration)
 
 **Release scope (owner decision 2026-10-18, ADR 013):** v0.3.0 is a **Windows-only** release
-candidate. The macOS launcher and portable code are kept, but macOS acceptance is deferred to a
+implementation. The macOS launcher and portable code are kept, but macOS acceptance is deferred to a
 later branch; nothing here claims macOS readiness.
+
+### Final application integration and repository cleanup — 2026-10-23
+- Reconciled 20 outdated regression setups/expectations with explicit list policies,
+  initialized performance/fetch metadata, incremental chunks, saved-body Resume
+  and current Refresh warnings. All original failing cases and 448 neighboring tests
+  pass; legacy file-preservation and fatal incremental-publication checks remain.
+  The final complete offline gate passes all 2,289 tests with zero skips, plus
+  dependency/documentation checks. Protected-data hashes remain unchanged.
+  Delivery state is resolved from Git references; handoff records the checkpoint.
+- Owner confirms successful live scraping and HTML-cache reuse for every enabled
+  novel/site pairing. No further production defect was reported after final triage.
+- Validated HTML reuse works across all three adapters, including matching WebNovel
+  redirects. Saved chapter lists avoid unnecessary TOC/tail requests when Refresh
+  is off; explicit refresh checks current source coverage. Activity reports cache,
+  transport, rendering and saved-body reuse without claiming historical limits are live.
+- Supreme Magus retains observed titles, exact fractional identities and verified
+  prefixes; pending refresh tails cannot certify complete coverage. Discovery HTML
+  is reused for publication after extraction validation.
+- Complete chunks publish during acquisition. Durable journal-bound chapter bodies
+  support Stop/Resume and missing-file rebuilds independently of the HTML cache.
+- Corrected pacing deadlines, bounded Windows JSON replacement retries, blank-page
+  layout, PDF glyph coverage and Unicode mappings. The LOTM chapter 1099 bullet
+  uses an embedded mapping; strict canonical verification remains unchanged.
+- Attempted/processed/pending accounting and UI summaries retain honest incomplete
+  publication outcomes. Three manually renamed Supreme Magus PDFs and their journals
+  remain unchanged; the original LOTM 1099 publication and external repair are preserved.
+- Removed completed checkpoint reports, superseded implementation/acceptance plans
+  and draft release notes after consolidating lasting guidance. Retained all meaningful
+  tests/fixtures, launchers, adapter stubs and reusable audit/diagnostic/repair tools.
+- Generated audit and repair evidence stays local and ignored. Historical datasets
+  and owner data require a separate archival decision; no tag or GitHub Release created.
+
+### Fixed — Supreme Magus chapter identity (owner acceptance, 2026-10-18)
+- A page whose heading misspells the word ("Chpater 1953: Nineteen (Part 1)") was read as having no
+  chapter number, which also switched the wrong-chapter guard off: a stale saved copy of chapter 1953
+  was published as chapter 1956 and chapter 1953 itself as "Untitled" with a doubled heading. A closed
+  list of unambiguous misspellings of "Chapter" is now read as the word (headings, repeated story
+  heading, composite headings, chapter-list anchors); a page with no heading number is checked against
+  the story's own opening heading. "Untitled" remains a title fallback only, never an identity fallback.
+- A title that is only the site name ("Chapter 1921 - Free Web Novel") is no longer taken as a title.
+- A page read while listing chapters is held to the same checks as a fetched or saved page; a wrong one
+  is set aside and fetched again once.
+- The chapter-list builder no longer assumes a constant slug-to-number gap between two equal gaps
+  (Supreme Magus slugs 1653-1932 show two numbers more than the pages around them; 282 chapters failed
+  safely with "shows chapter 1644, expects 1642"). Spans are inferred only between probed pages at most
+  16 slugs apart that agree; a change of gap is bisected to the exact slug.
+  Cost: about 8% of a long offset novel's pages are read while listing (they are saved for the download).
+- A run listed before this fix keeps its fixed selection; start a new run to get the corrected list.
+
+### Fixed — final Windows software gate (2026-10-18)
+- **I2:** reject symlinks, junctions and other reparse points inside output runs before verification,
+  publication or cleanup. Cleanup recognises only the application's new `.wns-output-*.part` names;
+  ambiguous legacy temporary files and unrelated user files remain untouched.
+- **I3:** FreeWebNovel.net pagination accepts only the expected HTTPS host, novel index path and
+  exact page query. Off-host destinations, alternate ports, credentials and forbidden endpoints fail
+  before another list request is made.
+- **I4:** persist typed source-list gap coverage in the checksummed run header, restore it on Resume,
+  and retain `complete_with_problems` and audit warnings. Old headers with explicit gap notes remain
+  readable. The fixed chapter selection and journal/checksum rules are preserved.
+- **I5:** encode supplementary PDF mappings as UTF-16 surrogate pairs and add the installed Windows
+  historic-symbol font to the fallback set. Unsupported glyphs cause an explicit warning and unfinished
+  PDF status; complete original text is saved and journaled as TXT, including for PDF-only requests.
+- **I6:** WebNovel checks available page chapter index, chapter ID, book ID and displayed chapter
+  heading before accepting the body. Conflicts use the existing mismatch/cache-invalidation path.
+- **C1** remains covered by its existing composite-heading regressions.
+- Fresh-install acceptance uses one source-only Windows installation with both `.venv/` and the
+  entire `files/` directory initially absent, through the real batch launcher. Permanent tests and
+  fixtures stay in the development repository; generated state and smoke evidence are ignored.
+- Windows self-repair now forces reinstallation after a broken dependency import: pip metadata
+  alone can otherwise report a deleted package as already installed. Healthy launches keep reusing
+  the existing environment and packages.
+- **M1:** documentation now records the owner's accepted whole-novel testing across supported hosts.
+  Old manually modified output folders are outside this release gate; no recovery or audit is required.
+- Final offline verification and integration state are recorded in `handoff.md`.
 
 ### Fixed — corrective checkpoint 1 after the independent review of `838ca04` (2026-10-18)
 - **C1 (critical): a two-number page is only ever the chapter its second number names.** A page headed
@@ -22,9 +96,9 @@ later branch; nothing here claims macOS readiness.
   `TXT/` or the run folder that the journal does not record (hand-copied files, leftover `.part`/`.tmp`,
   a duplicate under another name), with size, SHA-256, the chapter its name says it is and the file the
   journal records for that chapter. Such a folder no longer passes. It reads and hashes only.
-- **I1 (Lord of Mysteries 2 original run): analysed and rehearsed, not executed.** See the acceptance
-  document ("Recovering the original Lord of Mysteries 2 (.com) run"). Nothing in the owner's folder
-  was changed.
+- **Historical I1 investigation:** analysed and rehearsed on scratch data only. The owner subsequently
+  excluded old manually modified output folders from the release gate. No owner-folder recovery is
+  part of v0.3.0 integration.
 - **Tests:** 1505 total.
 
 ### Fixed — composite chapter headings: Lord of Mysteries 2 (.com) chapters 1130–1138 (2026-10-18)

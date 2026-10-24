@@ -5,6 +5,8 @@ from __future__ import annotations
 import threading
 import time
 
+import pytest
+
 from webnovel_scraper.host_rate_limiter import HostRateLimiter, normalize_host
 from webnovel_scraper.request_manager import ScrapeCancelled
 
@@ -106,7 +108,7 @@ def test_fifo_order_is_preserved_within_one_host() -> None:
     assert order == ["first", "second"]
 
 
-def test_single_host_interval_timing_is_unchanged() -> None:
+def test_single_host_interval_includes_precision_margin() -> None:
     clock = [0.0]
     sleeps: list[float] = []
 
@@ -123,5 +125,7 @@ def test_single_host_interval_timing_is_unchanged() -> None:
         limiter.acquire("https://single.example/chapter")
         times.append(clock[0])
 
-    assert times == [0.0, 10.0, 20.0]
+    assert times[0] == 0.0
+    assert times == pytest.approx([0.0, 10.02, 20.04])
+    assert all(b - a >= 10.02 for a, b in zip(times, times[1:]))
 

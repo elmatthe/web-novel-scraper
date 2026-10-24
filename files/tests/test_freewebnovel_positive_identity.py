@@ -99,8 +99,9 @@ def test_all_fetch_paths_validate_and_bound_retries(html, path):
         rm.cache = SimpleNamespace(store=lambda *a, **kw: stored.append(a))
     with pytest.raises(ChapterMismatchError):
         if path == "rescue":
-            RescuePool._default_fetch(SimpleNamespace(_use_cache=True), meta, manager=rm,
-                                      adapter=adapter, mode=HEADLESS_CAMOUFOX, fresh=False, budget=1)
+            pool = RescuePool(primary_headless=True, use_cache=True)
+            pool._default_fetch(meta, manager=rm, adapter=adapter,
+                                mode=HEADLESS_CAMOUFOX, fresh=False, budget=1)
         else:
             adapter.fetch_chapter(meta, SPEC, fast_path=True)
     assert rm.fetches == (2 if path == "cache" else 1)
@@ -137,7 +138,10 @@ def test_actual_com_parser_preserves_exact_fractional_labels_through_metadata_an
     for identity, meta in zip(identities, metas):
         back = ChapterIdentity.from_json(SOURCE, identity.to_json())
         bridged = meta_from_identity(back, meta)
-        contents.append(fwn.FreeWebNovelAdapter(request_manager=object()).fetch_chapter(bridged, SPEC))
+        rm = Pages()
+        contents.append(fwn.FreeWebNovelAdapter(request_manager=rm).fetch_chapter(bridged, SPEC))
+        assert rm.fetches == 0
+        assert rm.last_fetch_info.classification == "prefetched" and not rm.last_fetch_info.from_cache
     assert [c.heading for c in contents] == ["Chapter 627.1: Diagnostic", "Chapter 627.10: Diagnostic"]
     names = [pipeline._separate_pdf_name(c) for c in contents]
     assert len(set(names)) == 2

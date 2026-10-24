@@ -186,6 +186,12 @@ def test_the_launcher_trusts_no_marker_files_and_repairs_only_what_is_missing():
     assert 'set "PLAYWRIGHT_BROWSERS_PATH=%CD%\\files\\bin\\ms-playwright"' in text
 
 
+def test_broken_imports_force_reinstallation_despite_existing_distribution_metadata():
+    text = _bat()
+    assert 'if errorlevel 1 set "REPAIR_DEPS=--force-reinstall"' in text
+    assert '-m pip install --disable-pip-version-check %REPAIR_DEPS% -r' in text
+
+
 def test_the_launcher_keeps_start_up_errors_and_shows_them():
     text = _bat()
     assert '"%VENV_PYW%" "%MAIN_SCRIPT%" 2> "%LAUNCH_LOG%"' in text

@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import time
 from pathlib import Path
 
 
@@ -24,7 +25,17 @@ def write_json_atomic(path: str | os.PathLike[str], payload: object) -> None:
             handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temp_name, target)
+        # Windows readers/scanners can briefly deny replacement of a closed
+        # checkpoint. Retry the same fsynced temp; persistent denial still fails
+        # with the previous target intact and normal temp cleanup below.
+        for attempt in range(5):
+            try:
+                os.replace(temp_name, target)
+                break
+            except PermissionError as exc:
+                if getattr(exc, "winerror", None) not in (5, 32, 33) or attempt == 4:
+                    raise
+                time.sleep(0.05 * (attempt + 1))
     except BaseException:
         try:
             os.unlink(temp_name)

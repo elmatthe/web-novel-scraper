@@ -69,7 +69,8 @@ def test_gaps_in_the_selection_are_listed(tmp_path):
     folder = make_run(tmp_path, Site([1, 2, 5, 6]), mode=OutputMode.SEPARATE, formats=("txt",))
     report = audit_run.audit(folder)
     assert report["whole_numbers_missing_from_the_selection"] == [3, 4]
-    assert report["problems"] == []
+    assert report["source_list_gaps"] == [3, 4]
+    assert any("source chapter list skips" in p for p in report["problems"])
 
 
 @pytest.mark.parametrize("text,expected", [

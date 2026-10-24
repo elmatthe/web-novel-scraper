@@ -5,6 +5,42 @@ See AI-WORKSPACE.md for how this fits alongside Briefing, Changelog, and Handoff
 
 ---
 
+## 018 — Saved coverage, durable bodies and certified publication remain separate evidence — 2026-10-23 — Codex
+
+**Status:** Accepted, included in the owner-accepted v0.3.0 application.
+
+**Context:** Repeating accepted novels should reuse HTML and chapter lists without
+rechecking an unchanged source tail. Stop/Resume and offline PDF repair also need
+accepted canonical bodies after HTML caching is disabled. Transport success,
+processed chapters and successful requested-format publication are different facts.
+
+**Decision:** The GUI explicitly chooses saved-list or update mode. Saved coverage
+has a historical upper bound and never claims a current source maximum. Supreme
+Magus updates retain a verified prefix, revalidate the last 64 slugs and new slugs,
+and invalidate incomplete/conflicting tails before accepting new observations.
+HTML provenance/identity validation remains independent of this policy. New runs
+save canonical bodies bound to accepted journal events and verify them before
+Resume mutation. Complete chunks publish during acquisition; missing outputs can
+be rebuilt from verified bodies. PDF certificates require exact canonical text
+and no blank pages. Unsupported glyphs preserve complete TXT and leave requested
+PDF publication unfinished. Pending publication and interrupted attempts remain
+visible in audit/accounting and the GUI.
+
+**Alternatives considered:** Rechecking every saved tail wastes paced network
+requests; trusting filenames or raw cached bytes loses semantic evidence; marking
+processed chapters as published hides PDF failures. Editing source text or
+weakening PDF verification would hide encoding defects.
+
+**Consequences:** Historical outputs and renamed files are never rewritten to
+make an audit pass. The chapter 1099 bullet repair uses an embedded Unicode font
+mapping while its original failed publication/journal stays preserved. Completed
+checkpoint plans/reports can be removed after carrying these invariants into
+Briefing, regression tests and this log. Reusable diagnostic/publication/repair
+tools and their fixtures remain available; historical local datasets need a
+separate archival decision.
+
+---
+
 ## 017 — The Windows launcher trusts only real checks; it repairs what is missing and refuses what it cannot fix — 2026-10-18 — Claude (Opus 5.5)
 
 **Status:** Accepted (v0.3.0 Checkpoint 07)

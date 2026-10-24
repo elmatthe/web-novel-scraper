@@ -72,6 +72,18 @@ def _novel_path(spec: SiteSpec) -> str:
     return path[:-5] if path.endswith(".html") else path.rstrip("/")
 
 
+def _pagination_url(spec: SiteSpec, number: int, url: str) -> str:
+    """Only the public HTTPS novel index and its exact page query are permitted."""
+    parts = urlsplit(urljoin(spec.url, url))
+    expected = urlsplit(spec.url)
+    if (number < 1 or parts.scheme != "https" or parts.netloc != "freewebnovel.net"
+            or expected.netloc != "freewebnovel.net" or parts.path != expected.path
+            or parts.fragment or parts.query not in (
+                ("", "page=1") if number == 1 else (f"page={number}",))):
+        raise ValueError(f"Invalid chapter-list pagination URL for page {number}: {url!r}")
+    return parts.geturl()
+
+
 def _entry(anchor, base: str, novel_path: str):
     """``(label, raw text, url, irregular)`` for a chapter link of this novel, else None. A link
     whose address is not ``<novel>/chapter-….html`` counts only when it is one ``word-N-….html`` page
@@ -126,7 +138,7 @@ def parse_list_page(html: str, spec: SiteSpec, number: int) -> ListPage:
                 page.ranges[value] = (int(match.group(1)), int(match.group(2)))
             data_url = option.get("data-url")
             if data_url:
-                page.urls[value] = urljoin(base, data_url)
+                page.urls[value] = _pagination_url(spec, value, data_url)
     for anchor in soup.select(".m-newest1 a[href]"):
         parsed = _entry(anchor, base, novel_path)
         if parsed is not None and parsed[0] is not None:
@@ -161,6 +173,8 @@ class FreeWebNovelNetAdapter(FreeWebNovelAdapter):
     enabled = True
 
     def _list_page(self, rm, spec: SiteSpec, number: int, url: str) -> ListPage:
+        url = _pagination_url(spec, number, url)
+        self._log(f"Fresh index/TOC request: {url}")
         html = rm.fetch(url, use_browser=spec.use_browser, use_cache=False)
         return parse_list_page(html, spec, number)
 

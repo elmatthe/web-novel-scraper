@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import os
 import re
+import struct
 import tempfile
 from io import BytesIO
 from pathlib import Path
@@ -30,6 +31,7 @@ from reportlab.lib.pagesizes import letter
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import inch
 from reportlab.platypus import Flowable, PageBreak, Paragraph, SimpleDocTemplate
+from reportlab.pdfbase.ttfonts import TTFont
 
 from .models import ChapterContent
 
@@ -251,21 +253,44 @@ def chapters_to_text(chapters: list[ChapterContent]) -> str:
 # quotes, dashes, ellipses, accents, €) would otherwise come out as wrong glyphs. Each run of such
 # characters is drawn from the first installed font that has them; everything else keeps the
 # established font, so ordinary text looks exactly as before. With no font for a character it is
-# left as it is (and reported), never replaced or dropped.
+# refused for PDF with complete TXT preservation by RunOutputs, never replaced or dropped.
 _FALLBACK_FONT_FILES = (
     # (registered name, file under %WINDIR%\Fonts, TrueType collection index)
     ("WNS-TimesNewRoman", "times.ttf", None),
     ("WNS-SegoeUI", "segoeui.ttf", None),
     ("WNS-SegoeUISymbol", "seguisym.ttf", None),
+    ("WNS-SegoeUIHistoric", "seguihis.ttf", None),
     ("WNS-SegoeUIEmoji", "seguiemj.ttf", None),
     ("WNS-YaHei", "msyh.ttc", 0),
     ("WNS-MSGothic", "msgothic.ttc", 0),
     ("WNS-MalgunGothic", "malgun.ttf", None),
     ("WNS-Nirmala", "Nirmala.ttf", None),
+    ("WNS-NirmalaCollection", "Nirmala.ttc", 0),
     ("WNS-ArialUnicode", "arialuni.ttf", None),
+    # Locally installed Windows collection, SIL Open Font License 1.1 (name table).
+    # Includes Lepcha and Tai Viet, absent from the older Windows fallback fonts.
+    ("WNS-SansSerifCollection", "SansSerifCollection.ttf", None),
 )
 _fallback_cache: list | None = None
 missing_glyphs: set[str] = set()   # characters no available font could draw (diagnostics)
+
+
+class _UnicodeTTFont(TTFont):
+    """Repair ReportLab 4.5.1's non-BMP ToUnicode destinations locally to our fonts."""
+
+    def addObjects(self, doc):
+        state = self.state[doc]
+        names = [self.getSubsetInternalName(n, doc)[1:] for n in range(len(state.subsets))]
+        super().addObjects(doc)
+        for name in names:
+            font = doc.idToObject[name]
+            cmap = doc.idToObject[font.ToUnicode.name]
+            # A destination is a UTF-16BE byte string, not a scalar's 5/6-digit hex value.
+            cmap.content = re.sub(
+                r"(?m)^(<[0-9A-F]{2}> )<([0-9A-F]{5,6})>$",
+                lambda m: m[1] + "<" + chr(int(m[2], 16)).encode("utf-16-be").hex().upper() + ">",
+                cmap.content,
+            )
 
 
 class UnsupportedGlyphError(ValueError):
@@ -305,7 +330,6 @@ def _fallback_fonts() -> list:
     if _fallback_cache is not None:
         return _fallback_cache
     from reportlab.pdfbase import pdfmetrics
-    from reportlab.pdfbase.ttfonts import TTFont
 
     found = []
     for name, filename, index in _FALLBACK_FONT_FILES:
@@ -314,9 +338,16 @@ def _fallback_fonts() -> list:
             if not path.is_file():
                 continue
             try:
-                font = TTFont(name, str(path), subfontIndex=index or 0) if index is not None else TTFont(name, str(path))
+                font = _UnicodeTTFont(name, str(path), subfontIndex=index or 0) if index is not None else _UnicodeTTFont(name, str(path))
+                # Respect restricted embedding, no-subsetting and bitmap-only flags.
+                # ReportLab's own subsetting check does not reliably enforce these.
+                if "OS/2" in font.face.table:
+                    rights = struct.unpack_from(">H", font.face.get_table("OS/2"), 8)[0]
+                    if rights & 0x0302:
+                        continue
                 pdfmetrics.registerFont(font)
-                found.append((name, set(font.face.charToGlyph)))
+                # A cmap entry pointing to .notdef is not glyph coverage.
+                found.append((name, {cp for cp, gid in font.face.charToGlyph.items() if gid}))
             except Exception:  # noqa: BLE001 - an unusable font file is simply skipped
                 pass
             break
@@ -325,6 +356,11 @@ def _fallback_fonts() -> list:
 
 
 def _encodable(char: str) -> bool:
+    # ReportLab maps the standard-font bullet to byte 0x7f. Without a ToUnicode
+    # map, PDF extraction reads DEL instead of U+2022. Embed its Unicode mapping
+    # through the existing TrueType fallback, preserving exact canonical text.
+    if char == "\u2022":
+        return False
     try:
         char.encode("cp1252")
     except UnicodeEncodeError:
@@ -354,6 +390,7 @@ def markup(text: str) -> str:
             font = next((name for name, cmap in fonts if code in cmap), None)
             if font is None:
                 missing_glyphs.add(char)
+                raise UnsupportedGlyphError(f"PDF fonts cannot represent U+{code:04X}.")
         if font != run_font:
             flush()
             run_font = font
@@ -402,10 +439,12 @@ def build_story(chapters: list[ChapterContent], cancel_event=None) -> list:
     body_style, heading_style = _styles()
     story: list = []
     for i, chapter in enumerate(chapters):
-        if cancel_event is not None:
-            story.append(_CancelPoint(cancel_event))
         if i > 0:
             story.append(PageBreak())
+        # A checkpoint BEFORE PageBreak can spill onto a fresh page when the prior
+        # chapter fills its frame; the break then leaves that page empty.
+        if cancel_event is not None:
+            story.append(_CancelPoint(cancel_event))
         story.append(Paragraph(markup(chapter.heading), heading_style))
         for paragraph in chapter.paragraphs:
             story.append(Paragraph(markup(paragraph), body_style))
@@ -424,10 +463,11 @@ def create_pdf(
     partial-cleanup fix; applies to every grouping. Since v0.3.0 the layout is built from the
     chapters' structure (``build_story``), not re-parsed from joined text."""
     output_path = Path(output_path)
+    require_glyph_coverage(chapters)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     fd, tmp_name = tempfile.mkstemp(
-        dir=str(output_path.parent), prefix=output_path.name + ".", suffix=".part"
+        dir=str(output_path.parent), prefix=".wns-output-", suffix=".part"
     )
     os.close(fd)  # ReportLab opens the path itself
     tmp = Path(tmp_name)

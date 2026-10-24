@@ -36,6 +36,7 @@ Standard library only.
 from __future__ import annotations
 
 import collections
+import math
 import random
 import threading
 import time
@@ -55,6 +56,10 @@ _NON_FRONT_POLL = 0.1
 # The front waiter sleeps for its host interval in slices no longer than this, so a
 # Stop request aborts the wait within one slice rather than after the full interval.
 _WAIT_SLICE = 0.25
+
+# Covers clock quantization and the short handoff between reservation and dispatch.
+# A deadline is still rechecked after every wakeup; this is not a sleep assumption.
+PACING_SAFETY_MARGIN = 0.020
 
 
 def normalize_host(url: str) -> str:
@@ -83,6 +88,7 @@ class HostRateLimiter:
         sleep: Callable[[float], None] = time.sleep,
         random_fn: Callable[[], float] = random.random,
         default_cooldown: float = DEFAULT_RATE_LIMIT_COOLDOWN,
+        safety_margin: float = PACING_SAFETY_MARGIN,
     ) -> None:
         self._interval = max(0.0, float(interval))
         self._jitter_ratio = max(0.0, float(jitter_ratio))
@@ -90,6 +96,7 @@ class HostRateLimiter:
         self._sleep = sleep
         self._random = random_fn
         self._default_cooldown = max(0.0, float(default_cooldown))
+        self._safety_margin = max(0.0, float(safety_margin))
 
         self._cond = threading.Condition(threading.Lock())
         self._waiters: Dict[str, Deque[object]] = {}
@@ -173,7 +180,7 @@ class HostRateLimiter:
                         self._blocked_until.get(host, 0.0),
                     )
                     if is_front and now >= allowed_at:
-                        self._next_allowed[host] = now + self._interval + self._jitter()
+                        self._next_allowed[host] = self._deadline(now) + self._jitter()
                         queue.popleft()
                         if not queue:
                             self._waiters.pop(host, None)
@@ -202,6 +209,24 @@ class HostRateLimiter:
             raise
 
     # ── helpers ───────────────────────────────────────────────────────────────
+    def _deadline(self, now: float) -> float:
+        if self._interval <= 0:
+            return now
+        return math.nextafter(now + self._interval + self._safety_margin, math.inf)
+
+    def navigation_dispatched(self, url: str) -> None:
+        """Anchor pacing after the transport handoff, including any setup/logging delay.
+
+        Call immediately after request dispatch (also if dispatch raises). Using its
+        return time is conservative: the next request waits at least a full interval
+        after the previous request actually started, regardless of handoff latency.
+        """
+        host = normalize_host(url)
+        with self._cond:
+            self._next_allowed[host] = max(self._next_allowed.get(host, 0.0),
+                                           self._deadline(self._monotonic()))
+            self._cond.notify_all()
+
     def _jitter(self) -> float:
         if self._jitter_ratio <= 0.0:
             return 0.0
@@ -214,10 +239,11 @@ class HostRateLimiter:
         re-check ``cancel_event`` — so a Stop request aborts the wait promptly
         instead of sleeping out the whole interval (the "cancel_event, not a bare
         sleep" requirement of §3.4)."""
-        remaining = seconds
-        while remaining > 0.0:
+        deadline = self._monotonic() + seconds
+        while True:
             if cancel_event is not None and cancel_event.is_set():
                 return  # the acquire loop re-checks is_set() and raises
-            chunk = remaining if remaining < _WAIT_SLICE else _WAIT_SLICE
-            self._sleep(chunk)
-            remaining -= chunk
+            remaining = deadline - self._monotonic()
+            if remaining <= 0:
+                return
+            self._sleep(min(remaining, _WAIT_SLICE))

@@ -116,6 +116,7 @@ class RunHeader:
     outcome_policy: Optional[str] = None
     resume_policy: Optional[str] = None
     extraction_policy: Optional[str] = None
+    toc_gaps: Optional[tuple[int, ...]] = None  # None: legacy header without typed coverage
 
     def __post_init__(self) -> None:
         if self.grouping_mode not in GROUPING_MODES:
@@ -130,6 +131,8 @@ class RunHeader:
             raise JournalError("The run's source belongs to another novel.")
         if self.outcome_policy not in (None, OUTCOME_POLICY):
             raise JournalError("The run's outcome policy is unsupported.")
+        if self.toc_gaps is not None and any(type(n) is not int or n < 1 for n in self.toc_gaps):
+            raise JournalError("The run's source-list gaps are malformed.")
 
     def to_json(self) -> dict:
         return {
@@ -142,6 +145,7 @@ class RunHeader:
                 "sha256": self.selection_sha256, "count": self.selection_count,
                 "first_label": self.first_label, "last_label": self.last_label,
                 "requested": list(self.requested), "effective": list(self.effective),
+                "toc_gaps": list(self.toc_gaps) if self.toc_gaps is not None else None,
             },
             "formats": list(self.formats),
             "grouping": {"mode": self.grouping_mode, "chunk_size": self.chunk_size},
@@ -176,11 +180,23 @@ class RunHeader:
                 outcome_policy=raw.get("outcome_policy"),
                 resume_policy=raw.get("resume_policy"),
                 extraction_policy=raw.get("extraction_policy"),
+                toc_gaps=tuple(sel["toc_gaps"]) if sel.get("toc_gaps") is not None else None,
             )
         except JournalError:
             raise
         except (KeyError, TypeError, ValueError, AttributeError, SourceIdentityError) as exc:
             raise JournalError(f"The journal header is malformed ({exc}).") from exc
+
+
+def source_list_gaps(header: RunHeader, chapters: list[ChapterIdentity]) -> list[int]:
+    """Restore typed coverage; old headers recorded a specific gap note instead."""
+    if header.toc_gaps is not None:
+        return list(header.toc_gaps)
+    if not any("chapter number(s) inside the range are not on the site's chapter list" in n
+               for n in header.notes):
+        return []
+    selected = {c.label.value for c in chapters}
+    return [n for n in range(header.effective[0], header.effective[1] + 1) if n not in selected]
 
 
 # ── replay ───────────────────────────────────────────────────────────────────

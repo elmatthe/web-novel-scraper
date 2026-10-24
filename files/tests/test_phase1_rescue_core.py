@@ -244,8 +244,9 @@ def test_host_limiter_paces_at_effective_interval() -> None:
     for _ in range(3):
         lim.acquire("https://h/p")
         times.append(clock[0])
-    # A 10s effective interval yields exactly 10s spacing — never closer.
-    assert times == [0.0, 10.0, 20.0]
+    # The configured minimum includes the 20ms precision margin — never closer.
+    assert times == pytest.approx([0.0, 10.02, 20.04])
+    assert all(b - a >= 10.02 for a, b in zip(times, times[1:]))
 
 
 def test_host_limiter_positive_jitter_added_after_interval() -> None:
@@ -253,9 +254,10 @@ def test_host_limiter_positive_jitter_added_after_interval() -> None:
     lim = HostRateLimiter(
         10.0, jitter_ratio=0.1, monotonic=now, sleep=sleep, random_fn=lambda: 1.0
     )
-    lim.acquire("https://h/p")   # reserves 0 + 10 + (1.0 * 0.1 * 10) = 11.0
-    lim.acquire("https://h/p")   # must wait to 11.0 (>= the bare interval)
-    assert clock[0] == 11.0
+    lim.acquire("https://h/p")   # reserves interval + margin + positive jitter
+    lim.acquire("https://h/p")
+    assert clock[0] == pytest.approx(11.02)
+    assert clock[0] >= 11.02
 
 
 def test_warmup_and_chapter_nav_are_both_gated(tmp_path, monkeypatch) -> None:
@@ -322,7 +324,7 @@ def test_last_fetch_info_reports_cache_vs_network(tmp_path, monkeypatch) -> None
 def _spec(use_browser: bool) -> SiteSpec:
     return SiteSpec(
         novel_slug="x", novel_title="X", adapter_key="freewebnovel",
-        display_name="FWN", enabled=True, url="https://fwn/novel/x",
+        display_name="FWN", enabled=True, url="https://freewebnovel.com/novel/x",
         use_browser=use_browser,
     )
 
@@ -352,7 +354,7 @@ def test_job_use_browser_reaches_adapter_without_mutating_catalog_spec(use_brows
             return CLEARED
 
     adapter = FreeWebNovelAdapter(request_manager=_RM(), log=lambda _m: None)
-    adapter.fetch_chapter(ChapterMeta(index=1, url="https://fwn/novel/x/chapter-1"), runtime)
+    adapter.fetch_chapter(ChapterMeta(index=1, url=runtime.url + "/chapter-1"), runtime)
     assert seen["use_browser"] is use_browser
 
 

@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import stat
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -37,6 +38,28 @@ _RUN_NAME_RE = re.compile(r"(?P<slug>[a-z0-9]+(?:-[a-z0-9]+)*)-(?P<number>[1-9][
 
 class RunStorageError(RuntimeError):
     """A run folder could not be allocated or validated (message is user-actionable)."""
+
+
+def checked_output_path(run_dir: Path, relative: str) -> Path:
+    """Reject links/reparse points at every component inside an output run."""
+    root, rel = Path(run_dir), Path(relative)
+    if rel.is_absolute() or len(rel.parts) not in (1, 2) or rel.parts[0] not in ("PDF", "TXT", "chapter-bodies") or any(
+        part in (".", "..") for part in rel.parts
+    ):
+        raise RunStorageError(f"Invalid output path: {relative!r}.")
+    path = root
+    for part in (None, *rel.parts):
+        if part is not None:
+            path /= part
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+            raise RunStorageError(f"Linked/reparse output paths are not supported: {path}.")
+    if not path.resolve().is_relative_to(root.resolve()):
+        raise RunStorageError(f"Output path escapes its run folder: {path}.")
+    return path
 
 
 @dataclass(frozen=True)
@@ -209,6 +232,8 @@ def open_existing_run(
         raise RunStorageError(f"The run folder {path} does not exist.")
     if path.is_symlink() or path.is_junction() or not path.is_dir():
         raise RunStorageError(f"{path} is not a folder.")
+    for folder in ("PDF", "TXT", "chapter-bodies"):
+        checked_output_path(path, folder)
     _read_reservation(path, slug, number)
     if expected_novel_slug is not None and expected_novel_slug != slug:
         raise RunStorageError(

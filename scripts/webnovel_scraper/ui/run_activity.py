@@ -78,6 +78,7 @@ PIPELINE_MESSAGE_RULES: tuple[tuple[str, str, str, bool], ...] = (
     ("prefix", "discovered ", INFO, True),
     ("prefix", "loaded ", INFO, True),
     ("prefix", "NOTE:", INFO, True),
+    ("prefix", "Performance:", INFO, True),
 )
 
 OUTCOMES = ("completed", "completed_with_problems", "nothing_written", "stopped", "failed",
@@ -250,9 +251,14 @@ def _coverage_events(report: object) -> list[ActivityEvent]:
     effective = _span(getattr(report, "effective_range", None))
     if requested and effective and effective[0] <= effective[1]:
         if requested[1] < UNBOUNDED_END and effective[1] < requested[1]:
-            events.append(_line(
-                f"The site's chapter list ends at chapter {effective[1]}, so chapters "
-                f"{effective[1] + 1} to {requested[1]} are not available.", WARNING))
+            if getattr(report, "saved_list_used", False):
+                events.append(_line(
+                    f"The saved chapter list was used through chapter {effective[1]}; newer chapters "
+                    "were not checked. Enable Refresh chapter list to look for updates.", WARNING))
+            else:
+                events.append(_line(
+                    f"The site's chapter list ends at chapter {effective[1]}, so chapters "
+                    f"{effective[1] + 1} to {requested[1]} are not available.", WARNING))
         if effective[0] > requested[0]:
             events.append(_line(
                 f"The site's chapter list starts at chapter {effective[0]}, so chapters "
@@ -322,6 +328,7 @@ def outcome_events(report: object | None, *, processed: tuple[int, int] | None =
         accounting = getattr(report, "accounting", {}) or {}
         problems = accounting.get("requested_failure", len(set(failed) | set(missing) | set(empty)))
         integrity = accounting.get("integrity_suspicions", 0)
+        pending = accounting.get("pending", 0)
         unaccounted = (processed[1] - processed[0]) if processed else 0
         gaps = _gaps_in_range(report)
         if getattr(report, "cancelled", False):
@@ -331,6 +338,10 @@ def outcome_events(report: object | None, *, processed: tuple[int, int] | None =
             outcome = "completed_with_problems"
             events.append(run(f"Finished with problems: {_plural(problems, 'chapter')} could "
                               "not be saved.", WARNING))
+        elif pending:
+            outcome = "completed_with_problems"
+            events.append(run(f"Finished with pending requested-format publication for "
+                              f"{_plural(pending, 'page')}; see run-audit.json for outcomes.", WARNING))
         elif integrity:
             outcome = "completed_with_problems"
             events.append(run(f"Finished with content-integrity concerns: {integrity} suspected duplicate "
@@ -363,11 +374,17 @@ def outcome_events(report: object | None, *, processed: tuple[int, int] | None =
         events.append(_processed_line(processed))
         events.append(run(f"{files_word[0].upper() + files_word[1:]} written: {written_detail}. "
                           f"Already present (skipped): {skipped}."))
+        restored = int(getattr(report, "from_bodies", 0) or 0)
+        if restored:
+            events.append(run(f"Verified saved bodies reused: {restored}; no page requests needed for these chapters."))
         if accounting:
+            if "attempted" in accounting and "processed" in accounting:
+                events.append(run(f"Pages: {accounting['attempted']} attempted, "
+                                  f"{accounting['processed']} processed."))
             events.append(run(f"Requested-format success: {accounting['requested_success']} pages; "
                               f"requested-format failure: {accounting['requested_failure']}; "
                               f"fallback artifact preserved: {accounting['fallback_preserved']}; "
-                              f"not attempted: {accounting['not_attempted']}."))
+                              f"not attempted: {accounting['not_attempted']}; pending: {pending}."))
         if failed:
             events.append(run(f"Failed chapters: {_chapter_list(failed)}.", WARNING))
         if missing:
